@@ -100,6 +100,7 @@ fn m3_dual_virtual_screen_concurrency_security_and_isolation() {
             preferred_display: None,
             enable_vnc: false,
             session_id: Some("e2e-sess-a".to_owned()),
+            ..Default::default()
         })
         .expect("create virtual screen A")
     });
@@ -112,6 +113,7 @@ fn m3_dual_virtual_screen_concurrency_security_and_isolation() {
             preferred_display: None,
             enable_vnc: true,
             session_id: Some("e2e-sess-b".to_owned()),
+            ..Default::default()
         })
         .expect("create virtual screen B")
     });
@@ -289,6 +291,7 @@ fn m3_xvfb_sigkill_crash_reap_stale_runtime_zero_residue() {
             preferred_display: None,
             enable_vnc: false,
             session_id: Some("crash-test".to_owned()),
+            ..Default::default()
         })
         .expect("create screen for SIGKILL crash test");
     std::mem::forget(mgr1);
@@ -328,6 +331,7 @@ fn m3_xvfb_sigkill_crash_reap_stale_runtime_zero_residue() {
             preferred_display: Some(info.display_num),
             enable_vnc: false,
             session_id: None,
+            ..Default::default()
         })
         .expect("re-create screen after crash recovery");
     assert_eq!(recovered.display_num, info.display_num);

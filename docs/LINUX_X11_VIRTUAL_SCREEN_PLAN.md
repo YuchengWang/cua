@@ -50,17 +50,18 @@
   - Generates isolated `mcookie` and `0600` `xauth` file under `~/.cache/cua-ycwang/xauth/<n>.auth` (never `-ac`, never `xhost +`).
   - Launches `Xvfb :<n> -screen 0 <W>x<H>x24 -auth <xauth_file> +extension COMPOSITE +extension XTEST +extension MIT-SHM -nolisten tcp -s 0 -dpms`.
   - Starts `openbox --config-file ~/.config/cua-ycwang/openbox/rc.xml` (`focusNew=yes`, animations disabled) and optional isolated `dbus-daemon --session --fork --print-address` + `at-spi-bus-launcher`.
-  - Optional preview bridge: `x11vnc -display :<n> -auth <xauth_path> -localhost -rfbport <auto_port> -viewonly -passwdfile <vnc_pw_file>` (loopback `127.0.0.1` only, `0600` one-time password, never `-nopw`).
+  - Optional preview bridge: `x11vnc -display :<n> -auth <xauth_path> -localhost -rfbport <auto_port> [-viewonly] -forever -shared -passwdfile <vnc_pw_file>` (loopback `127.0.0.1` only, `0600` one-time password, `-viewonly` by default unless `vnc_interactive=true`, never `-nopw`).
 
 ### 3.2 Lifecycle Cleanup & Stale Runtime Self-Healing
 - Registers `SessionEndHook` (`cua-driver-core/src/session.rs`) for automatic `SIGTERM -> SIGKILL` cleanup on session end, idle TTL expiration, or daemon shutdown.
 - `reap_stale_runtime()` inspects `/proc/<pid>/cmdline` on startup, cleaning dead `.pid`/`.sock` files, orphan `Xvfb`/`openbox` processes, and user-owned `/tmp/.X<n>-lock` files.
 
 ### 3.3 MCP Virtual Screen Tools
-- `create_virtual_screen(width?, height?, dpi?, session?, enable_dbus?, enable_vnc?)`
+- `create_virtual_screen(width?, height?, dpi?, session?, enable_dbus?, enable_vnc?, vnc_interactive?)` (default `1920x1080`)
 - `list_virtual_screens()`
 - `destroy_virtual_screen(display_id, force?)`
 - `launch_in_virtual_screen(display_id, command, args?, env?)`
+- `list_windows(display_id?, session?)`: routes strictly by explicit `display_id` > `session` > `Primary`, and supplements `_NET_CLIENT_LIST` with `QueryTree` `MapState::VIEWABLE` popups (filtering `<= 1x1` `FocusProxy` windows).
 
 ---
 

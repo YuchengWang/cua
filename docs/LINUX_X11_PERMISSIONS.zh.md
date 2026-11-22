@@ -86,7 +86,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
 ### 4.2 X11 与 VNC 加固红线
 - 严禁：`xhost +`、`Xvfb -ac`、`x11vnc -nopw`。
-- 强制：每屏独立 `mcookie` + `0600` xauth 文件；`x11vnc` 仅监听 `127.0.0.1`，强制 `-viewonly -passwdfile`（`0600` 一次性密码，销毁虚拟屏时同步删除）。
+- 强制：每屏独立 `mcookie` + `0600` xauth 文件；`x11vnc` 仅监听 `127.0.0.1`，强制 `-passwdfile`（`0600` 一次性密码，销毁虚拟屏时同步删除），默认 `-viewonly`，仅当显式传入 `vnc_interactive=true` 时允许交互。
 
 ---
 

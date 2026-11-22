@@ -29,7 +29,7 @@
 - **Immutability rule**: Recipes for different versions or builds are strictly isolated and **never overwrite** prior versions.
 
 ### 2.2 `AppRecipe` Schema & `VersionGate`
-- Core fields: `schema_version`, `app_id`, `app_version`, `version_source` (`dpkg` | `install4j` | `package_json` | `pe_or_elf`), `fingerprint_sha256`, `generated_at`, `recipe_revision`, `fingerprint` (`wm_class`, `tech_stack`, `recommended_env`), `introspection_strategy`, `verified_shortcuts`, `menu_topology`, `relative_anchors`, `modal_handlers`, `state_machine` (`states` with `auth_gate`/`ready_assertion`, `transitions` with `post_assertions`/`timeout_ms`).
+- Core fields: `schema_version`, `app_id`, `app_version`, `version_source` (`dpkg` | `install4j` | `package_json` | `pe_or_elf`), `fingerprint_sha256`, `generated_at`, `recipe_revision`, `tech_stack`, `atspi_blind`, `recommended_interaction` (`atspi_semantic` | `visual_grounding_plus_hotkeys` | `cdp_browser`), `launch_isolation_hints`, `fingerprint` (`wm_class`, `tech_stack`, `recommended_env`), `introspection_strategy`, `verified_shortcuts`, `menu_topology`, `relative_anchors`, `modal_handlers`, `state_machine` (`states` with `auth_gate`/`ready_assertion`, `transitions` with `post_assertions`/`timeout_ms`).
 - **`VersionGate::verify()`**: Probes live `app_version` and `<fp8>` before loading or running any recipe. On mismatch, blocks old recipe execution with structured `version_mismatch` error and recommends regenerating `<app_id>_v<new_ver>_<new_fp8>.json` inside an isolated virtual screen.
 
 ---
@@ -40,7 +40,7 @@
 - Implemented in `crates/platform-linux/src/app_inspector.rs` (wired via `mcp_app_recipe.rs`).
 - **Tier 1 (Zero-Intrusion Live Layer)**:
   - X11 window properties (`WM_CLASS`, `_NET_WM_PID`, `/proc/<pid>/exe`, `/proc/<pid>/cmdline`).
-  - AT-SPI2 full control/menu tree snapshot (role, name, automation ID, bounding box).
+  - AT-SPI2 full control/menu tree snapshot (role, name, automation ID, bounding box); when a running process exposes `0` interactive nodes, reports `atspi_blind: true`, `recommended_interaction: "visual_grounding_plus_hotkeys"`, `remediation_hints`, and `visual_hotspots` (6x4 grid edge-contrast normalized `[rel_x, rel_y, rel_w, rel_h]` hotspots mapped into `AppRecipe.relative_anchors`).
   - Electron detection: inspects `resources/app.asar` / `package.json` (`contributes.commands`, `contributes.menus`, `contributes.keybindings`) and user `keybindings.json`.
 - **Tier 2 (Runtime & Bytecode Manifest Layer)**:
   - Java (`install4j` / Swing): locates `.install4j/` version metadata, JAR `META-INF/MANIFEST.MF`, and lightweight bytecode/shortcut/window-manifest extraction without launching heavy GUI decompilers.

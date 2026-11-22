@@ -174,7 +174,13 @@ fn list_windows_on(
                     .ok()
                     .and_then(|c| c.reply().ok())
                 {
-                    if attrs.override_redirect && attrs.map_state == MapState::VIEWABLE {
+                    if attrs.map_state == MapState::VIEWABLE {
+                        if let Some(geom) = conn.get_geometry(child).ok().and_then(|c| c.reply().ok())
+                        {
+                            if geom.width <= 1 && geom.height <= 1 {
+                                continue;
+                            }
+                        }
                         windows.push(child);
                     }
                 }

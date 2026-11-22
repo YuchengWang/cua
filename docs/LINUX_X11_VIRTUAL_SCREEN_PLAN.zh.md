@@ -50,17 +50,18 @@
   - 生成独立 `mcookie` 与 `0600` 权限的 `xauth` 文件至 `~/.cache/cua-ycwang/xauth/<n>.auth`（严禁 `-ac` 与 `xhost +`）。
   - 启动 `Xvfb :<n> -screen 0 <W>x<H>x24 -auth <xauth_file> +extension COMPOSITE +extension XTEST +extension MIT-SHM -nolisten tcp -s 0 -dpms`。
   - 启动 `openbox --config-file ~/.config/cua-ycwang/openbox/rc.xml`（`focusNew=yes`、禁用动画）及可选独立 `dbus-daemon --session --fork --print-address` + `at-spi-bus-launcher`。
-  - 可选旁路监看：`x11vnc -display :<n> -auth <xauth_path> -localhost -rfbport <auto_port> -viewonly -passwdfile <vnc_pw_file>`（仅监听 `127.0.0.1`、`0600` 一次性随机密码，严禁 `-nopw`）。
+  - 可选旁路监看：`x11vnc -display :<n> -auth <xauth_path> -localhost -rfbport <auto_port> [-viewonly] -forever -shared -passwdfile <vnc_pw_file>`（仅监听 `127.0.0.1`、`0600` 一次性随机密码，默认 `-viewonly`，仅当 `vnc_interactive=true` 时移除 `-viewonly`，严禁 `-nopw`）。
 
 ### 3.2 生命周期清理与残留自愈
 - 注册 `SessionEndHook`（`cua-driver-core/src/session.rs`），在会话结束、空闲 TTL 到期或 daemon 退出时执行 `SIGTERM -> SIGKILL` 回收子进程树。
 - 启动入口执行 `reap_stale_runtime()` 校验 `/proc/<pid>/cmdline`，自动清理死进程残留的 `.pid`/`.sock`、孤儿 `Xvfb`/`openbox` 及当前用户属主的 `/tmp/.X<n>-lock`。
 
 ### 3.3 MCP 虚拟屏工具契约
-- `create_virtual_screen(width?, height?, dpi?, session?, enable_dbus?, enable_vnc?)`
+- `create_virtual_screen(width?, height?, dpi?, session?, enable_dbus?, enable_vnc?, vnc_interactive?)`（默认 `1920x1080`）
 - `list_virtual_screens()`
 - `destroy_virtual_screen(display_id, force?)`
 - `launch_in_virtual_screen(display_id, command, args?, env?)`
+- `list_windows(display_id?, session?)`：严格按显式 `display_id` > `session` > `Primary` 路由，并在 `_NET_CLIENT_LIST` 之外补充 `QueryTree` `MapState::VIEWABLE` 弹窗枚举（过滤 `<= 1x1` 的 `FocusProxy` 窗口）。
 
 ---
 

@@ -59,7 +59,9 @@ impl Tool for ListWindowsTool {
             input_schema: json!({"type":"object","properties":{
                 "pid":{"type":"integer","description":"Only list windows owned by this process ID."},
                 "app":{"type":"string","description":cua_driver_core::tool_args::LIST_WINDOWS_APP_FILTER_DESCRIPTION},
-                "on_screen_only":{"type":"boolean","description":"When true, filter to visible windows only. Default false."}
+                "on_screen_only":{"type":"boolean","description":"When true, filter to visible windows only. Default false."},
+                "display_id":{"type":"string","description":"Optional X11 display target ('primary' or ':99'). Overrides session binding."},
+                "session": cua_driver_core::tool_schema::session_schema()
             },"additionalProperties":false}),
             read_only: true, destructive: false, idempotent: true, open_world: false,
         })
@@ -69,10 +71,21 @@ impl Tool for ListWindowsTool {
         use cua_driver_core::tool_args::ArgsExt;
         let filter_pid = args.opt_u64("pid").map(|v| v as u32);
         let on_screen_only = args.bool_or("on_screen_only", false);
-        let virtual_display = crate::x11::virtual_screen::global_virtual_screen_manager()
-            .resolve_display_for_session(args.opt_str("session").as_deref(), None);
+        let explicit_display = args.opt_str("display_id");
+        let session = args.opt_str("session");
+        let target_display = if let Some(ref disp) = explicit_display {
+            match crate::x11::context::DisplayTarget::from_display_id(Some(disp)) {
+                Ok(t) => Some(t),
+                Err(e) => return ToolResult::error(format!("invalid display_id '{disp}': {e:#}")),
+            }
+        } else {
+            crate::x11::virtual_screen::global_virtual_screen_manager()
+                .resolve_display_for_session(session.as_deref(), None)
+                .map(crate::x11::context::DisplayTarget::Virtual)
+        };
         let mut windows = tokio::task::spawn_blocking(move || {
-            if let Some(ref display_id) = virtual_display {
+            if let Some(crate::x11::context::DisplayTarget::Virtual(ref display_id)) = target_display
+            {
                 if let Ok(ctx) = crate::x11::virtual_screen::global_virtual_screen_manager()
                     .connect_context(display_id)
                 {

@@ -130,6 +130,14 @@ pub struct AppRecipe {
     pub app_version: String,
     pub version_source: VersionSource,
     pub fingerprint_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tech_stack: Option<String>,
+    #[serde(default)]
+    pub atspi_blind: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended_interaction: Option<String>,
+    #[serde(default)]
+    pub launch_isolation_hints: Vec<String>,
     #[serde(default)]
     pub verified_shortcuts: Vec<VerifiedShortcut>,
     #[serde(default)]
@@ -334,6 +342,10 @@ mod tests {
             app_version: version.to_owned(),
             version_source: VersionSource::Install4j,
             fingerprint_sha256: sha.to_owned(),
+            tech_stack: Some("java_install4j".to_owned()),
+            atspi_blind: false,
+            recommended_interaction: Some("visual_grounding_plus_hotkeys".to_owned()),
+            launch_isolation_hints: Vec::new(),
             verified_shortcuts: vec![VerifiedShortcut {
                 id: "order_ticket".to_owned(),
                 keys: vec!["ctrl".to_owned(), "o".to_owned()],

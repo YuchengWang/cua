@@ -35,6 +35,7 @@ pub struct CreateVirtualScreenRequest {
     pub height: Option<u16>,
     pub preferred_display: Option<u16>,
     pub enable_vnc: bool,
+    pub vnc_interactive: bool,
     pub session_id: Option<String>,
 }
 
@@ -279,31 +280,30 @@ impl VirtualScreenManager {
             children.push(child);
         }
 
-        // Optional view-only localhost x11vnc with 0600 random passwdfile (never -nopw).
+        // Optional localhost x11vnc with 0600 random passwdfile (never -nopw).
+        // Defaults to -viewonly unless req.vnc_interactive is true.
         let (vnc_port, vnc_passwd_path, pid_x11vnc) = if req.enable_vnc {
             let port = 5900 + display_num;
             let pw_path = runtime_dir.join("vnc.passwd");
             let pw_hex = random_hex(12)?;
             write_mode_0600(&pw_path, pw_hex.as_bytes())?;
-            let child = Command::new("x11vnc")
+            let port_str = port.to_string();
+            let mut vnc_cmd = Command::new("x11vnc");
+            vnc_cmd
                 .args(["-display", &display_id])
                 .arg("-auth")
                 .arg(&xauth_path)
-                .args([
-                    "-localhost",
-                    "-viewonly",
-                    "-forever",
-                    "-shared",
-                    "-rfbport",
-                    &port.to_string(),
-                    "-passwdfile",
-                ])
+                .arg("-localhost");
+            if !req.vnc_interactive {
+                vnc_cmd.arg("-viewonly");
+            }
+            vnc_cmd
+                .args(["-forever", "-shared", "-rfbport", &port_str, "-passwdfile"])
                 .arg(&pw_path)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .context("failed to spawn x11vnc")?;
+                .stderr(Stdio::null());
+            let child = vnc_cmd.spawn().context("failed to spawn x11vnc")?;
             let pid = child.id();
             children.push(child);
             (Some(port), Some(pw_path), Some(pid))

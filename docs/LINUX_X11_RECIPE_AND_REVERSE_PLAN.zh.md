@@ -29,7 +29,7 @@
 - **不可变原则**：不同版本、不同发行构建的配方严格隔离，**绝不覆盖历史旧版配方**。
 
 ### 2.2 `AppRecipe` Schema 与 `VersionGate`
-- 核心字段：`schema_version`、`app_id`、`app_version`、`version_source`（`dpkg` | `install4j` | `package_json` | `pe_or_elf`）、`fingerprint_sha256`、`generated_at`、`recipe_revision`、`fingerprint`（`wm_class`、`tech_stack`、`recommended_env`）、`introspection_strategy`、`verified_shortcuts`、`menu_topology`、`relative_anchors`、`modal_handlers`、`state_machine`（含 `auth_gate`/`ready_assertion` 的 `states` 与含 `post_assertions`/`timeout_ms` 的 `transitions`）。
+- 核心字段：`schema_version`、`app_id`、`app_version`、`version_source`（`dpkg` | `install4j` | `package_json` | `pe_or_elf`）、`fingerprint_sha256`、`generated_at`、`recipe_revision`、`tech_stack`、`atspi_blind`、`recommended_interaction`（`atspi_semantic` | `visual_grounding_plus_hotkeys` | `cdp_browser`）、`launch_isolation_hints`、`fingerprint`（`wm_class`、`tech_stack`、`recommended_env`）、`introspection_strategy`、`verified_shortcuts`、`menu_topology`、`relative_anchors`、`modal_handlers`、`state_machine`（含 `auth_gate`/`ready_assertion` 的 `states` 与含 `post_assertions`/`timeout_ms` 的 `transitions`）。
 - **`VersionGate::verify()`**：加载或运行任何配方前实时探测目标应用的 `app_version` 与 `<fp8>`；任一不匹配立即阻断旧配方执行，返回结构化 `version_mismatch` 错误并引导在隔离虚拟屏重建 `<app_id>_v<new_ver>_<new_fp8>.json`。
 
 ---
@@ -40,7 +40,7 @@
 - 实现于 `crates/platform-linux/src/app_inspector.rs`（经 `mcp_app_recipe.rs` 接入）。
 - **Tier 1（零侵入实时层）**：
   - X11 窗口属性采集（`WM_CLASS`、`_NET_WM_PID`、`/proc/<pid>/exe`、`/proc/<pid>/cmdline`）。
-  - AT-SPI2 全量控件/菜单树快照（Role、Name、AutomationId、边界坐标）。
+  - AT-SPI2 全量控件/菜单树快照（Role、Name、AutomationId、边界坐标）；当运行中进程暴露 `0` 个可交互节点时，显式返回 `atspi_blind: true`、`recommended_interaction: "visual_grounding_plus_hotkeys"`、`remediation_hints` 与 `visual_hotspots`（基于 6x4 网格边缘对比度提取归一化 `[rel_x, rel_y, rel_w, rel_h]` 热区并写入 `AppRecipe.relative_anchors`）。
   - Electron 探测：解析 `resources/app.asar` / `package.json`（`contributes.commands`、`contributes.menus`、`contributes.keybindings`）及用户 `keybindings.json`。
 - **Tier 2（语言运行时与清单层）**：
   - Java（`install4j` / Swing）：定位 `.install4j/` 版本元数据、JAR `META-INF/MANIFEST.MF` 与轻量字节码/快捷键/窗口清单提取，无需启动重型反编译界面。

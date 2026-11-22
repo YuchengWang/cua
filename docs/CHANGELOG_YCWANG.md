@@ -7,6 +7,19 @@
 
 ## [Unreleased] — `feat/x11-virtual-desktop`
 
+### P0–P2 Field-Feedback Hardening & Differentiated Recipe Generation (`2026-11-22`, Landed)
+- **Changed / 变更**：
+  - `x11/virtual_screen.rs` & `tools/mcp_virtual_screen.rs`: Added `vnc_interactive: Option<bool>` (default `false` retaining `-viewonly`; when `true`, removes `-viewonly` while keeping `-localhost -forever -shared -passwdfile <0600>`); aligned default virtual screen resolution to `1920x1080`.
+  - `cua-driver-contract/src/windows.rs`, `tools/list_windows.rs`, `x11/mod.rs`: Added explicit `display_id` & `session` routing to `list_windows` (`explicit display_id > session > Primary`) and `QueryTree` `MapState::VIEWABLE` popup enumeration filtering `<= 1x1` `FocusProxy` windows.
+  - `cua-driver-core/src/app_recipe.rs`, `platform-linux/src/app_inspector.rs`, `tools/mcp_app_recipe.rs`:
+    - Added `tech_stack`, `atspi_blind`, `recommended_interaction`, and `launch_isolation_hints` to `AppRecipe`;
+    - Fixed `atspi_blind` detection for `window_id`-only and `java_install4j` targets, plus 6x4-grid `visual_hotspots` mapped into `AppRecipe.relative_anchors`;
+    - Populated differentiated non-empty recipes per stack: AT-SPI2 rich (`v2rayn_v7.25.1_ab9e208e.json`: `menus=22, anchors=30, atspi_semantic`), Electron (`vscode_v1.146.0_b0432bb8.json`: `shortcuts=10, menus=64, isolation=1`), and Java `install4j` (`ibkr_tws_v10.52.1d_ff4b4710.json`: `atspi_blind=true, visual_grounding_plus_hotkeys, shortcuts=2, anchors=3, isolation=1, modals=1`).
+  - `deploy/linux/user/app_recipes/tws.json`: Added `-J-DjtsConfigDir=${CUA_YCWANG_HOME:-$HOME/.cua-ycwang}/jts` isolation guidance and `Warning` / `Trades` / `Watchlist` anchors.
+- **Verified / 已核验**：
+  - `cargo clippy -p cua-driver-core -p platform-linux -p cua-driver --all-targets -- -D warnings` passed.
+  - `app_recipe` (3/3), `app_inspector` (4/4), `virtual_screen_m3_e2e_xorg` (2/2), `virtual_screen_m4_xorg` (2/2), and `schema_consistency_test` (4/4) all passed; Release binary updated at `~/.cua-ycwang/packages/current/cua-ycwang`.
+
 ### Hotfix: TWS Audit Fixes — Swing CJK `type_text`, Clipboard Routing Priority & Zombie Reaping (`2026-11-22`, Landed)
 - **Fixed / 修复**：
   - `platform-linux/src/x11/virtual_input.rs`: Hardened `xtest_type_text()` and `xtest_hotkey()` for Java Swing / TWS mixed ASCII+CJK input (e.g. `"AUDIT_测试_123"`): added `release_stuck_modifiers()` via `QueryKeymap` before typing/pasting, `10ms` press/release separation in `xtest_hotkey()`, `75ms` `CLIPBOARD` Selection ownership settle before `Ctrl+V`, and `150ms` async Swing `SelectionRequest` settle before restoring prior clipboard.

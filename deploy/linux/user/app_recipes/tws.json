@@ -3,10 +3,15 @@
   "app_id": "tws",
   "display_name": "Interactive Brokers Trader Workstation",
   "recommended_profile": "desktop-1080p",
+  "recommended_resolution": "1920x1080",
   "x11_env": {
     "GDK_SCALE": "1",
     "_JAVA_AWT_WM_NONREPARENTING": "1",
     "AWT_TOOLKIT": "MToolkit"
+  },
+  "isolation": {
+    "jts_config_dir_flag": "-J-DjtsConfigDir=${CUA_YCWANG_HOME:-$HOME/.cua-ycwang}/jts",
+    "notes": "Pass -J-DjtsConfigDir=... when launching TWS in a virtual screen to isolate Jts settings and lock files from host ~/Jts."
   },
   "window_matchers": [
     {
@@ -16,7 +21,34 @@
     {
       "title_regex": ".*Trader Workstation.*",
       "role": "main"
+    },
+    {
+      "title_regex": ".*(Pending Tasks|Login Messages|Warning).*",
+      "role": "modal_warning"
     }
   ],
-  "notes": "Run TWS inside Xvfb + Openbox (:99) to isolate trading GUI from the host desktop."
+  "relative_anchors": [
+    {
+      "name": "Warning",
+      "title_pattern": ".*Warning.*",
+      "rel_x": 0.5,
+      "rel_y": 0.85,
+      "notes": "Confirm or dismiss startup warning/pending tasks modal."
+    },
+    {
+      "name": "Trades",
+      "title_pattern": ".*Trader Workstation.*",
+      "rel_x": 0.18,
+      "rel_y": 0.12,
+      "notes": "Trades / Activity panel anchor in 1920x1080 Mosaic layout."
+    },
+    {
+      "name": "Watchlist",
+      "title_pattern": ".*Trader Workstation.*",
+      "rel_x": 0.15,
+      "rel_y": 0.35,
+      "notes": "Watchlist panel anchor in 1920x1080 Mosaic layout."
+    }
+  ],
+  "notes": "Run TWS inside Xvfb + Openbox (:99, 1920x1080) with -J-DjtsConfigDir=... to isolate trading GUI and config from the host desktop."
 }

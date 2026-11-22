@@ -86,7 +86,7 @@ To allow passwordless `/dev/uinput` input injection without running `cua-ycwang`
 
 ### 4.2 X11 & VNC Hardening Redlines
 - Forbidden: `xhost +`, `Xvfb -ac`, `x11vnc -nopw`.
-- Required: per-display `mcookie` + `0600` xauth file; `x11vnc` bound strictly to `127.0.0.1` with `-viewonly -passwdfile` (`0600` ephemeral password deleted on destroy).
+- Required: per-display `mcookie` + `0600` xauth file; `x11vnc` bound strictly to `127.0.0.1` with `-passwdfile` (`0600` ephemeral password deleted on destroy), defaulting to `-viewonly` unless `vnc_interactive=true` is explicitly requested.
 
 ---
 

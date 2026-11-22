@@ -37,6 +37,7 @@ fn m4_xtest_click_and_cjk_clipboard_roundtrip() {
             preferred_display: None,
             enable_vnc: false,
             session_id: Some("m4-xtest".to_owned()),
+            ..Default::default()
         })
         .expect("create virtual screen");
 
@@ -138,6 +139,7 @@ fn m4_isolated_clipboard_tools_and_override_redirect_enumeration() {
             preferred_display: None,
             enable_vnc: false,
             session_id: Some("m4-cb-1".to_owned()),
+            ..Default::default()
         })
         .unwrap();
     let s2 = mgr
@@ -147,6 +149,7 @@ fn m4_isolated_clipboard_tools_and_override_redirect_enumeration() {
             preferred_display: None,
             enable_vnc: false,
             session_id: Some("m4-cb-2".to_owned()),
+            ..Default::default()
         })
         .unwrap();
 

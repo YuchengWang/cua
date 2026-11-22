@@ -48,6 +48,12 @@ pub struct ListWindowsInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "bool_schema")]
     pub on_screen_only: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "string_schema")]
+    pub display_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "string_schema")]
+    pub session: Option<String>,
 }
 
 impl ToolInput for ListWindowsInput {

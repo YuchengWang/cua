@@ -325,6 +325,7 @@ impl Tool for CreateVirtualScreenTool {
                     "height": { "type": "integer", "minimum": 240, "maximum": 4320 },
                     "preferred_display": { "type": "integer", "minimum": 99, "maximum": 199 },
                     "enable_vnc": { "type": "boolean", "description": "Optional localhost view-only x11vnc with 0600 random passwdfile." },
+                    "vnc_interactive": { "type": "boolean", "description": "Allow interactive VNC input when enable_vnc is true (still bound to localhost with 0600 passwdfile). Default false (-viewonly)." },
                     "session": cua_driver_core::tool_schema::session_schema()
                 },
                 "additionalProperties": false
@@ -342,6 +343,7 @@ impl Tool for CreateVirtualScreenTool {
             height: args.opt_u64("height").map(|v| v as u16),
             preferred_display: args.opt_u64("preferred_display").map(|v| v as u16),
             enable_vnc: args.bool_or("enable_vnc", false),
+            vnc_interactive: args.bool_or("vnc_interactive", false),
             session_id: args.opt_str("session"),
         };
         match tokio::task::spawn_blocking(move || global_virtual_screen_manager().create(req)).await

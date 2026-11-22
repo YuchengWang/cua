@@ -16,7 +16,7 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use cua_driver_core::app_recipe::{fp8_of, MenuEntry, VerifiedShortcut, VersionSource};
+use cua_driver_core::app_recipe::{fp8_of, MenuEntry, RelativeAnchor, VerifiedShortcut, VersionSource};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
@@ -30,6 +30,17 @@ pub struct InspectAppFlowRequest {
     pub window_id: Option<u64>,
     pub app_path: Option<String>,
     pub display_id: Option<String>,
+}
+
+/// Salient visual region hotspot in normalized window coordinates (`0.0..=1.0`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VisualHotspot {
+    pub id: String,
+    pub rel_x: f64,
+    pub rel_y: f64,
+    pub rel_w: f64,
+    pub rel_h: f64,
+    pub hint: String,
 }
 
 /// Structured output returned by `inspect_app_flow`.
@@ -53,6 +64,16 @@ pub struct AppFlowInspection {
     pub verified_shortcuts: Vec<VerifiedShortcut>,
     pub menu_topology: Vec<MenuEntry>,
     pub interactive_elements_count: usize,
+    pub atspi_blind: bool,
+    pub recommended_interaction: String,
+    #[serde(default)]
+    pub remediation_hints: Vec<String>,
+    #[serde(default)]
+    pub launch_isolation_hints: Vec<String>,
+    #[serde(default)]
+    pub visual_hotspots: Vec<VisualHotspot>,
+    #[serde(default)]
+    pub discovered_anchors: Vec<RelativeAnchor>,
     pub sample_roles: Vec<String>,
     pub notes: Vec<String>,
 }
@@ -64,6 +85,7 @@ pub fn inspect_app_flow(req: InspectAppFlowRequest) -> Result<AppFlowInspection>
     let mut pid = req.pid;
     let mut window_title = None;
     let mut wm_class = None;
+    let mut window_geom: Option<(i32, i32, u32, u32)> = None;
 
     if let Some(xid) = req.window_id {
         let target = DisplayTarget::from_display_id(req.display_id.as_deref())?;
@@ -75,6 +97,9 @@ pub fn inspect_app_flow(req: InspectAppFlowRequest) -> Result<AppFlowInspection>
                 }
                 if !info.app_name.is_empty() {
                     wm_class = Some(info.app_name);
+                }
+                if info.width > 0 && info.height > 0 {
+                    window_geom = Some((info.x, info.y, info.width, info.height));
                 }
             }
         }
@@ -118,6 +143,12 @@ pub fn inspect_app_flow(req: InspectAppFlowRequest) -> Result<AppFlowInspection>
             verified_shortcuts: Vec::new(),
             menu_topology: Vec::new(),
             interactive_elements_count: 0,
+            atspi_blind: false,
+            recommended_interaction: "chrome_devtools".to_owned(),
+            remediation_hints: Vec::new(),
+            launch_isolation_hints: Vec::new(),
+            visual_hotspots: Vec::new(),
+            discovered_anchors: Vec::new(),
             sample_roles: Vec::new(),
             notes: vec!["Routed to browser_exempt channel".to_owned()],
         });
@@ -126,6 +157,7 @@ pub fn inspect_app_flow(req: InspectAppFlowRequest) -> Result<AppFlowInspection>
     let mut notes = Vec::new();
     let mut shortcuts = Vec::new();
     let mut menu_topology = Vec::new();
+    let mut launch_isolation_hints = Vec::new();
 
     // Resolve base directory for static artifact inspection.
     let base_dir = exe_path.as_deref().map(|p| {
@@ -138,14 +170,21 @@ pub fn inspect_app_flow(req: InspectAppFlowRequest) -> Result<AppFlowInspection>
 
     let (app_id, app_version, version_source, tech_stack, fp_target) =
         if let Some(dir) = base_dir.as_deref() {
-            if let Some(java) = inspect_java_install4j(dir, &mut shortcuts, &mut notes) {
+            if let Some(java) =
+                inspect_java_install4j(dir, &mut shortcuts, &mut menu_topology, &mut launch_isolation_hints, &mut notes)
+            {
                 java
             } else if let Some(dotnet) = inspect_dotnet_avalonia(dir, exe_path.as_deref(), &mut notes)
             {
                 dotnet
-            } else if let Some(electron) =
-                inspect_electron_app(dir, exe_path.as_deref(), &mut shortcuts, &mut menu_topology, &mut notes)
-            {
+            } else if let Some(electron) = inspect_electron_app(
+                dir,
+                exe_path.as_deref(),
+                &mut shortcuts,
+                &mut menu_topology,
+                &mut launch_isolation_hints,
+                &mut notes,
+            ) {
                 electron
             } else {
                 inspect_native_fallback(exe_path.as_deref(), wm_class.as_deref(), &mut notes)
@@ -163,23 +202,55 @@ pub fn inspect_app_flow(req: InspectAppFlowRequest) -> Result<AppFlowInspection>
     // Tier 1 runtime AT-SPI2 tree walk when a live PID is available.
     let mut interactive_elements_count = 0usize;
     let mut sample_roles = BTreeSet::new();
+    let mut discovered_anchors = Vec::new();
     if let Some(live_pid) = pid {
         let xid = req.window_id.unwrap_or(0);
         let walked = crate::atspi::walk_tree(live_pid, xid, None);
         interactive_elements_count = walked.nodes.len();
+        let bounds_map: std::collections::HashMap<usize, (i32, i32, u32, u32)> = walked
+            .bounds
+            .iter()
+            .map(|&(idx, bx, by, bw, bh)| (idx, (bx, by, bw, bh)))
+            .collect();
+
         for node in walked.nodes.iter().take(200) {
             if !node.role.is_empty() {
                 sample_roles.insert(node.role.clone());
             }
-            if node.role.contains("menu") {
-                if let Some(ref name) = node.name {
-                    if !name.is_empty() {
+            if let Some(ref name) = node.name {
+                if !name.is_empty() {
+                    if (node.role.contains("menu")
+                        || node.role.contains("tab")
+                        || node.role.contains("button"))
+                        && menu_topology.len() < 80
+                    {
                         menu_topology.push(MenuEntry {
                             path: vec![name.clone()],
                             label: name.clone(),
                             shortcut: None,
                             role: Some(node.role.clone()),
                         });
+                    }
+                    if discovered_anchors.len() < 40 {
+                        if let Some(el_idx) = node.element_index {
+                            if let Some(&(bx, by, bw, bh)) = bounds_map.get(&el_idx) {
+                                let (rel_x, rel_y) = if let Some((wx, wy, ww, wh)) = window_geom {
+                                    (
+                                        (f64::from(bx - wx) + f64::from(bw) * 0.5) / f64::from(ww.max(1)),
+                                        (f64::from(by - wy) + f64::from(bh) * 0.5) / f64::from(wh.max(1)),
+                                    )
+                                } else {
+                                    (f64::from(bx), f64::from(by))
+                                };
+                                discovered_anchors.push(RelativeAnchor {
+                                    name: name.clone(),
+                                    role: Some(node.role.clone()),
+                                    title_pattern: window_title.clone(),
+                                    rel_x,
+                                    rel_y,
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -188,6 +259,37 @@ pub fn inspect_app_flow(req: InspectAppFlowRequest) -> Result<AppFlowInspection>
             notes.push(format!("AT-SPI note: {reason}"));
         }
     }
+
+    let atspi_blind = ((pid.is_some() || req.window_id.is_some()) && interactive_elements_count == 0)
+        || (pid.is_none() && tech_stack == "java_install4j");
+    let mut remediation_hints = Vec::new();
+    let recommended_interaction = if atspi_blind {
+        if tech_stack == "java_install4j" {
+            remediation_hints.push(
+                "Configure accessibility.properties (org.GNOME.Accessibility.AtkWrapper) in the app JRE, or rely on visual grounding + hotkeys."
+                    .to_owned(),
+            );
+        } else if tech_stack == "electron" {
+            remediation_hints.push(
+                "Launch with --force-renderer-accessibility for full AT-SPI2 DOM tree, or rely on visual grounding + hotkeys."
+                    .to_owned(),
+            );
+        } else {
+            remediation_hints.push(
+                "AT-SPI2 returned 0 interactive elements; use visual grounding + hotkeys."
+                    .to_owned(),
+            );
+        }
+        "visual_grounding_plus_hotkeys".to_owned()
+    } else {
+        "atspi_semantic".to_owned()
+    };
+
+    let visual_hotspots = if atspi_blind {
+        extract_visual_hotspots(req.window_id, pid, req.display_id.as_deref())
+    } else {
+        Vec::new()
+    };
 
     Ok(AppFlowInspection {
         channel: "desktop_recipe".to_owned(),
@@ -204,9 +306,129 @@ pub fn inspect_app_flow(req: InspectAppFlowRequest) -> Result<AppFlowInspection>
         verified_shortcuts: shortcuts,
         menu_topology,
         interactive_elements_count,
+        atspi_blind,
+        recommended_interaction,
+        remediation_hints,
+        launch_isolation_hints,
+        visual_hotspots,
+        discovered_anchors,
         sample_roles: sample_roles.into_iter().collect(),
         notes,
     })
+}
+
+fn extract_visual_hotspots(
+    window_id: Option<u64>,
+    pid: Option<u32>,
+    display_id: Option<&str>,
+) -> Vec<VisualHotspot> {
+    let target_xid = window_id.or_else(|| {
+        let p = pid?;
+        let target = DisplayTarget::from_display_id(display_id).ok()?;
+        let ctx = global_screen_pool().get_or_connect(&target).ok()?;
+        crate::x11::list_windows_with_context(&ctx, Some(p))
+            .into_iter()
+            .next()
+            .map(|w| w.xid)
+    });
+
+    if let Some(xid) = target_xid {
+        if let Ok(target) = DisplayTarget::from_display_id(display_id) {
+            if let Ok(ctx) = global_screen_pool().get_or_connect(&target) {
+                if let Ok(png) = crate::capture::screenshot_window_bytes_with_context(&ctx, xid) {
+                    if let Some(spots) = compute_salient_grid_hotspots(&png) {
+                        if !spots.is_empty() {
+                            return spots;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback structural hotspots for AT-SPI-blind windows when offscreen capture is unavailable.
+    vec![
+        VisualHotspot {
+            id: "toolbar_band".to_owned(),
+            rel_x: 0.5,
+            rel_y: 0.08,
+            rel_w: 0.9,
+            rel_h: 0.1,
+            hint: "Top menu/toolbar region (visual fallback)".to_owned(),
+        },
+        VisualHotspot {
+            id: "primary_workspace".to_owned(),
+            rel_x: 0.5,
+            rel_y: 0.5,
+            rel_w: 0.8,
+            rel_h: 0.65,
+            hint: "Central interactive canvas/table region (visual fallback)".to_owned(),
+        },
+        VisualHotspot {
+            id: "modal_action_bar".to_owned(),
+            rel_x: 0.5,
+            rel_y: 0.88,
+            rel_w: 0.6,
+            rel_h: 0.12,
+            hint: "Bottom dialog confirm/dismiss button band (visual fallback)".to_owned(),
+        },
+    ]
+}
+
+fn compute_salient_grid_hotspots(png_bytes: &[u8]) -> Option<Vec<VisualHotspot>> {
+    let img = image::load_from_memory(png_bytes).ok()?.to_luma8();
+    let (w, h) = img.dimensions();
+    if w < 12 || h < 8 {
+        return None;
+    }
+    let cols = 6u32;
+    let rows = 4u32;
+    let cw = (w / cols).max(1);
+    let ch = (h / rows).max(1);
+    let mut scored: Vec<(u64, u32, u32)> = Vec::new();
+
+    for r in 0..rows {
+        for c in 0..cols {
+            let x0 = c * cw;
+            let y0 = r * ch;
+            let x1 = ((c + 1) * cw).min(w);
+            let y1 = ((r + 1) * ch).min(h);
+            let mut edge_sum: u64 = 0;
+            for y in y0..y1.saturating_sub(1) {
+                for x in x0..x1.saturating_sub(1) {
+                    let p = i32::from(img.get_pixel(x, y).0[0]);
+                    let px = i32::from(img.get_pixel(x + 1, y).0[0]);
+                    let py = i32::from(img.get_pixel(x, y + 1).0[0]);
+                    edge_sum += ((p - px).abs() + (p - py).abs()) as u64;
+                }
+            }
+            if edge_sum > 0 {
+                scored.push((edge_sum, c, r));
+            }
+        }
+    }
+
+    scored.sort_by_key(|b| std::cmp::Reverse(b.0));
+    let hotspots = scored
+        .into_iter()
+        .take(6)
+        .enumerate()
+        .map(|(idx, (_score, c, r))| {
+            let rel_w = 1.0 / f64::from(cols);
+            let rel_h = 1.0 / f64::from(rows);
+            let rel_x = (f64::from(c) + 0.5) * rel_w;
+            let rel_y = (f64::from(r) + 0.5) * rel_h;
+            VisualHotspot {
+                id: format!("hotspot_{idx}_{c}_{r}"),
+                rel_x,
+                rel_y,
+                rel_w,
+                rel_h,
+                hint: format!("High-contrast visual region (grid {c},{r})"),
+            }
+        })
+        .collect();
+    Some(hotspots)
 }
 
 fn is_chrome_or_chromium(
@@ -251,6 +473,8 @@ type DetectedTuple = (String, String, VersionSource, String, Option<PathBuf>);
 fn inspect_java_install4j(
     dir: &Path,
     shortcuts: &mut Vec<VerifiedShortcut>,
+    menu_topology: &mut Vec<MenuEntry>,
+    launch_isolation_hints: &mut Vec<String>,
     notes: &mut Vec<String>,
 ) -> Option<DetectedTuple> {
     let varfile = dir.join(".install4j").join("response.varfile");
@@ -273,6 +497,12 @@ fn inspect_java_install4j(
             }
             if let Some(mc) = main_class {
                 notes.push(format!("Main-Class: {mc}"));
+                menu_topology.push(MenuEntry {
+                    path: vec!["Entry".to_owned(), mc.clone()],
+                    label: mc,
+                    shortcut: None,
+                    role: Some("java_main_class".to_owned()),
+                });
             }
             shortcuts.extend(jar_shortcuts);
         }
@@ -283,6 +513,26 @@ fn inspect_java_install4j(
         .and_then(|n| n.to_str())
         .unwrap_or("java-app")
         .to_ascii_lowercase();
+    if app_id.contains("tws") || dir.join("tws.vmoptions").is_file() {
+        launch_isolation_hints.push(
+            "-J-DjtsConfigDir=${CUA_YCWANG_HOME:-$HOME/.cua-ycwang}/jts".to_owned(),
+        );
+        if shortcuts.is_empty() {
+            shortcuts.push(VerifiedShortcut {
+                id: "tws.dismiss_modal".to_owned(),
+                keys: vec!["Escape".to_owned()],
+                description: Some("Dismiss startup warning or pending tasks modal".to_owned()),
+                source: "java_install4j_default".to_owned(),
+            });
+            shortcuts.push(VerifiedShortcut {
+                id: "tws.order_ticket".to_owned(),
+                keys: vec!["ctrl".to_owned(), "o".to_owned()],
+                description: Some("Open Order Ticket".to_owned()),
+                source: "java_install4j_default".to_owned(),
+            });
+        }
+    }
+
     let ver = version.unwrap_or_else(|| "unknown".to_owned());
     Some((
         app_id,
@@ -415,6 +665,7 @@ fn inspect_electron_app(
     exe_path: Option<&Path>,
     shortcuts: &mut Vec<VerifiedShortcut>,
     menu_topology: &mut Vec<MenuEntry>,
+    launch_isolation_hints: &mut Vec<String>,
     notes: &mut Vec<String>,
 ) -> Option<DetectedTuple> {
     let pkg_json = dir.join("resources").join("app").join("package.json");
@@ -435,31 +686,65 @@ fn inspect_electron_app(
         .unwrap_or("unknown")
         .to_owned();
 
-    if let Some(kb) = json.pointer("/contributes/keybindings").and_then(Value::as_array) {
-        for item in kb.iter().take(64) {
-            if let (Some(cmd), Some(key)) = (
-                item.get("command").and_then(Value::as_str),
-                item.get("key").and_then(Value::as_str),
-            ) {
-                shortcuts.push(VerifiedShortcut {
-                    id: cmd.to_owned(),
-                    keys: key.split('+').map(str::trim).map(ToOwned::to_owned).collect(),
-                    description: None,
-                    source: "package.json".to_owned(),
-                });
+    launch_isolation_hints
+        .push("--user-data-dir=${CUA_YCWANG_HOME:-$HOME/.cua-ycwang}/electron_profile".to_owned());
+
+    let collect_contributes = |doc: &Value,
+                               source: &str,
+                               shortcuts: &mut Vec<VerifiedShortcut>,
+                               menu_topology: &mut Vec<MenuEntry>| {
+        if let Some(kb) = doc.pointer("/contributes/keybindings").and_then(Value::as_array) {
+            for item in kb {
+                if shortcuts.len() >= 64 {
+                    break;
+                }
+                if let (Some(cmd), Some(key)) = (
+                    item.get("command").and_then(Value::as_str),
+                    item.get("key").and_then(Value::as_str),
+                ) {
+                    shortcuts.push(VerifiedShortcut {
+                        id: cmd.to_owned(),
+                        keys: key.split('+').map(str::trim).map(ToOwned::to_owned).collect(),
+                        description: None,
+                        source: source.to_owned(),
+                    });
+                }
             }
         }
-    }
 
-    if let Some(cmds) = json.pointer("/contributes/commands").and_then(Value::as_array) {
-        for item in cmds.iter().take(64) {
-            if let Some(title) = item.get("title").and_then(Value::as_str) {
-                menu_topology.push(MenuEntry {
-                    path: vec![title.to_owned()],
-                    label: title.to_owned(),
-                    shortcut: None,
-                    role: Some("command".to_owned()),
-                });
+        if let Some(cmds) = doc.pointer("/contributes/commands").and_then(Value::as_array) {
+            for item in cmds {
+                if menu_topology.len() >= 64 {
+                    break;
+                }
+                if let Some(title) = item.get("title").and_then(Value::as_str) {
+                    menu_topology.push(MenuEntry {
+                        path: vec![title.to_owned()],
+                        label: title.to_owned(),
+                        shortcut: None,
+                        role: Some("command".to_owned()),
+                    });
+                }
+            }
+        }
+    };
+
+    collect_contributes(&json, "package.json", shortcuts, menu_topology);
+
+    // Built-in Electron extensions (e.g. VS Code extensions/*/package.json).
+    let ext_dir = dir.join("resources").join("app").join("extensions");
+    if ext_dir.is_dir() && (shortcuts.is_empty() || menu_topology.is_empty()) {
+        if let Ok(entries) = fs::read_dir(&ext_dir) {
+            for entry in entries.flatten().take(30) {
+                let ext_pkg = entry.path().join("package.json");
+                if let Ok(ext_text) = fs::read_to_string(&ext_pkg) {
+                    if let Ok(ext_json) = serde_json::from_str::<Value>(&ext_text) {
+                        collect_contributes(&ext_json, "extension_package.json", shortcuts, menu_topology);
+                    }
+                }
+                if shortcuts.len() >= 32 && menu_topology.len() >= 32 {
+                    break;
+                }
             }
         }
     }

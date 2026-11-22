@@ -14,7 +14,8 @@ use async_trait::async_trait;
 use cua_driver_core::{
     app_recipe::{
         find_matching_recipe, global_recipe_cache, load_recipe, recipes_dir, save_recipe_to_dir,
-        AppRecipe, AuthGate, RecipeState, RecipeTransition, StateMachine, VerifyResult, VersionGate,
+        AppRecipe, AuthGate, ModalHandler, RecipeState, RecipeTransition, RelativeAnchor,
+        StateMachine, VerifyResult, VersionGate,
     },
     protocol::ToolResult,
     tool::{Tool, ToolDef},
@@ -195,16 +196,64 @@ impl Tool for GenerateAppRecipeTool {
                 });
             }
 
+            let relative_anchors: Vec<RelativeAnchor> = if !inspection.discovered_anchors.is_empty()
+            {
+                inspection.discovered_anchors.clone()
+            } else {
+                inspection
+                    .visual_hotspots
+                    .iter()
+                    .map(|h| RelativeAnchor {
+                        name: h.id.clone(),
+                        role: None,
+                        title_pattern: inspection.window_title.clone(),
+                        rel_x: h.rel_x,
+                        rel_y: h.rel_y,
+                    })
+                    .collect()
+            };
+
+            let mut modal_handlers = Vec::new();
+            if inspection.tech_stack == "java_install4j" {
+                modal_handlers.push(ModalHandler {
+                    pattern: ".*(Pending Tasks|Login Messages|Warning).*".to_owned(),
+                    action: "press_key".to_owned(),
+                    key: Some("Escape".to_owned()),
+                });
+                if transitions.is_empty() {
+                    states.push(RecipeState {
+                        id: "workspace".to_owned(),
+                        description: Some("Main workspace after initial settle".to_owned()),
+                        title_regex: None,
+                        expected_roles: Vec::new(),
+                        auth_gate: None,
+                        captcha_patterns: Vec::new(),
+                    });
+                    transitions.push(RecipeTransition {
+                        from_state: "ready".to_owned(),
+                        to_state: "workspace".to_owned(),
+                        action: "wait_for_stable_frame".to_owned(),
+                        args: json!({ "wait_for_stable_frame_ms": 500 }),
+                        wait_for_stable_frame_ms: Some(500),
+                        on_error: Some("dismiss_modal_and_retry".to_owned()),
+                    });
+                }
+            }
+
             let recipe = AppRecipe {
                 schema_version: 1,
                 app_id,
                 app_version: inspection.app_version,
                 version_source: inspection.version_source,
                 fingerprint_sha256: inspection.fingerprint_sha256,
+                tech_stack: Some(inspection.tech_stack),
+                atspi_blind: inspection.atspi_blind,
+                recommended_interaction: Some(inspection.recommended_interaction),
+                launch_isolation_hints: inspection.launch_isolation_hints,
                 verified_shortcuts: inspection.verified_shortcuts,
                 menu_topology: inspection.menu_topology,
-                relative_anchors: Vec::new(),
-                modal_handlers: Vec::new(),
+                relative_anchors,
+                modal_handlers,
                 state_machine: StateMachine {
                     initial_state: "ready".to_owned(),
                     states,
