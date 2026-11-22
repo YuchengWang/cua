@@ -23,7 +23,7 @@
 - **Verified / 全量验收**：
   - `CUA_YCWANG_CONFIG_DIR=~/.config/cua-ycwang CUA_YCWANG_HOME=~/.cua-ycwang ~/.local/bin/cua-ycwang doctor --json` returned `ok: true` with `elevation_required` (`io.github.yuchengwang.cua.uinput.setup`) when system rules are not yet installed.
   - Real Xorg E2E tests passed: `virtual_screen_m2_xorg` (4/4), `virtual_screen_m3_e2e_xorg` (2/2), `virtual_screen_m4_xorg` (2/2), and `cua-driver-core batch_tools` (69/69, `--test-threads=1`).
-  - Security audits (`cua-security-auditor`) passed across M1–M4 (`0600` xauth/VNC passwords, `127.0.0.1` VNC, clipboard isolation, `screen_locked` guard, `elevate` allowlist).
+  - Security audits passed across M1–M4 (`0600` xauth/VNC passwords, `127.0.0.1` VNC, clipboard isolation, `screen_locked` guard, `elevate` allowlist).
 
 ### Milestone 4: Desktop Interaction Enhancements, `doctor --json` & `elevate` (`2026-11-22`, Landed)
 - **Added / 新增**：
@@ -49,7 +49,7 @@
   - `cua-driver-core/src/authorization.rs` & `tool.rs`: Classified virtual screen tools under `RiskClass::R3` with `display.virtual` capability.
   - `platform-linux/src/tools/{mod.rs,impl_.rs,get_desktop_state.rs,get_screen_size.rs,list_windows.rs}`: Wired `display_id` routing through `X11ScreenPool` and registered the 4 virtual screen MCP tools.
 - **Verified / 已核验**：
-  - M3 security audit (`cua-security-auditor`) passed across `virtual_screen.rs`, `mcp_virtual_screen.rs`, `authorization.rs`, `tool.rs`, and `reap_stale_runtime()` (`0600` xauth/VNC passwords, `127.0.0.1` VNC, no shell injection).
+  - M3 security audit passed across `virtual_screen.rs`, `mcp_virtual_screen.rs`, `authorization.rs`, `tool.rs`, and `reap_stale_runtime()` (`0600` xauth/VNC passwords, `127.0.0.1` VNC, no shell injection).
 
 ### Milestone 2: `X11ScreenPool` & `XComposite` Offscreen Capture (`2026-11-22`, Landed)
 - **Added / 新增**：
@@ -97,4 +97,4 @@
 ---
 
 ### Target Release Tag
-- `ycwang-x11-v0.57.0-m5` on `feat/x11-virtual-desktop` (pending final MCP JSON-RPC E2E & `git commit` by `cua-driver-dev`).
+- `ycwang-x11-v0.57.0-m5` on `feat/x11-virtual-desktop` (Maintainer: `Yucheng Wang <wfing123@gmail.com>`).
