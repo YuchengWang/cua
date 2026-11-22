@@ -167,15 +167,23 @@ pub fn inspect_app_flow(req: InspectAppFlowRequest) -> Result<AppFlowInspection>
             p.parent().unwrap_or_else(|| Path::new("/")).to_path_buf()
         }
     });
+    let install4j_dir = resolve_install4j_dir(base_dir.as_deref(), pid, &cmdline);
 
     let (app_id, app_version, version_source, tech_stack, fp_target) =
-        if let Some(dir) = base_dir.as_deref() {
-            if let Some(java) =
-                inspect_java_install4j(dir, &mut shortcuts, &mut menu_topology, &mut launch_isolation_hints, &mut notes)
-            {
-                java
-            } else if let Some(dotnet) = inspect_dotnet_avalonia(dir, exe_path.as_deref(), &mut notes)
-            {
+        if let Some(dir) = install4j_dir.as_deref() {
+            inspect_java_install4j(
+                dir,
+                window_title.as_deref(),
+                &mut shortcuts,
+                &mut menu_topology,
+                &mut launch_isolation_hints,
+                &mut notes,
+            )
+            .unwrap_or_else(|| {
+                inspect_native_fallback(exe_path.as_deref(), wm_class.as_deref(), &mut notes)
+            })
+        } else if let Some(dir) = base_dir.as_deref() {
+            if let Some(dotnet) = inspect_dotnet_avalonia(dir, exe_path.as_deref(), &mut notes) {
                 dotnet
             } else if let Some(electron) = inspect_electron_app(
                 dir,
@@ -469,9 +477,57 @@ fn resolve_proc_cmdline(pid: u32) -> Option<String> {
 
 type DetectedTuple = (String, String, VersionSource, String, Option<PathBuf>);
 
-/// Tier 2: Java `install4j` detector (e.g. IBKR TWS).
+fn is_install4j_dir(dir: &Path) -> bool {
+    dir.join(".install4j").join("response.varfile").exists()
+        || dir.join("jars").is_dir()
+        || dir.join("usergui").is_dir()
+}
+
+fn resolve_install4j_dir(
+    base_dir: Option<&Path>,
+    pid: Option<u32>,
+    cmdline: &str,
+) -> Option<PathBuf> {
+    if let Some(dir) = base_dir {
+        if is_install4j_dir(dir) {
+            return Some(dir.to_path_buf());
+        }
+    }
+    if let Some(p) = pid {
+        if let Ok(cwd) = fs::read_link(format!("/proc/{p}/cwd")) {
+            if is_install4j_dir(&cwd) {
+                return Some(cwd);
+            }
+        }
+    }
+    for token in cmdline.split(|c: char| c.is_whitespace() || c == ':') {
+        if let Some(idx) = token.find("/.install4j/") {
+            let root = PathBuf::from(&token[..idx]);
+            if is_install4j_dir(&root) {
+                return Some(root);
+            }
+        }
+        if token.ends_with("/launcher.jar") || token.contains("twslaunch") {
+            let p = Path::new(token);
+            if let Some(parent) = p.parent() {
+                let candidate = if parent.file_name().and_then(|n| n.to_str()) == Some("jars") {
+                    parent.parent().unwrap_or(parent)
+                } else {
+                    parent
+                };
+                if is_install4j_dir(candidate) {
+                    return Some(candidate.to_path_buf());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Tier 2: Java `install4j` detector (e.g. IBKR TWS and Schwab Thinkorswim).
 fn inspect_java_install4j(
     dir: &Path,
+    window_title: Option<&str>,
     shortcuts: &mut Vec<VerifiedShortcut>,
     menu_topology: &mut Vec<MenuEntry>,
     launch_isolation_hints: &mut Vec<String>,
@@ -479,17 +535,28 @@ fn inspect_java_install4j(
 ) -> Option<DetectedTuple> {
     let varfile = dir.join(".install4j").join("response.varfile");
     let jars_dir = dir.join("jars");
-    if !varfile.exists() && !jars_dir.is_dir() {
+    let usergui_dir = dir.join("usergui");
+    if !varfile.exists() && !jars_dir.is_dir() && !usergui_dir.is_dir() {
         return None;
     }
 
-    let mut version = None;
-    if let Ok(text) = fs::read_to_string(&varfile) {
-        version = parse_install4j_version(&text);
+    let mut version = find_highest_usergui_jar(&usergui_dir).map(|(ver, _)| ver);
+    let usergui_jar = find_highest_usergui_jar(&usergui_dir).map(|(_, jar)| jar);
+
+    if version.is_none() {
+        if let Ok(text) = fs::read_to_string(&varfile) {
+            version = parse_install4j_version(&text);
+        }
     }
 
-    // Pick the highest-versioned launch JAR (e.g. twslaunch-1052.jar > twslaunch-1050.jar).
-    let primary_jar = find_highest_version_jar(&jars_dir);
+    // Pick the highest-versioned launch JAR (e.g. twslaunch-1052.jar > twslaunch-1050.jar),
+    // or fall back to Thinkorswim's `tos-usergui-base-*.jar` / `launcher.jar`.
+    let primary_jar = usergui_jar
+        .or_else(|| find_highest_version_jar(&jars_dir))
+        .or_else(|| {
+            let launcher = dir.join("launcher.jar");
+            launcher.is_file().then_some(launcher)
+        });
     if let Some(ref jar_path) = primary_jar {
         if let Ok((impl_ver, main_class, jar_shortcuts)) = inspect_jar_archive(jar_path) {
             if version.is_none() {
@@ -508,12 +575,51 @@ fn inspect_java_install4j(
         }
     }
 
-    let app_id = dir
+    if version.is_none() {
+        version = window_title.and_then(parse_window_title_build);
+    }
+
+    let dir_name = dir
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("java-app")
         .to_ascii_lowercase();
-    if app_id.contains("tws") || dir.join("tws.vmoptions").is_file() {
+    let is_thinkorswim = dir_name.contains("thinkorswim")
+        || dir.join("thinkorswim").is_file()
+        || usergui_dir.is_dir()
+        || dir.join("jxbrowser").is_dir()
+        || window_title.is_some_and(|t| t.to_ascii_lowercase().contains("thinkorswim"));
+    let is_tws = !is_thinkorswim && (dir_name.contains("tws") || dir.join("tws.vmoptions").is_file());
+
+    let app_id = if is_thinkorswim {
+        "thinkorswim".to_owned()
+    } else if is_tws {
+        "tws".to_owned()
+    } else {
+        dir_name
+    };
+
+    if is_thinkorswim {
+        launch_isolation_hints.push("unset DBUS_SESSION_BUS_ADDRESS".to_owned());
+        launch_isolation_hints.push("-Djxbrowser.linux.deps.check.disabled=true".to_owned());
+        if dir.join("jxbrowser").is_dir() {
+            notes.push("Embedded JxBrowser Chromium runtime detected".to_owned());
+        }
+        if shortcuts.is_empty() {
+            shortcuts.push(VerifiedShortcut {
+                id: "tos.dismiss_modal".to_owned(),
+                keys: vec!["Escape".to_owned()],
+                description: Some("Dismiss modal dialog or popup".to_owned()),
+                source: "java_install4j_default".to_owned(),
+            });
+            shortcuts.push(VerifiedShortcut {
+                id: "tos.symbol_focus".to_owned(),
+                keys: vec!["ctrl".to_owned(), "l".to_owned()],
+                description: Some("Focus symbol lookup box".to_owned()),
+                source: "java_install4j_default".to_owned(),
+            });
+        }
+    } else if is_tws {
         launch_isolation_hints.push(
             "-J-DjtsConfigDir=${CUA_YCWANG_HOME:-$HOME/.cua-ycwang}/jts".to_owned(),
         );
@@ -544,7 +650,7 @@ fn inspect_java_install4j(
 }
 
 pub(crate) fn parse_install4j_version(text: &str) -> Option<String> {
-    // Matches e.g. `# Trader Workstation latest (10.52.1d)`
+    // Matches e.g. `# Trader Workstation latest (10.52.1d)` or `# install4j response file for thinkorswim 1991.3.0`
     for line in text.lines() {
         if let (Some(start), Some(end)) = (line.rfind('('), line.rfind(')')) {
             if start < end {
@@ -554,8 +660,72 @@ pub(crate) fn parse_install4j_version(text: &str) -> Option<String> {
                 }
             }
         }
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            if let Some(last) = trimmed.split_whitespace().last() {
+                if last.chars().any(|c| c.is_ascii_digit()) && last.contains('.') {
+                    return Some(last.to_owned());
+                }
+            }
+        }
     }
     None
+}
+
+pub(crate) fn parse_window_title_build(title: &str) -> Option<String> {
+    // Matches e.g. `Main@thinkorswim [build 1994]`
+    let lower = title.to_ascii_lowercase();
+    let idx = lower.find("[build ")?;
+    let rest = &title[idx + 7..];
+    let end = rest.find(']')?;
+    let build = rest[..end].trim();
+    (!build.is_empty() && build.chars().all(|c| c.is_ascii_digit() || c == '.'))
+        .then(|| build.to_owned())
+}
+
+fn parse_version_tuple(s: &str) -> Vec<u64> {
+    s.split('.')
+        .map(|part| {
+            let digits: String = part.chars().take_while(|c| c.is_ascii_digit()).collect();
+            digits.parse::<u64>().unwrap_or(0)
+        })
+        .collect()
+}
+
+fn find_highest_usergui_jar(usergui_dir: &Path) -> Option<(String, PathBuf)> {
+    let entries = fs::read_dir(usergui_dir).ok()?;
+    let mut candidates: Vec<(Vec<u64>, String, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let Some(ver_name) = dir.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !ver_name.chars().any(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let base_jar = dir.join(format!("tos-usergui-base-{ver_name}.jar"));
+        let jar_path = if base_jar.is_file() {
+            Some(base_jar)
+        } else {
+            fs::read_dir(&dir).ok().and_then(|sub| {
+                sub.flatten()
+                    .map(|e| e.path())
+                    .find(|p| {
+                        p.file_name()
+                            .and_then(|n| n.to_str())
+                            .is_some_and(|n| n.starts_with("tos-usergui-base-") && n.ends_with(".jar"))
+                    })
+            })
+        };
+        if let Some(jar) = jar_path {
+            candidates.push((parse_version_tuple(ver_name), ver_name.to_owned(), jar));
+        }
+    }
+    candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    candidates.into_iter().next().map(|(_, ver, jar)| (ver, jar))
 }
 
 fn find_highest_version_jar(jars_dir: &Path) -> Option<PathBuf> {
@@ -949,5 +1119,54 @@ mod tests {
         assert_eq!(res.version_source, VersionSource::PackageJson);
         assert_eq!(res.verified_shortcuts.len(), 1);
         assert_eq!(res.menu_topology.len(), 1);
+    }
+
+    #[test]
+    fn parses_thinkorswim_varfile_and_window_title_build() {
+        let varfile = "# install4j response file for thinkorswim 1991.3.0\nuserDomain=schwab\n";
+        assert_eq!(parse_install4j_version(varfile).as_deref(), Some("1991.3.0"));
+        assert_eq!(
+            parse_window_title_build("Main@thinkorswim [build 1994]").as_deref(),
+            Some("1994")
+        );
+    }
+
+    #[test]
+    fn inspects_thinkorswim_usergui_jar_and_jxbrowser_isolation_hints() {
+        let dir = tempfile::tempdir().unwrap();
+        let i4j = dir.path().join(".install4j");
+        let ug1 = dir.path().join("usergui").join("1994.1.10");
+        let ug2 = dir.path().join("usergui").join("1994.1.16");
+        let jxb = dir.path().join("jxbrowser");
+        fs::create_dir_all(&i4j).unwrap();
+        fs::create_dir_all(&ug1).unwrap();
+        fs::create_dir_all(&ug2).unwrap();
+        fs::create_dir_all(&jxb).unwrap();
+        fs::write(
+            i4j.join("response.varfile"),
+            "# install4j response file for thinkorswim 1991.3.0\n",
+        )
+        .unwrap();
+        fs::write(ug1.join("tos-usergui-base-1994.1.10.jar"), b"old").unwrap();
+        fs::write(ug2.join("tos-usergui-base-1994.1.16.jar"), b"new").unwrap();
+        fs::write(dir.path().join("thinkorswim"), b"#!/bin/sh\n").unwrap();
+
+        let res = inspect_app_flow(InspectAppFlowRequest {
+            app_path: Some(dir.path().display().to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(res.app_id, "thinkorswim");
+        assert_eq!(res.app_version, "1994.1.16");
+        assert_eq!(res.version_source, VersionSource::Install4j);
+        assert_eq!(res.tech_stack, "java_install4j");
+        assert!(res
+            .launch_isolation_hints
+            .iter()
+            .any(|h| h.contains("unset DBUS_SESSION_BUS_ADDRESS")));
+        assert!(res
+            .notes
+            .iter()
+            .any(|n| n.contains("JxBrowser")));
     }
 }

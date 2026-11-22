@@ -113,6 +113,18 @@ pub struct RecipeTransition {
     pub on_error: Option<String>,
 }
 
+/// Single step in a named [`AppRecipe::flows`] sequence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecipeStep {
+    pub action: String,
+    #[serde(default)]
+    pub args: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_for_stable_frame_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StateMachine {
     pub initial_state: String,
@@ -146,6 +158,8 @@ pub struct AppRecipe {
     pub relative_anchors: Vec<RelativeAnchor>,
     #[serde(default)]
     pub modal_handlers: Vec<ModalHandler>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub flows: HashMap<String, Vec<RecipeStep>>,
     pub state_machine: StateMachine,
 }
 
@@ -208,6 +222,22 @@ pub fn load_recipe(path: &Path) -> Result<AppRecipe, String> {
     serde_json::from_str(&text).map_err(|e| format!("invalid recipe {}: {e}", path.display()))
 }
 
+/// Resolve normalized [`RelativeAnchor`] coordinates `(rel_x, rel_y)` against
+/// a target window geometry `(win_x, win_y, win_w, win_h)`.
+pub fn resolve_relative_anchor_xy(
+    anchor: &RelativeAnchor,
+    win_x: i32,
+    win_y: i32,
+    win_w: u32,
+    win_h: u32,
+) -> (i16, i16) {
+    let rx = anchor.rel_x.clamp(0.0, 1.0);
+    let ry = anchor.rel_y.clamp(0.0, 1.0);
+    let x = (f64::from(win_x) + rx * f64::from(win_w.max(1))).round() as i16;
+    let y = (f64::from(win_y) + ry * f64::from(win_h.max(1))).round() as i16;
+    (x, y)
+}
+
 /// Find a recipe in `dir` matching `(app_id, app_version, fp8)`.
 pub fn find_matching_recipe(
     dir: &Path,
@@ -222,6 +252,71 @@ pub fn find_matching_recipe(
         }
     }
     None
+}
+
+/// Find the highest-fidelity recipe for `app_id` in `dir`, preferring exact
+/// `(app_version, fp8)` matches and ranking `java_install4j` / `electron` /
+/// `dotnet_avalonia` recipes above lower-fidelity `native_elf` / `vunknown`
+/// fallbacks.
+pub fn find_best_recipe_for_app(
+    dir: &Path,
+    app_id: &str,
+    preferred_version: Option<&str>,
+    preferred_sha256: Option<&str>,
+) -> Option<AppRecipe> {
+    if let (Some(ver), Some(sha)) = (preferred_version, preferred_sha256) {
+        if ver != "unknown" {
+            if let Some(exact) = find_matching_recipe(dir, app_id, ver, sha) {
+                return Some(exact);
+            }
+        }
+    }
+
+    let preferred_fp8 = preferred_sha256.map(fp8_of);
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut best: Option<(i32, AppRecipe)> = None;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(recipe) = load_recipe(&path) else {
+            continue;
+        };
+        if !recipe.app_id.eq_ignore_ascii_case(app_id) {
+            continue;
+        }
+        let mut score = 0i32;
+        if let Some(ver) = preferred_version.filter(|v| *v != "unknown") {
+            if recipe.app_version == ver {
+                score += 100;
+            }
+        }
+        if let Some(fp8) = preferred_fp8 {
+            if recipe.fp8() == fp8 {
+                score += 50;
+            }
+        }
+        match recipe.tech_stack.as_deref() {
+            Some("java_install4j" | "electron" | "dotnet_avalonia") => score += 20,
+            Some("native_elf") => {}
+            Some(_) => score += 10,
+            None => {}
+        }
+        if recipe.app_version != "unknown" {
+            score += 10;
+        }
+        if !recipe.relative_anchors.is_empty() || !recipe.flows.is_empty() {
+            score += 5;
+        }
+
+        if best.as_ref().is_none_or(|(best_score, _)| score > *best_score) {
+            best = Some((score, recipe));
+        }
+    }
+
+    best.map(|(_, recipe)| recipe)
 }
 
 /// Machine-readable result from [`VersionGate::verify`].
@@ -364,6 +459,7 @@ mod tests {
                 action: "press_key".to_owned(),
                 key: Some("Escape".to_owned()),
             }],
+            flows: HashMap::new(),
             state_machine: StateMachine {
                 initial_state: "login".to_owned(),
                 states: vec![RecipeState {
@@ -436,5 +532,38 @@ mod tests {
 
         cache.invalidate("tws", "7.25.1", "11223344");
         assert!(cache.get("tws", "7.25.1", "11223344").is_none());
+    }
+
+    #[test]
+    fn find_best_recipe_prefers_java_install4j_over_native_elf_vunknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut native = sample_recipe("unknown", "26b5c011727a1194");
+        native.app_id = "thinkorswim".to_owned();
+        native.version_source = VersionSource::PeOrElf;
+        native.tech_stack = Some("native_elf".to_owned());
+        save_recipe_to_dir(dir.path(), &native).unwrap();
+
+        let mut java = sample_recipe("1994.1.16", "deadbeef12345678");
+        java.app_id = "thinkorswim".to_owned();
+        java.version_source = VersionSource::Install4j;
+        java.tech_stack = Some("java_install4j".to_owned());
+        save_recipe_to_dir(dir.path(), &java).unwrap();
+
+        let picked = find_best_recipe_for_app(dir.path(), "thinkorswim", Some("unknown"), None)
+            .expect("should find a recipe");
+        assert_eq!(picked.tech_stack.as_deref(), Some("java_install4j"));
+        assert_eq!(picked.app_version, "1994.1.16");
+    }
+
+    #[test]
+    fn resolve_relative_anchor_xy_maps_normalized_coords_to_window_geometry() {
+        let anchor = RelativeAnchor {
+            name: "charts_tab".to_owned(),
+            role: Some("tab".to_owned()),
+            title_pattern: None,
+            rel_x: 0.25,
+            rel_y: 0.5,
+        };
+        assert_eq!(resolve_relative_anchor_xy(&anchor, 100, 50, 1000, 800), (350, 450));
     }
 }

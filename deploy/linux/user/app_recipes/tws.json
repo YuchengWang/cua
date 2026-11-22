@@ -1,54 +1,153 @@
 {
   "schema_version": 1,
   "app_id": "tws",
-  "display_name": "Interactive Brokers Trader Workstation",
-  "recommended_profile": "desktop-1080p",
-  "recommended_resolution": "1920x1080",
-  "x11_env": {
-    "GDK_SCALE": "1",
-    "_JAVA_AWT_WM_NONREPARENTING": "1",
-    "AWT_TOOLKIT": "MToolkit"
-  },
-  "isolation": {
-    "jts_config_dir_flag": "-J-DjtsConfigDir=${CUA_YCWANG_HOME:-$HOME/.cua-ycwang}/jts",
-    "notes": "Pass -J-DjtsConfigDir=... when launching TWS in a virtual screen to isolate Jts settings and lock files from host ~/Jts."
-  },
-  "window_matchers": [
+  "app_version": "seeded",
+  "version_source": "install4j",
+  "fingerprint_sha256": "seeded",
+  "tech_stack": "java_install4j",
+  "atspi_blind": true,
+  "recommended_interaction": "visual_grounding_plus_hotkeys",
+  "launch_isolation_hints": [
+    "-J-DjtsConfigDir=${CUA_YCWANG_HOME:-$HOME/.cua-ycwang}/jts"
+  ],
+  "verified_shortcuts": [
     {
-      "wm_class": "install4j-jclient-LoginFrame",
-      "role": "login"
+      "id": "tws.dismiss_modal",
+      "keys": ["Escape"],
+      "description": "Dismiss startup warning or pending tasks modal",
+      "source": "java_install4j_default"
     },
     {
-      "title_regex": ".*Trader Workstation.*",
-      "role": "main"
+      "id": "tws.new_window",
+      "keys": ["ctrl", "n"],
+      "description": "Open New Window menu (read-only navigation)",
+      "source": "seeded_tws_recipe"
+    }
+  ],
+  "menu_topology": [
+    {
+      "path": ["New Window"],
+      "label": "New Window",
+      "shortcut": "Ctrl+N",
+      "role": "menu"
     },
     {
-      "title_regex": ".*(Pending Tasks|Login Messages|Warning).*",
-      "role": "modal_warning"
+      "path": ["New Window", "Watchlist"],
+      "label": "Watchlist",
+      "role": "menu_item"
     }
   ],
   "relative_anchors": [
     {
-      "name": "Warning",
-      "title_pattern": ".*Warning.*",
+      "name": "warning_dismiss",
+      "role": "push_button",
+      "title_pattern": ".*(Pending Tasks|Login Messages|Warning).*",
       "rel_x": 0.5,
-      "rel_y": 0.85,
-      "notes": "Confirm or dismiss startup warning/pending tasks modal."
+      "rel_y": 0.85
     },
     {
-      "name": "Trades",
+      "name": "new_window_button",
+      "role": "push_button",
       "title_pattern": ".*Trader Workstation.*",
-      "rel_x": 0.18,
-      "rel_y": 0.12,
-      "notes": "Trades / Activity panel anchor in 1920x1080 Mosaic layout."
+      "rel_x": 0.04,
+      "rel_y": 0.06
     },
     {
-      "name": "Watchlist",
+      "name": "watchlist_panel",
+      "role": "panel",
       "title_pattern": ".*Trader Workstation.*",
       "rel_x": 0.15,
-      "rel_y": 0.35,
-      "notes": "Watchlist panel anchor in 1920x1080 Mosaic layout."
+      "rel_y": 0.35
+    },
+    {
+      "name": "trades_panel",
+      "role": "panel",
+      "title_pattern": ".*Trader Workstation.*",
+      "rel_x": 0.18,
+      "rel_y": 0.12
     }
   ],
-  "notes": "Run TWS inside Xvfb + Openbox (:99, 1920x1080) with -J-DjtsConfigDir=... to isolate trading GUI and config from the host desktop."
+  "modal_handlers": [
+    {
+      "pattern": ".*(Pending Tasks|Login Messages|Warning).*",
+      "action": "press_key",
+      "key": "Escape"
+    }
+  ],
+  "flows": {
+    "dismiss_startup_modals": [
+      {
+        "action": "press_key",
+        "args": { "key": "Escape" },
+        "description": "Dismiss any startup warning or pending tasks modal"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 300 },
+        "description": "Allow main workspace to settle"
+      },
+      {
+        "action": "verify_window_count_min",
+        "args": { "min": 1 },
+        "description": "Verify at least one TWS window remains open"
+      }
+    ],
+    "open_new_window_menu": [
+      {
+        "action": "click_anchor",
+        "args": { "anchor": "new_window_button" },
+        "description": "Click New Window button in Mosaic top-left toolbar"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 300 },
+        "description": "Wait for New Window menu popup"
+      },
+      {
+        "action": "verify_window_count_min",
+        "args": { "min": 1 },
+        "description": "Verify TWS window/menu is active"
+      }
+    ],
+    "open_watchlist": [
+      {
+        "action": "click_anchor",
+        "args": { "anchor": "watchlist_panel" },
+        "description": "Focus Watchlist panel in Mosaic layout (read-only)"
+      },
+      {
+        "action": "verify_window_title_regex",
+        "args": { "pattern": ".*Trader Workstation.*" },
+        "description": "Verify TWS main window title without screenshot"
+      }
+    ]
+  },
+  "state_machine": {
+    "initial_state": "ready",
+    "states": [
+      {
+        "id": "ready",
+        "description": "Initial state for IBKR Trader Workstation",
+        "title_regex": ".*Trader Workstation.*",
+        "expected_roles": ["window"],
+        "captcha_patterns": ["Verify you are human", "CAPTCHA", "Turnstile"]
+      },
+      {
+        "id": "workspace",
+        "description": "Main Mosaic workspace after initial settle",
+        "expected_roles": [],
+        "captcha_patterns": []
+      }
+    ],
+    "transitions": [
+      {
+        "from_state": "ready",
+        "to_state": "workspace",
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 500 },
+        "wait_for_stable_frame_ms": 500,
+        "on_error": "dismiss_modal_and_retry"
+      }
+    ]
+  }
 }

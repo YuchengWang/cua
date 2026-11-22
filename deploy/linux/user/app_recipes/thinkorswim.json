@@ -1,0 +1,224 @@
+{
+  "schema_version": 1,
+  "app_id": "thinkorswim",
+  "app_version": "1994.1.16",
+  "version_source": "install4j",
+  "fingerprint_sha256": "6f8008dc2e5f07e8b5f43dbc29694fb3a099c91b8bf9448c914e2caae8430b61",
+  "tech_stack": "java_install4j",
+  "atspi_blind": true,
+  "recommended_interaction": "visual_grounding_plus_hotkeys",
+  "launch_isolation_hints": [
+    "unset DBUS_SESSION_BUS_ADDRESS",
+    "-Djxbrowser.linux.deps.check.disabled=true"
+  ],
+  "verified_shortcuts": [
+    {
+      "id": "tos.dismiss_modal",
+      "keys": ["Escape"],
+      "description": "Dismiss modal dialog or popup",
+      "source": "java_install4j_default"
+    },
+    {
+      "id": "tos.symbol_focus",
+      "keys": ["ctrl", "l"],
+      "description": "Focus symbol lookup input",
+      "source": "java_install4j_default"
+    }
+  ],
+  "menu_topology": [
+    { "path": ["Monitor"], "label": "Monitor", "role": "tab" },
+    { "path": ["Trade"], "label": "Trade", "role": "tab" },
+    { "path": ["Analyze"], "label": "Analyze", "role": "tab" },
+    { "path": ["Scan"], "label": "Scan", "role": "tab" },
+    { "path": ["MarketWatch"], "label": "MarketWatch", "role": "tab" },
+    { "path": ["Charts"], "label": "Charts", "role": "tab" }
+  ],
+  "relative_anchors": [
+    {
+      "name": "monitor_tab",
+      "role": "tab",
+      "title_pattern": ".*thinkorswim.*",
+      "rel_x": 0.13,
+      "rel_y": 0.045
+    },
+    {
+      "name": "trade_tab",
+      "role": "tab",
+      "title_pattern": ".*thinkorswim.*",
+      "rel_x": 0.19,
+      "rel_y": 0.045
+    },
+    {
+      "name": "analyze_tab",
+      "role": "tab",
+      "title_pattern": ".*thinkorswim.*",
+      "rel_x": 0.25,
+      "rel_y": 0.045
+    },
+    {
+      "name": "scan_tab",
+      "role": "tab",
+      "title_pattern": ".*thinkorswim.*",
+      "rel_x": 0.30,
+      "rel_y": 0.045
+    },
+    {
+      "name": "marketwatch_tab",
+      "role": "tab",
+      "title_pattern": ".*thinkorswim.*",
+      "rel_x": 0.36,
+      "rel_y": 0.045
+    },
+    {
+      "name": "charts_tab",
+      "role": "tab",
+      "title_pattern": ".*thinkorswim.*",
+      "rel_x": 0.43,
+      "rel_y": 0.045
+    },
+    {
+      "name": "probability_subtab",
+      "role": "tab",
+      "title_pattern": ".*thinkorswim.*",
+      "rel_x": 0.34,
+      "rel_y": 0.075
+    },
+    {
+      "name": "option_chain_subtab",
+      "role": "tab",
+      "title_pattern": ".*thinkorswim.*",
+      "rel_x": 0.18,
+      "rel_y": 0.075
+    },
+    {
+      "name": "symbol_input",
+      "role": "text",
+      "title_pattern": ".*thinkorswim.*",
+      "rel_x": 0.15,
+      "rel_y": 0.115
+    }
+  ],
+  "modal_handlers": [
+    {
+      "pattern": ".*(Pending Tasks|Login Messages|Warning).*",
+      "action": "press_key",
+      "key": "Escape"
+    }
+  ],
+  "flows": {
+    "verify_workspace_ready": [
+      {
+        "action": "verify_window_count_min",
+        "args": { "min": 1, "title_regex": ".*thinkorswim.*" },
+        "description": "Verify main thinkorswim window is mapped on display"
+      },
+      {
+        "action": "verify_window_title_regex",
+        "args": { "pattern": "Main@thinkorswim \\[build \\d+\\]" },
+        "description": "Verify Main@thinkorswim build title without screenshot"
+      },
+      {
+        "action": "verify_log_pattern",
+        "args": {
+          "path": "/home/ycwang/work/schwab/thinkorswim/suit.usergui.log",
+          "pattern": "build\\s+1994|thinkorswim|MainFrame",
+          "tail_bytes": 65536
+        },
+        "description": "Verify usergui log activity without screenshot"
+      }
+    ],
+    "switch_to_charts": [
+      {
+        "action": "click_anchor",
+        "args": { "anchor": "charts_tab" },
+        "description": "Switch to Charts tab (read-only)"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 400 },
+        "description": "Allow Charts view to settle"
+      },
+      {
+        "action": "verify_window_title_regex",
+        "args": { "pattern": "Main@thinkorswim \\[build \\d+\\]" },
+        "description": "Verify Main@thinkorswim remains responsive without screenshot"
+      }
+    ],
+    "switch_to_analyze_probability": [
+      {
+        "action": "click_anchor",
+        "args": { "anchor": "analyze_tab" },
+        "description": "Switch to Analyze tab (read-only)"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 300 }
+      },
+      {
+        "action": "click_anchor",
+        "args": { "anchor": "probability_subtab" },
+        "description": "Open Probability Analysis subtab (read-only)"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 300 }
+      },
+      {
+        "action": "verify_window_title_regex",
+        "args": { "pattern": "Main@thinkorswim \\[build \\d+\\]" }
+      }
+    ],
+    "switch_to_trade_option_chain": [
+      {
+        "action": "click_anchor",
+        "args": { "anchor": "trade_tab" },
+        "description": "Switch to Trade tab (read-only option chain view; no order submission)"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 300 }
+      },
+      {
+        "action": "click_anchor",
+        "args": { "anchor": "option_chain_subtab" },
+        "description": "Focus All Products / Option Chain subtab (read-only)"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 300 }
+      },
+      {
+        "action": "verify_window_title_regex",
+        "args": { "pattern": "Main@thinkorswim \\[build \\d+\\]" }
+      }
+    ]
+  },
+  "state_machine": {
+    "initial_state": "ready",
+    "states": [
+      {
+        "id": "ready",
+        "description": "Initial state for Schwab thinkorswim",
+        "title_regex": "Main@thinkorswim \\[build \\d+\\]",
+        "expected_roles": ["window"],
+        "captcha_patterns": ["Verify you are human", "CAPTCHA", "Turnstile"]
+      },
+      {
+        "id": "workspace",
+        "description": "Main workspace after initial settle",
+        "expected_roles": [],
+        "captcha_patterns": []
+      }
+    ],
+    "transitions": [
+      {
+        "from_state": "ready",
+        "to_state": "workspace",
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 500 },
+        "wait_for_stable_frame_ms": 500,
+        "on_error": "dismiss_modal_and_retry"
+      }
+    ]
+  }
+}

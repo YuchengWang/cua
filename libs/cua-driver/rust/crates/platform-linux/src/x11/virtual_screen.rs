@@ -281,25 +281,17 @@ impl VirtualScreenManager {
         }
 
         // Optional localhost x11vnc with 0600 random passwdfile (never -nopw).
-        // Defaults to -viewonly unless req.vnc_interactive is true.
+        // Defaults to -viewonly unless req.vnc_interactive is true (which enables -xkb).
         let (vnc_port, vnc_passwd_path, pid_x11vnc) = if req.enable_vnc {
             let port = 5900 + display_num;
             let pw_path = runtime_dir.join("vnc.passwd");
             let pw_hex = random_hex(12)?;
             write_mode_0600(&pw_path, pw_hex.as_bytes())?;
-            let port_str = port.to_string();
+            let vnc_args =
+                build_x11vnc_args(&display_id, &xauth_path, port, &pw_path, req.vnc_interactive);
             let mut vnc_cmd = Command::new("x11vnc");
             vnc_cmd
-                .args(["-display", &display_id])
-                .arg("-auth")
-                .arg(&xauth_path)
-                .arg("-localhost");
-            if !req.vnc_interactive {
-                vnc_cmd.arg("-viewonly");
-            }
-            vnc_cmd
-                .args(["-forever", "-shared", "-rfbport", &port_str, "-passwdfile"])
-                .arg(&pw_path)
+                .args(&vnc_args)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
@@ -466,13 +458,15 @@ impl VirtualScreenManager {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
 
-        if let Some(ref dbus) = info.dbus_address {
+        if should_unset_dbus_for_launch(command, args, extra_env) {
+            cmd.env_remove("DBUS_SESSION_BUS_ADDRESS");
+        } else if let Some(ref dbus) = info.dbus_address {
             cmd.env("DBUS_SESSION_BUS_ADDRESS", dbus);
         }
         for (k, v) in extra_env {
             if matches!(
                 k.as_str(),
-                "DISPLAY" | "XAUTHORITY" | "DBUS_SESSION_BUS_ADDRESS"
+                "DISPLAY" | "XAUTHORITY" | "DBUS_SESSION_BUS_ADDRESS" | "CUA_UNSET_DBUS"
             ) {
                 continue;
             }
@@ -857,6 +851,65 @@ pub(crate) fn write_xauthority_file(path: &Path, display_num: u16, cookie: &[u8;
     write_mode_0600(path, &blob)
 }
 
+/// Build `x11vnc` CLI arguments. When `vnc_interactive` is true, `-xkb` is
+/// included so Remmina/VNC keyboard typing works on `Xvfb` out-of-the-box.
+pub(crate) fn build_x11vnc_args(
+    display_id: &str,
+    xauth_path: &Path,
+    port: u16,
+    pw_path: &Path,
+    vnc_interactive: bool,
+) -> Vec<std::ffi::OsString> {
+    use std::ffi::OsString;
+    let mut args = vec![
+        OsString::from("-display"),
+        OsString::from(display_id),
+        OsString::from("-auth"),
+        xauth_path.as_os_str().to_owned(),
+        OsString::from("-localhost"),
+    ];
+    if vnc_interactive {
+        args.push(OsString::from("-xkb"));
+    } else {
+        args.push(OsString::from("-viewonly"));
+    }
+    args.extend([
+        OsString::from("-forever"),
+        OsString::from("-shared"),
+        OsString::from("-rfbport"),
+        OsString::from(port.to_string()),
+        OsString::from("-passwdfile"),
+        pw_path.as_os_str().to_owned(),
+    ]);
+    args
+}
+
+/// Returns true when launching a `java_install4j` + JxBrowser app (e.g.
+/// `thinkorswim`) or when explicit isolation hints request unsetting
+/// `DBUS_SESSION_BUS_ADDRESS` to avoid the 25s OSCrypt Libsecret hang + SIGTRAP 133.
+pub(crate) fn should_unset_dbus_for_launch(
+    command: &str,
+    args: &[String],
+    extra_env: &HashMap<String, String>,
+) -> bool {
+    let matches_jxbrowser_app = |s: &str| {
+        let lower = s.to_ascii_lowercase();
+        lower.contains("thinkorswim") || lower.contains("jxbrowser")
+    };
+    if matches_jxbrowser_app(command) || args.iter().any(|a| matches_jxbrowser_app(a)) {
+        return true;
+    }
+    if extra_env
+        .get("CUA_UNSET_DBUS")
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    {
+        return true;
+    }
+    extra_env
+        .get("DBUS_SESSION_BUS_ADDRESS")
+        .is_some_and(|v| v.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -878,5 +931,42 @@ mod tests {
         assert!(allocate_free_display(Some(0)).is_err());
         assert!(allocate_free_display(Some(98)).is_err());
         assert!(allocate_free_display(Some(200)).is_err());
+    }
+
+    #[test]
+    fn x11vnc_args_include_xkb_when_interactive_and_viewonly_otherwise() {
+        let xauth = Path::new("/tmp/Xauthority");
+        let pw = Path::new("/tmp/vnc.passwd");
+
+        let interactive = build_x11vnc_args(":132", xauth, 6032, pw, true);
+        let interactive_strs: Vec<String> = interactive
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        assert!(interactive_strs.contains(&"-xkb".to_owned()));
+        assert!(!interactive_strs.contains(&"-viewonly".to_owned()));
+
+        let viewonly = build_x11vnc_args(":132", xauth, 6032, pw, false);
+        let viewonly_strs: Vec<String> = viewonly
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        assert!(viewonly_strs.contains(&"-viewonly".to_owned()));
+        assert!(!viewonly_strs.contains(&"-xkb".to_owned()));
+    }
+
+    #[test]
+    fn should_unset_dbus_for_thinkorswim_and_explicit_hint() {
+        let empty_env = HashMap::new();
+        assert!(should_unset_dbus_for_launch(
+            "/home/ycwang/work/schwab/thinkorswim/thinkorswim",
+            &[],
+            &empty_env
+        ));
+        assert!(!should_unset_dbus_for_launch("/usr/bin/xterm", &[], &empty_env));
+
+        let mut hinted = HashMap::new();
+        hinted.insert("CUA_UNSET_DBUS".to_owned(), "1".to_owned());
+        assert!(should_unset_dbus_for_launch("/usr/bin/java", &[], &hinted));
     }
 }

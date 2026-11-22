@@ -7,6 +7,17 @@
 
 ## [Unreleased] — `feat/x11-virtual-desktop`
 
+### Thinkorswim & TWS Local-JSON Fast Execution, Non-Screenshot Verification & Launch Isolation (`2026-11-22`, Landed)
+- **Changed / 变更**：
+  - `platform-linux/src/x11/virtual_screen.rs`: Added `build_x11vnc_args()` including `-xkb` by default when `vnc_interactive=true` (so Remmina keyboard typing works on `Xvfb` out-of-the-box) and `-viewonly` otherwise; added `should_unset_dbus_for_launch()` in `launch_app()` to unset `DBUS_SESSION_BUS_ADDRESS` for `thinkorswim` / `jxbrowser` (or `CUA_UNSET_DBUS=1`) so direct launches avoid the 25s OSCrypt Libsecret hang + `SIGTRAP` 133.
+  - `platform-linux/src/app_inspector.rs`: Added `/proc/<pid>/cwd` & `cmdline` `install4j` root resolution (`resolve_install4j_dir()`), `usergui/<ver>/tos-usergui-base-*.jar` version & SHA-256 detection (`find_highest_usergui_jar()`), `[build <num>]` window-title fallback (`parse_window_title_build()`), `# ... <ver>` varfile parsing, and differentiated `thinkorswim` (`java_install4j` + JxBrowser hints) vs `tws` metadata.
+  - `cua-driver-core/src/app_recipe.rs` & `platform-linux/src/tools/mcp_app_recipe.rs`: Added `RecipeStep` & `AppRecipe::flows`, `resolve_relative_anchor_xy()`, and `find_best_recipe_for_app()` (ranking `java_install4j` / `electron` / `dotnet_avalonia` above `native_elf` `vunknown`); extended `run_app_recipe` with `flow` execution, `click_anchor`, `shortcut` / `hotkey`, and non-screenshot verification primitives (`verify_window_title_regex`, `verify_window_count_min`, `verify_log_pattern`, `verify_clipboard_nonempty`, `wait_for_stable_frame`).
+  - `deploy/linux/user/app_recipes/{tws.json,thinkorswim.json}`: Seeded strictly read-only navigation & non-screenshot verification recipes (no order-submission actions).
+- **Verified / 已核验**：
+  - `cargo clippy -p cua-driver-core -p platform-linux -p cua-driver --all-targets -- -D warnings` passed.
+  - `cargo test -p cua-driver-core --lib` (`1396 passed; 0 failed; 3 ignored`) and `cargo test -p platform-linux --lib` (`1144 passed; 0 failed; 16 ignored`) passed.
+  - Live MCP stdio E2E on virtual screen `:198` verified `-xkb` on `x11vnc`, direct `thinkorswim` launch without wrapper script (no 25s hang / SIGTRAP 133), live `inspect_app_flow` without `app_path` (`thinkorswim v1994.1.16`, `fp8=6f8008dc`, `java_install4j`), and `run_app_recipe` non-screenshot verification flow (`4/4` steps `ok: true`).
+
 ### P0–P2 Field-Feedback Hardening & Differentiated Recipe Generation (`2026-11-22`, Landed)
 - **Changed / 变更**：
   - `x11/virtual_screen.rs` & `tools/mcp_virtual_screen.rs`: Added `vnc_interactive: Option<bool>` (default `false` retaining `-viewonly`; when `true`, removes `-viewonly` while keeping `-localhost -forever -shared -passwdfile <0600>`); aligned default virtual screen resolution to `1920x1080`.
