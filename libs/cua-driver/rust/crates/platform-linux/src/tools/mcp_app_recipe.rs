@@ -6,18 +6,21 @@
 //! - `inspect_app_flow`
 //! - `generate_app_recipe`
 //! - `run_app_recipe`
+//! - `acquire_app_data`
 
 use std::collections::HashMap;
-use std::io::{Read as _, Seek as _, SeekFrom};
+use std::io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use cua_driver_core::{
     app_recipe::{
-        find_best_recipe_for_app, global_recipe_cache, load_recipe, recipes_dir,
-        resolve_relative_anchor_xy, save_recipe_to_dir, AppRecipe, AuthGate, ModalHandler,
-        RecipeState, RecipeTransition, RelativeAnchor, StateMachine, VerifyResult, VersionGate,
+        find_best_recipe_with_path, global_recipe_cache, load_recipe, recipes_dir,
+        resolve_relative_anchor_xy, save_recipe_to_dir, AppRecipe, AuthGate, CapabilitySpec,
+        DataChannel, ModalHandler, RecipeState, RecipeStep, RecipeTransition, RelativeAnchor,
+        SafetyLevel, StateMachine, VerifyResult, VersionGate,
     },
     protocol::ToolResult,
     tool::{Tool, ToolDef},
@@ -30,8 +33,8 @@ use crate::app_inspector::{inspect_app_flow, InspectAppFlowRequest};
 use crate::x11::context::{global_screen_pool, DisplayTarget, X11ScreenContext};
 use crate::tools::mcp_type_secret::{resolve_secret_from_env, type_secret_into_context, validate_env_key};
 use crate::x11::virtual_input::{
-    clipboard_get_for_context, xtest_click, xtest_focus_window, xtest_hotkey, xtest_press_key,
-    xtest_type_text,
+    clipboard_get_for_context, clipboard_set_for_context, xtest_click, xtest_focus_window,
+    xtest_hotkey, xtest_press_key, xtest_type_text,
 };
 use crate::x11::virtual_screen::global_virtual_screen_manager;
 
@@ -261,6 +264,8 @@ impl Tool for GenerateAppRecipeTool {
                 relative_anchors,
                 modal_handlers,
                 flows: HashMap::new(),
+                capabilities: HashMap::new(),
+                safety_policy: None,
                 state_machine: StateMachine {
                     initial_state: "ready".to_owned(),
                     states,
@@ -322,7 +327,13 @@ impl Tool for RunAppRecipeTool {
                     "window_id": { "type": "integer" },
                     "app_path": { "type": "string" },
                     "display_id": { "type": "string" },
-                    "session": cua_driver_core::tool_schema::session_schema()
+                    "session": cua_driver_core::tool_schema::session_schema(),
+                    "allow_safety_level": {
+                        "type": "string",
+                        "enum": ["read_only", "auth_only", "restricted"],
+                        "default": "auth_only",
+                        "description": "Maximum SafetyLevel permitted for this invocation (default: auth_only)."
+                    }
                 },
                 "additionalProperties": false
             }),
@@ -339,6 +350,13 @@ impl Tool for RunAppRecipeTool {
         };
         let flow_name = args.opt_str("flow");
         let recipe_path = args.opt_str("recipe_path").map(PathBuf::from);
+        let allow_safety_level = match parse_safety_level(
+            args.opt_str("allow_safety_level").as_deref(),
+            SafetyLevel::AuthOnly,
+        ) {
+            Ok(lvl) => lvl,
+            Err(e) => return ToolResult::error(e.to_string()),
+        };
         let display_id = resolve_display_id(&args);
         let mut req = InspectAppFlowRequest {
             pid: args.opt_u64("pid").map(|v| v as u32),
@@ -376,7 +394,7 @@ impl Tool for RunAppRecipeTool {
             // Resolve recipe: explicit recipe_path -> hot cache -> best recipe in recipes_dir().
             let recipe = if let Some(ref p) = recipe_path {
                 let loaded = load_recipe(p).map_err(|e| anyhow::anyhow!("{e}"))?;
-                global_recipe_cache().insert(loaded.clone());
+                global_recipe_cache().insert_with_path(loaded.clone(), Some(p.clone()));
                 loaded
             } else if let Some(cached) = global_recipe_cache().get(
                 &app_id,
@@ -385,7 +403,7 @@ impl Tool for RunAppRecipeTool {
             ) {
                 (*cached).clone()
             } else if let Some(dir) = recipes_dir() {
-                let found = find_best_recipe_for_app(
+                let (found, found_path) = find_best_recipe_with_path(
                     &dir,
                     &app_id,
                     Some(&inspection.app_version),
@@ -398,7 +416,7 @@ impl Tool for RunAppRecipeTool {
                         inspection.fp8
                     )
                 })?;
-                global_recipe_cache().insert(found.clone());
+                global_recipe_cache().insert_with_path(found.clone(), Some(found_path));
                 found
             } else {
                 anyhow::bail!("app_recipes directory unavailable");
@@ -431,51 +449,39 @@ impl Tool for RunAppRecipeTool {
                         available
                     )
                 })?;
-                let mut executed_steps = Vec::with_capacity(steps.len());
-                for (idx, step) in steps.iter().enumerate() {
-                    if let Some(ms) = step.wait_for_stable_frame_ms {
-                        std::thread::sleep(std::time::Duration::from_millis(ms.min(5_000)));
-                    }
-                    let outcome = execute_recipe_step(
-                        ctx.as_deref(),
-                        &recipe,
-                        target_window_id,
-                        target_pid,
-                        &step.action,
-                        &step.args,
-                    );
-                    match outcome {
-                        Ok(details) => {
-                            executed_steps.push(json!({
-                                "step": idx,
-                                "action": step.action,
-                                "description": step.description,
-                                "ok": true,
-                                "details": details,
-                            }));
-                        }
-                        Err(err) => {
-                            executed_steps.push(json!({
-                                "step": idx,
-                                "action": step.action,
-                                "description": step.description,
-                                "ok": false,
-                                "error": format!("{err:#}"),
-                            }));
-                            return Ok(ToolResult::error(format!(
-                                "flow '{flow}' failed at step {idx} ({}): {err:#}",
-                                step.action
-                            ))
-                            .with_structured(json!({
-                                "status": "failed",
-                                "app_id": recipe.app_id,
-                                "app_version": recipe.app_version,
-                                "fp8": recipe.fp8(),
-                                "flow": flow,
-                                "steps": executed_steps,
-                            })));
-                        }
-                    }
+                if let Err(blocked) = check_safety_gate(
+                    &recipe,
+                    Some(flow),
+                    steps,
+                    SafetyLevel::ReadOnly,
+                    allow_safety_level,
+                ) {
+                    return Ok(blocked);
+                }
+                let FlowExecutionResult {
+                    steps: executed_steps,
+                    artifacts,
+                    error: step_err,
+                } = execute_flow_steps(
+                    ctx.as_deref(),
+                    &recipe,
+                    target_window_id,
+                    target_pid,
+                    steps,
+                );
+                if let Some((idx, action, err)) = step_err {
+                    return Ok(ToolResult::error(format!(
+                        "flow '{flow}' failed at step {idx} ({action}): {err:#}"
+                    ))
+                    .with_structured(json!({
+                        "status": "failed",
+                        "app_id": recipe.app_id,
+                        "app_version": recipe.app_version,
+                        "fp8": recipe.fp8(),
+                        "flow": flow,
+                        "steps": executed_steps,
+                        "artifacts": artifacts,
+                    })));
                 }
                 return Ok(ToolResult::text(format!(
                     "Completed flow '{}' of {} ({} steps, non-screenshot verified)",
@@ -490,6 +496,7 @@ impl Tool for RunAppRecipeTool {
                     "fp8": recipe.fp8(),
                     "flow": flow,
                     "steps": executed_steps,
+                    "artifacts": artifacts,
                 })));
             }
 
@@ -584,6 +591,606 @@ impl Tool for RunAppRecipeTool {
             Err(e) => ToolResult::error(format!("run_app_recipe panicked: {e}")),
         }
     }
+}
+
+// ── acquire_app_data ──────────────────────────────────────────────────────────
+
+pub struct AcquireAppDataTool;
+static ACQUIRE_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
+
+#[async_trait]
+impl Tool for AcquireAppDataTool {
+    fn def(&self) -> &ToolDef {
+        ACQUIRE_DEF.get_or_init(|| ToolDef {
+            name: "acquire_app_data".into(),
+            description: "Acquire structured application data via a recipe's 4-tier capability routing (AT-SPI/CDP, Clipboard/FileExport/Log, WindowMeta, or ScreenshotROI) with SafetyLevel enforcement and automatic fallback.".into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["app_id", "capability"],
+                "properties": {
+                    "app_id": { "type": "string" },
+                    "capability": { "type": "string", "description": "Named capability in recipe.capabilities." },
+                    "display_id": { "type": "string" },
+                    "session": cua_driver_core::tool_schema::session_schema(),
+                    "recipe_path": { "type": "string" },
+                    "fallback": { "type": "boolean", "default": true },
+                    "allow_safety_level": {
+                        "type": "string",
+                        "enum": ["read_only", "auth_only", "restricted"],
+                        "default": "read_only",
+                        "description": "Maximum SafetyLevel permitted (default: read_only)."
+                    }
+                },
+                "additionalProperties": false
+            }),
+            read_only: false,
+            destructive: false,
+            idempotent: false,
+            open_world: false,
+        })
+    }
+
+    async fn invoke(&self, args: Value) -> ToolResult {
+        let Some(app_id) = args.opt_str("app_id") else {
+            return ToolResult::error("app_id is required");
+        };
+        let Some(capability) = args.opt_str("capability") else {
+            return ToolResult::error("capability is required");
+        };
+        let recipe_path = args.opt_str("recipe_path").map(PathBuf::from);
+        let fallback = args.bool_or("fallback", true);
+        let allow_safety_level = match parse_safety_level(
+            args.opt_str("allow_safety_level").as_deref(),
+            SafetyLevel::ReadOnly,
+        ) {
+            Ok(lvl) => lvl,
+            Err(e) => return ToolResult::error(e.to_string()),
+        };
+        let display_id = resolve_display_id(&args);
+        let mut req = InspectAppFlowRequest {
+            pid: None,
+            window_id: None,
+            app_path: None,
+            display_id: display_id.clone(),
+        };
+
+        match tokio::task::spawn_blocking(move || -> anyhow::Result<ToolResult> {
+            if let Ok(target) = DisplayTarget::from_display_id(display_id.as_deref()) {
+                if let Ok(ctx) = global_screen_pool().get_or_connect(&target) {
+                    if let Some(win) = find_window_for_app(&ctx, &app_id) {
+                        req.window_id = Some(win.xid);
+                        req.pid = win.pid;
+                    }
+                }
+            }
+
+            let target_window_id = req.window_id;
+            let target_pid = req.pid;
+            let inspection = inspect_app_flow(req)?;
+            if inspection.channel == "browser_exempt" {
+                return Ok(ToolResult::error(
+                    inspection
+                        .exempt_reason
+                        .clone()
+                        .unwrap_or_else(|| "browser_exempt".to_owned()),
+                )
+                .with_structured(json!({ "inspection": inspection })));
+            }
+
+            let recipe = if let Some(ref p) = recipe_path {
+                let loaded = load_recipe(p).map_err(|e| anyhow::anyhow!("{e}"))?;
+                global_recipe_cache().insert_with_path(loaded.clone(), Some(p.clone()));
+                loaded
+            } else if let Some(cached) = global_recipe_cache().get(
+                &app_id,
+                &inspection.app_version,
+                &inspection.fingerprint_sha256,
+            ) {
+                (*cached).clone()
+            } else if let Some(dir) = recipes_dir() {
+                let (found, found_path) = find_best_recipe_with_path(
+                    &dir,
+                    &app_id,
+                    Some(&inspection.app_version),
+                    Some(&inspection.fingerprint_sha256),
+                )
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no matching recipe for {app_id} v{} ({})",
+                        inspection.app_version,
+                        inspection.fp8
+                    )
+                })?;
+                global_recipe_cache().insert_with_path(found.clone(), Some(found_path));
+                found
+            } else {
+                anyhow::bail!("app_recipes directory unavailable");
+            };
+
+            let is_seeded =
+                recipe.app_version == "seeded" || recipe.fingerprint_sha256 == "seeded";
+            if !is_seeded {
+                let verify = VersionGate::verify(
+                    &recipe,
+                    &inspection.app_version,
+                    &inspection.fingerprint_sha256,
+                );
+                if let VerifyResult::VersionMismatch { ref reason, .. } = verify {
+                    return Ok(ToolResult::error(reason.clone())
+                        .with_structured(serde_json::to_value(&verify)?));
+                }
+            }
+
+            let spec = lookup_capability(&recipe, &capability)?;
+            let flow_steps: &[RecipeStep] = spec
+                .flow
+                .as_deref()
+                .and_then(|f| recipe.flows.get(f))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+
+            if let Err(blocked) = check_safety_gate(
+                &recipe,
+                spec.flow.as_deref(),
+                flow_steps,
+                spec.safety_level,
+                allow_safety_level,
+            ) {
+                return Ok(blocked);
+            }
+
+            let target = DisplayTarget::from_display_id(display_id.as_deref())?;
+            let ctx = global_screen_pool().get_or_connect(&target).ok();
+
+            match execute_capability_primary(
+                ctx.as_deref(),
+                &recipe,
+                &inspection,
+                target_window_id,
+                target_pid,
+                &capability,
+                spec,
+            ) {
+                Ok((steps, artifacts)) => Ok(ToolResult::text(format!(
+                    "Acquired capability '{capability}' for {} ({} artifacts)",
+                    recipe.canonical_filename(),
+                    artifacts.len()
+                ))
+                .with_structured(json!({
+                    "status": "completed",
+                    "app_id": recipe.app_id,
+                    "app_version": recipe.app_version,
+                    "fp8": recipe.fp8(),
+                    "capability": capability,
+                    "data_channel": spec.data_channel,
+                    "fallback_used": false,
+                    "steps": steps,
+                    "artifacts": artifacts,
+                }))),
+                Err(primary_err) if fallback => {
+                    if let Some(fb_method) = spec.fallback_method {
+                        let fb_artifact = execute_fallback_channel(
+                            ctx.as_deref(),
+                            &recipe,
+                            &inspection,
+                            target_window_id,
+                            target_pid,
+                            fb_method,
+                            spec,
+                        )?;
+                        return Ok(ToolResult::text(format!(
+                            "Acquired capability '{capability}' for {} via fallback {:?}",
+                            recipe.canonical_filename(),
+                            fb_method
+                        ))
+                        .with_structured(json!({
+                            "status": "completed_with_fallback",
+                            "app_id": recipe.app_id,
+                            "app_version": recipe.app_version,
+                            "fp8": recipe.fp8(),
+                            "capability": capability,
+                            "data_channel": fb_method,
+                            "fallback_used": true,
+                            "primary_error": format!("{primary_err:#}"),
+                            "steps": [],
+                            "artifacts": [fb_artifact],
+                        })));
+                    }
+                    if let Some(ref fb_cap_name) = spec.fallback_capability {
+                        let fb_spec = lookup_capability(&recipe, fb_cap_name)?;
+                        let fb_steps: &[RecipeStep] = fb_spec
+                            .flow
+                            .as_deref()
+                            .and_then(|f| recipe.flows.get(f))
+                            .map(Vec::as_slice)
+                            .unwrap_or(&[]);
+                        if let Err(blocked) = check_safety_gate(
+                            &recipe,
+                            fb_spec.flow.as_deref(),
+                            fb_steps,
+                            fb_spec.safety_level,
+                            allow_safety_level,
+                        ) {
+                            return Ok(blocked);
+                        }
+                        let (steps, artifacts) = execute_capability_primary(
+                            ctx.as_deref(),
+                            &recipe,
+                            &inspection,
+                            target_window_id,
+                            target_pid,
+                            fb_cap_name,
+                            fb_spec,
+                        )?;
+                        return Ok(ToolResult::text(format!(
+                            "Acquired capability '{capability}' for {} via fallback capability '{fb_cap_name}'",
+                            recipe.canonical_filename()
+                        ))
+                        .with_structured(json!({
+                            "status": "completed_with_fallback",
+                            "app_id": recipe.app_id,
+                            "app_version": recipe.app_version,
+                            "fp8": recipe.fp8(),
+                            "capability": capability,
+                            "fallback_capability": fb_cap_name,
+                            "data_channel": fb_spec.data_channel,
+                            "fallback_used": true,
+                            "primary_error": format!("{primary_err:#}"),
+                            "steps": steps,
+                            "artifacts": artifacts,
+                        })));
+                    }
+                    Err(primary_err)
+                }
+                Err(primary_err) => Err(primary_err),
+            }
+        })
+        .await
+        {
+            Ok(Ok(res)) => res,
+            Ok(Err(e)) => ToolResult::error(format!("acquire_app_data failed: {e:#}")),
+            Err(e) => ToolResult::error(format!("acquire_app_data panicked: {e}")),
+        }
+    }
+}
+
+pub(crate) fn parse_safety_level(raw: Option<&str>, default: SafetyLevel) -> anyhow::Result<SafetyLevel> {
+    match raw {
+        None => Ok(default),
+        Some("read_only") => Ok(SafetyLevel::ReadOnly),
+        Some("auth_only") => Ok(SafetyLevel::AuthOnly),
+        Some("restricted") => Ok(SafetyLevel::Restricted),
+        Some(other) => anyhow::bail!(
+            "invalid allow_safety_level '{other}' (expected read_only, auth_only, or restricted)"
+        ),
+    }
+}
+
+pub(crate) fn lookup_capability<'a>(
+    recipe: &'a AppRecipe,
+    capability: &str,
+) -> anyhow::Result<&'a CapabilitySpec> {
+    recipe.capabilities.get(capability).ok_or_else(|| {
+        let available: Vec<&str> = recipe.capabilities.keys().map(String::as_str).collect();
+        anyhow::anyhow!(
+            "capability '{capability}' not found in recipe {} (available: {:?})",
+            recipe.canonical_filename(),
+            available
+        )
+    })
+}
+
+fn normalize_shortcut_str(keys: &[String]) -> String {
+    keys.iter()
+        .map(|k| k.trim().to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
+#[allow(clippy::result_large_err)]
+pub(crate) fn check_safety_gate(
+    recipe: &AppRecipe,
+    flow_name: Option<&str>,
+    steps: &[RecipeStep],
+    required_level: SafetyLevel,
+    allow_level: SafetyLevel,
+) -> Result<(), ToolResult> {
+    let block = |reason: String, req: SafetyLevel| -> ToolResult {
+        ToolResult::error(reason.clone()).with_structured(json!({
+            "status": "safety_gate_blocked",
+            "code": "safety_gate_blocked",
+            "app_id": recipe.app_id,
+            "flow": flow_name,
+            "required_level": req.as_str(),
+            "allowed_level": allow_level.as_str(),
+            "reason": reason,
+        }))
+    };
+
+    if required_level > allow_level {
+        return Err(block(
+            format!(
+                "safety_gate_blocked: required level '{}' exceeds allowed '{}'",
+                required_level.as_str(),
+                allow_level.as_str()
+            ),
+            required_level,
+        ));
+    }
+
+    if let Some(ref policy) = recipe.safety_policy {
+        if let Some(f) = flow_name {
+            if policy.blocked_flows.iter().any(|b| b == f) {
+                return Err(block(
+                    format!("safety_gate_blocked: flow '{f}' is blocked by recipe safety_policy"),
+                    SafetyLevel::Restricted,
+                ));
+            }
+        }
+        for (idx, step) in steps.iter().enumerate() {
+            if let Some(step_lvl) = step.safety_level {
+                if step_lvl > allow_level {
+                    return Err(block(
+                        format!(
+                            "safety_gate_blocked: step {idx} ({}) requires '{}' > allowed '{}'",
+                            step.action,
+                            step_lvl.as_str(),
+                            allow_level.as_str()
+                        ),
+                        step_lvl,
+                    ));
+                }
+            }
+            if matches!(step.action.as_str(), "hotkey" | "shortcut" | "press_key") {
+                let keys = parse_shortcut_keys(&step.args);
+                let norm = normalize_shortcut_str(&keys);
+                if !norm.is_empty()
+                    && policy
+                        .blocked_shortcuts
+                        .iter()
+                        .any(|b| b.trim().to_ascii_lowercase() == norm)
+                {
+                    return Err(block(
+                        format!(
+                            "safety_gate_blocked: shortcut '{norm}' at step {idx} is blocked by safety_policy"
+                        ),
+                        SafetyLevel::Restricted,
+                    ));
+                }
+            }
+        }
+    } else {
+        for (idx, step) in steps.iter().enumerate() {
+            if let Some(step_lvl) = step.safety_level {
+                if step_lvl > allow_level {
+                    return Err(block(
+                        format!(
+                            "safety_gate_blocked: step {idx} ({}) requires '{}' > allowed '{}'",
+                            step.action,
+                            step_lvl.as_str(),
+                            allow_level.as_str()
+                        ),
+                        step_lvl,
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+struct FlowExecutionResult {
+    steps: Vec<Value>,
+    artifacts: Vec<Value>,
+    error: Option<(usize, String, anyhow::Error)>,
+}
+
+fn execute_flow_steps(
+    ctx: Option<&X11ScreenContext>,
+    recipe: &AppRecipe,
+    target_window_id: Option<u64>,
+    target_pid: Option<u32>,
+    steps: &[RecipeStep],
+) -> FlowExecutionResult {
+    let mut executed_steps = Vec::with_capacity(steps.len());
+    let mut artifacts = Vec::new();
+    for (idx, step) in steps.iter().enumerate() {
+        if let Some(ms) = step.wait_for_stable_frame_ms {
+            std::thread::sleep(std::time::Duration::from_millis(ms.min(5_000)));
+        }
+        match execute_recipe_step(
+            ctx,
+            recipe,
+            target_window_id,
+            target_pid,
+            &step.action,
+            &step.args,
+        ) {
+            Ok(details) => {
+                if let Some(art) = details.get("artifact") {
+                    artifacts.push(art.clone());
+                }
+                executed_steps.push(json!({
+                    "step": idx,
+                    "action": step.action,
+                    "description": step.description,
+                    "ok": true,
+                    "details": details,
+                }));
+            }
+            Err(err) => {
+                executed_steps.push(json!({
+                    "step": idx,
+                    "action": step.action,
+                    "description": step.description,
+                    "ok": false,
+                    "error": format!("{err:#}"),
+                }));
+                return FlowExecutionResult {
+                    steps: executed_steps,
+                    artifacts,
+                    error: Some((idx, step.action.clone(), err)),
+                };
+            }
+        }
+    }
+    FlowExecutionResult {
+        steps: executed_steps,
+        artifacts,
+        error: None,
+    }
+}
+
+fn execute_capability_primary(
+    ctx: Option<&X11ScreenContext>,
+    recipe: &AppRecipe,
+    inspection: &crate::app_inspector::AppFlowInspection,
+    target_window_id: Option<u64>,
+    target_pid: Option<u32>,
+    capability: &str,
+    spec: &CapabilitySpec,
+) -> anyhow::Result<(Vec<Value>, Vec<Value>)> {
+    if let Some(ref flow_name) = spec.flow {
+        let steps = recipe.flows.get(flow_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "capability '{capability}' references missing flow '{flow_name}'"
+            )
+        })?;
+        let FlowExecutionResult {
+            steps: executed,
+            mut artifacts,
+            error,
+        } = execute_flow_steps(ctx, recipe, target_window_id, target_pid, steps);
+        if let Some((idx, action, e)) = error {
+            anyhow::bail!("flow '{flow_name}' failed at step {idx} ({action}): {e:#}");
+        }
+        if artifacts.is_empty() {
+            if let Some(ref path) = spec.artifact_path {
+                if spec.data_channel == DataChannel::FileExport {
+                    let details = verify_file_export_at_path(&expand_home_path(path), 0, 1, 20)?;
+                    if let Some(art) = details.get("artifact") {
+                        artifacts.push(art.clone());
+                    }
+                }
+            }
+        }
+        return Ok((executed, artifacts));
+    }
+
+    let artifact = execute_fallback_channel(
+        ctx,
+        recipe,
+        inspection,
+        target_window_id,
+        target_pid,
+        spec.data_channel,
+        spec,
+    )?;
+    Ok((Vec::new(), vec![artifact]))
+}
+
+fn execute_fallback_channel(
+    ctx: Option<&X11ScreenContext>,
+    _recipe: &AppRecipe,
+    inspection: &crate::app_inspector::AppFlowInspection,
+    target_window_id: Option<u64>,
+    target_pid: Option<u32>,
+    channel: DataChannel,
+    spec: &CapabilitySpec,
+) -> anyhow::Result<Value> {
+    match channel {
+        DataChannel::WindowMeta => Ok(json!({
+            "kind": "window_meta",
+            "app_id": inspection.app_id,
+            "app_version": inspection.app_version,
+            "window_id": target_window_id,
+            "pid": target_pid,
+            "window_title": inspection.window_title,
+            "wm_class": inspection.wm_class,
+        })),
+        DataChannel::ScreenshotRoi => {
+            let xctx = ctx.ok_or_else(|| anyhow::anyhow!("X11 display context unavailable"))?;
+            let roi = spec.output_schema.as_ref().and_then(|s| s.roi_norm);
+            capture_screenshot_roi_artifact(xctx, target_window_id, target_pid, roi, "screenshot_roi")
+        }
+        DataChannel::ScreenshotFull => {
+            let xctx = ctx.ok_or_else(|| anyhow::anyhow!("X11 display context unavailable"))?;
+            capture_screenshot_roi_artifact(xctx, target_window_id, target_pid, None, "screenshot_full")
+        }
+        DataChannel::FileExport => {
+            let raw_path = spec
+                .artifact_path
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("file_export channel requires artifact_path"))?;
+            let details = verify_file_export_at_path(&expand_home_path(raw_path), 0, 1, 20)?;
+            Ok(details.get("artifact").cloned().unwrap_or(details))
+        }
+        DataChannel::Clipboard => {
+            let xctx = ctx.ok_or_else(|| anyhow::anyhow!("X11 display context unavailable"))?;
+            let text = clipboard_get_for_context(xctx)?;
+            build_clipboard_artifact(&text, 1, 65_536)
+        }
+        DataChannel::Log => {
+            let raw_path = spec
+                .artifact_path
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("log channel requires artifact_path"))?;
+            let details = verify_file_export_at_path(&expand_home_path(raw_path), 0, 1, 30)?;
+            Ok(details.get("artifact").cloned().unwrap_or(details))
+        }
+        DataChannel::Atspi | DataChannel::Cdp => {
+            anyhow::bail!("direct {:?} channel requires a named flow in recipe", channel)
+        }
+    }
+}
+
+fn capture_screenshot_roi_artifact(
+    ctx: &X11ScreenContext,
+    target_window_id: Option<u64>,
+    target_pid: Option<u32>,
+    roi_norm: Option<[f64; 4]>,
+    kind: &str,
+) -> anyhow::Result<Value> {
+    let xid = target_window_id
+        .or_else(|| {
+            crate::x11::list_windows_with_context(ctx, target_pid)
+                .into_iter()
+                .next()
+                .map(|w| w.xid)
+        })
+        .ok_or_else(|| anyhow::anyhow!("no target window found for {kind}"))?;
+    let png_bytes = crate::capture::screenshot_window_bytes_with_context(ctx, xid)?;
+    let img = image::load_from_memory(&png_bytes)?;
+    let (img_w, img_h) = (img.width(), img.height());
+    let out_img = if let Some([rx, ry, rw, rh]) = roi_norm {
+        let rx = rx.clamp(0.0, 1.0);
+        let ry = ry.clamp(0.0, 1.0);
+        let rw = rw.clamp(0.0, 1.0 - rx);
+        let rh = rh.clamp(0.0, 1.0 - ry);
+        let x0 = ((rx * f64::from(img_w)).round() as u32).min(img_w.saturating_sub(1));
+        let y0 = ((ry * f64::from(img_h)).round() as u32).min(img_h.saturating_sub(1));
+        let cw = ((rw * f64::from(img_w)).round() as u32).max(1).min(img_w - x0);
+        let ch = ((rh * f64::from(img_h)).round() as u32).max(1).min(img_h - y0);
+        img.crop_imm(x0, y0, cw, ch)
+    } else {
+        img
+    };
+    let (out_w, out_h) = (out_img.width(), out_img.height());
+    let mut buf = std::io::Cursor::new(Vec::new());
+    out_img.write_to(&mut buf, image::ImageFormat::Png)?;
+    let out_png = buf.into_inner();
+    let b64 = B64.encode(&out_png);
+    Ok(json!({
+        "kind": kind,
+        "mime_type": "image/png",
+        "window_id": xid,
+        "width": out_w,
+        "height": out_h,
+        "roi_norm": roi_norm,
+        "bytes": out_png.len(),
+        "data_base64": b64,
+    }))
 }
 
 fn resolve_auth_gate_secret(gate: &AuthGate) -> anyhow::Result<Zeroizing<String>> {
@@ -901,8 +1508,118 @@ fn execute_recipe_step(
                 anyhow::bail!("clipboard length {len} < min_len {min_len}")
             }
         }
+        "read_clipboard" => {
+            let xctx = ctx.ok_or_else(|| anyhow::anyhow!("X11 display context unavailable"))?;
+            let min_len = args.get("min_len").and_then(Value::as_u64).unwrap_or(1) as usize;
+            let max_bytes = args
+                .get("max_bytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(65_536) as usize;
+            let clear_before = args
+                .get("clear_before")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if clear_before {
+                let _ = clipboard_set_for_context(xctx, "");
+            }
+            let text = clipboard_get_for_context(xctx)?;
+            let artifact = build_clipboard_artifact(&text, min_len, max_bytes)?;
+            Ok(json!({
+                "artifact": artifact,
+                "bytes": text.len(),
+                "min_len": min_len,
+            }))
+        }
+        "verify_file_export" => {
+            let raw_path = args
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("verify_file_export requires 'path'"))?;
+            let wait_ms = args.get("wait_ms").and_then(Value::as_u64).unwrap_or(0).min(15_000);
+            let min_bytes = args.get("min_bytes").and_then(Value::as_u64).unwrap_or(1);
+            let preview_lines = args
+                .get("preview_lines")
+                .and_then(Value::as_u64)
+                .unwrap_or(20) as usize;
+            let path = expand_home_path(raw_path);
+            verify_file_export_at_path(&path, wait_ms, min_bytes, preview_lines)
+        }
         other => anyhow::bail!("unsupported recipe action '{other}'"),
     }
+}
+
+pub(crate) fn build_clipboard_artifact(
+    text: &str,
+    min_len: usize,
+    max_bytes: usize,
+) -> anyhow::Result<Value> {
+    let trimmed_len = text.trim().len();
+    if trimmed_len < min_len {
+        anyhow::bail!("clipboard length {trimmed_len} < min_len {min_len}");
+    }
+    let truncated = text.len() > max_bytes;
+    let slice = if truncated {
+        let mut end = max_bytes;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        &text[..end]
+    } else {
+        text
+    };
+    Ok(json!({
+        "kind": "clipboard",
+        "bytes": text.len(),
+        "truncated": truncated,
+        "content": slice,
+    }))
+}
+
+pub(crate) fn verify_file_export_at_path(
+    path: &Path,
+    wait_ms: u64,
+    min_bytes: u64,
+    preview_lines: usize,
+) -> anyhow::Result<Value> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+    let bytes = loop {
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.is_file() && meta.len() >= min_bytes {
+                break meta.len();
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            let actual = std::fs::metadata(path).map(|m| m.len()).ok();
+            anyhow::bail!(
+                "exported file {} missing or smaller than {} bytes (actual: {:?})",
+                path.display(),
+                min_bytes,
+                actual
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+
+    let file = std::fs::File::open(path)
+        .map_err(|e| anyhow::anyhow!("failed to open {}: {e}", path.display()))?;
+    let reader = BufReader::new(file.take(262_144));
+    let mut lines = Vec::new();
+    for line in reader.lines().take(preview_lines) {
+        lines.push(line?);
+    }
+    let preview = lines.join("\n");
+    Ok(json!({
+        "artifact": {
+            "kind": "file_export",
+            "path": path.display().to_string(),
+            "bytes": bytes,
+            "preview_lines": lines,
+            "preview": preview,
+        },
+        "path": path.display().to_string(),
+        "bytes": bytes,
+        "min_bytes": min_bytes,
+    }))
 }
 
 #[cfg(test)]
@@ -948,6 +1665,8 @@ mod tests {
             relative_anchors: Vec::new(),
             modal_handlers: Vec::new(),
             flows: HashMap::new(),
+            capabilities: HashMap::new(),
+            safety_policy: None,
             state_machine: StateMachine {
                 initial_state: "ready".to_owned(),
                 states: Vec::new(),
@@ -976,5 +1695,123 @@ mod tests {
         )
         .unwrap_err();
         assert!(prefix_err.to_string().contains("CUA_YCWANG_"));
+    }
+
+    #[test]
+    fn verify_file_export_reads_preview_and_enforces_min_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv_path = dir.path().join("statement.csv");
+        std::fs::write(&csv_path, "Account,Cash\n12345,100000.00\n").unwrap();
+
+        let res = verify_file_export_at_path(&csv_path, 0, 10, 5).unwrap();
+        assert_eq!(res["artifact"]["kind"], "file_export");
+        assert_eq!(res["artifact"]["preview_lines"].as_array().unwrap().len(), 2);
+
+        let err = verify_file_export_at_path(&csv_path, 0, 10_000, 5).unwrap_err();
+        assert!(err.to_string().contains("smaller than 10000 bytes"));
+    }
+
+    #[test]
+    fn parse_clipboard_artifact_truncates_utf8_safely_and_enforces_min_len() {
+        let art = build_clipboard_artifact("测试_ABC", 1, 7).unwrap();
+        assert_eq!(art["kind"], "clipboard");
+        assert_eq!(art["truncated"], true);
+        assert_eq!(art["content"], "测试_");
+
+        let err = build_clipboard_artifact("  ", 1, 100).unwrap_err();
+        assert!(err.to_string().contains("min_len"));
+    }
+
+    #[test]
+    fn safety_gate_blocks_restricted_and_blocked_flows_and_shortcuts() {
+        use cua_driver_core::app_recipe::SafetyPolicy;
+
+        let mut recipe = AppRecipe {
+            schema_version: 1,
+            app_id: "thinkorswim".to_owned(),
+            app_version: "seeded".to_owned(),
+            version_source: cua_driver_core::app_recipe::VersionSource::Install4j,
+            fingerprint_sha256: "seeded".to_owned(),
+            tech_stack: None,
+            atspi_blind: true,
+            recommended_interaction: None,
+            launch_isolation_hints: Vec::new(),
+            verified_shortcuts: Vec::new(),
+            menu_topology: Vec::new(),
+            relative_anchors: Vec::new(),
+            modal_handlers: Vec::new(),
+            flows: HashMap::new(),
+            capabilities: HashMap::new(),
+            safety_policy: Some(SafetyPolicy {
+                default_max_level: SafetyLevel::ReadOnly,
+                blocked_shortcuts: vec!["ctrl+enter".to_owned()],
+                blocked_flows: vec!["submit_order".to_owned()],
+                notes: None,
+            }),
+            state_machine: StateMachine {
+                initial_state: "ready".to_owned(),
+                states: Vec::new(),
+                transitions: Vec::new(),
+            },
+        };
+        recipe.capabilities.insert(
+            "account_statement".to_owned(),
+            CapabilitySpec {
+                data_channel: DataChannel::FileExport,
+                flow: Some("export_account_statement_csv".to_owned()),
+                safety_level: SafetyLevel::ReadOnly,
+                latency_ms_est: Some(2500),
+                artifact_path: Some("/tmp/tos.csv".to_owned()),
+                fallback_method: Some(DataChannel::ScreenshotRoi),
+                fallback_capability: None,
+                output_schema: None,
+            },
+        );
+
+        assert!(lookup_capability(&recipe, "account_statement").is_ok());
+        assert!(lookup_capability(&recipe, "missing_cap").is_err());
+
+        // Restricted level blocked under ReadOnly / AuthOnly
+        let blocked_res = check_safety_gate(
+            &recipe,
+            Some("trade"),
+            &[],
+            SafetyLevel::Restricted,
+            SafetyLevel::AuthOnly,
+        )
+        .unwrap_err();
+        assert_eq!(blocked_res.structured_content.as_ref().unwrap()["code"], "safety_gate_blocked");
+
+        // Blocked flow name rejected
+        let blocked_flow = check_safety_gate(
+            &recipe,
+            Some("submit_order"),
+            &[],
+            SafetyLevel::ReadOnly,
+            SafetyLevel::Restricted,
+        )
+        .unwrap_err();
+        assert_eq!(blocked_flow.structured_content.as_ref().unwrap()["code"], "safety_gate_blocked");
+
+        // Blocked shortcut in step rejected
+        let step = RecipeStep {
+            action: "hotkey".to_owned(),
+            args: json!({ "keys": ["ctrl", "Enter"] }),
+            wait_for_stable_frame_ms: None,
+            description: None,
+            method: None,
+            safety_level: None,
+            latency_ms_est: None,
+            fallback_method: None,
+        };
+        let blocked_key = check_safety_gate(
+            &recipe,
+            Some("custom"),
+            &[step],
+            SafetyLevel::ReadOnly,
+            SafetyLevel::AuthOnly,
+        )
+        .unwrap_err();
+        assert_eq!(blocked_key.structured_content.as_ref().unwrap()["code"], "safety_gate_blocked");
     }
 }

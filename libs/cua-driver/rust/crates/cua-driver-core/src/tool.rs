@@ -1039,6 +1039,7 @@ pub fn default_capabilities_for(tool_name: &str) -> Vec<String> {
         "inspect_app_flow" => &["app.inspect"],
         "generate_app_recipe" => &["app.recipe.write"],
         "run_app_recipe" => &["app.recipe.run"],
+        "acquire_app_data" => &["app.data.acquire"],
         "kill_app" => &["app.kill"],
         "agent_display"
         | "create_virtual_screen"

@@ -147,7 +147,92 @@
         "args": { "ms": 1000 },
         "description": "Allow post-login transition to settle"
       }
+    ],
+    "verify_workspace_ready": [
+      {
+        "action": "verify_window_count_min",
+        "args": { "min": 1 },
+        "description": "Verify TWS main window is mapped on display"
+      },
+      {
+        "action": "verify_window_title_regex",
+        "args": { "pattern": ".*(Interactive Brokers|Trader Workstation|Simulated Trading).*" },
+        "description": "Verify TWS main window title without screenshot"
+      }
+    ],
+    "copy_watchlist_snapshot": [
+      {
+        "action": "click_anchor",
+        "args": { "anchor": "watchlist_panel" },
+        "description": "Focus Watchlist panel in Mosaic layout"
+      },
+      {
+        "action": "hotkey",
+        "args": { "keys": ["ctrl", "a"] },
+        "description": "Select watchlist rows"
+      },
+      {
+        "action": "hotkey",
+        "args": { "keys": ["ctrl", "c"] },
+        "description": "Copy watchlist rows to clipboard"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 200 }
+      },
+      {
+        "action": "read_clipboard",
+        "args": { "min_len": 2, "max_bytes": 65536, "clear_before": false },
+        "method": "clipboard",
+        "safety_level": "read_only",
+        "latency_ms_est": 150,
+        "description": "Read copied watchlist snapshot from clipboard"
+      }
     ]
+  },
+  "capabilities": {
+    "workspace_health": {
+      "data_channel": "window_meta",
+      "flow": "verify_workspace_ready",
+      "safety_level": "read_only",
+      "latency_ms_est": 50,
+      "fallback_method": "screenshot_full",
+      "output_schema": {
+        "format": "json",
+        "fields": ["window_title", "pid"]
+      }
+    },
+    "watchlist_snapshot": {
+      "data_channel": "clipboard",
+      "flow": "copy_watchlist_snapshot",
+      "safety_level": "read_only",
+      "latency_ms_est": 800,
+      "fallback_method": "screenshot_roi",
+      "output_schema": {
+        "format": "tsv",
+        "delimiter": "\t",
+        "roi_norm": [0.02, 0.08, 0.40, 0.70]
+      }
+    },
+    "portfolio_export": {
+      "data_channel": "file_export",
+      "flow": "open_watchlist",
+      "safety_level": "read_only",
+      "latency_ms_est": 1500,
+      "artifact_path": "${HOME}/.cua-ycwang/exports/tws_portfolio.csv",
+      "fallback_method": "screenshot_roi",
+      "output_schema": {
+        "format": "csv",
+        "delimiter": ",",
+        "roi_norm": [0.02, 0.08, 0.96, 0.85]
+      }
+    }
+  },
+  "safety_policy": {
+    "default_max_level": "read_only",
+    "blocked_shortcuts": ["ctrl+enter", "alt+t"],
+    "blocked_flows": ["submit_order", "transmit_order", "place_trade"],
+    "notes": "Read-only Mosaic workspace & watchlist inspection + auth-only login; order transmission is strictly blocked."
   },
   "state_machine": {
     "initial_state": "ready",

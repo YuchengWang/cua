@@ -41,7 +41,9 @@ use super::{
     launch_app::LaunchAppTool,
     list_apps::ListAppsTool,
     list_windows::ListWindowsTool,
-    mcp_app_recipe::{GenerateAppRecipeTool, InspectAppFlowTool, RunAppRecipeTool},
+    mcp_app_recipe::{
+        AcquireAppDataTool, GenerateAppRecipeTool, InspectAppFlowTool, RunAppRecipeTool,
+    },
     mcp_clipboard::{GetClipboardTool, SetClipboardTool, SyncClipboardTool},
     mcp_type_secret::TypeSecretFromEnvTool,
     mcp_virtual_screen::{
@@ -5294,6 +5296,7 @@ pub fn build_registry_with_provider(
     r.register(Box::new(InspectAppFlowTool));
     r.register(Box::new(GenerateAppRecipeTool));
     r.register(Box::new(RunAppRecipeTool));
+    r.register(Box::new(AcquireAppDataTool));
     r.register(Box::new(TypeSecretFromEnvTool));
     r.register(Box::new(ListAppsTool));
     r.register(Box::new(ListWindowsTool));

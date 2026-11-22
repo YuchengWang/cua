@@ -1003,7 +1003,8 @@ pub fn advertised_risk_for(tool: &str) -> RiskAssessment {
         | "destroy_virtual_screen"
         | "launch_in_virtual_screen"
         | "generate_app_recipe"
-        | "run_app_recipe" => RiskClass::R3,
+        | "run_app_recipe"
+        | "acquire_app_data" => RiskClass::R3,
 
         _ => RiskClass::Unclassified,
     };
@@ -1127,7 +1128,8 @@ pub fn classify_tool_call(tool: &str, args: &Value) -> RiskAssessment {
         | "destroy_virtual_screen"
         | "launch_in_virtual_screen"
         | "generate_app_recipe"
-        | "run_app_recipe" => {
+        | "run_app_recipe"
+        | "acquire_app_data" => {
             RiskAssessment {
                 class: RiskClass::R3,
                 enforcement: RiskEnforcement::Active,

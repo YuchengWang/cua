@@ -113,6 +113,91 @@ pub struct RecipeTransition {
     pub on_error: Option<String>,
 }
 
+/// Primary or fallback data acquisition channel for a recipe capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DataChannel {
+    Atspi,
+    Cdp,
+    Clipboard,
+    FileExport,
+    Log,
+    #[default]
+    WindowMeta,
+    ScreenshotRoi,
+    ScreenshotFull,
+}
+
+/// Execution safety tier for a capability, flow, or step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SafetyLevel {
+    #[default]
+    ReadOnly,
+    AuthOnly,
+    Restricted,
+}
+
+impl SafetyLevel {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::AuthOnly => "auth_only",
+            Self::Restricted => "restricted",
+        }
+    }
+}
+
+/// Expected structured output shape for an acquired capability artifact.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct OutputSchema {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delimiter: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sections: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub columns: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roi_norm: Option<[f64; 4]>,
+}
+
+/// Declarative capability routing entry in [`AppRecipe::capabilities`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CapabilitySpec {
+    pub data_channel: DataChannel,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow: Option<String>,
+    #[serde(default)]
+    pub safety_level: SafetyLevel,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms_est: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_method: Option<DataChannel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_capability: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<OutputSchema>,
+}
+
+/// Runtime safety policy enforced by `run_app_recipe` and `acquire_app_data`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SafetyPolicy {
+    #[serde(default)]
+    pub default_max_level: SafetyLevel,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_shortcuts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_flows: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
 /// Single step in a named [`AppRecipe::flows`] sequence.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RecipeStep {
@@ -123,6 +208,14 @@ pub struct RecipeStep {
     pub wait_for_stable_frame_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safety_level: Option<SafetyLevel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms_est: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_method: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -160,6 +253,10 @@ pub struct AppRecipe {
     pub modal_handlers: Vec<ModalHandler>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub flows: HashMap<String, Vec<RecipeStep>>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub capabilities: HashMap<String, CapabilitySpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safety_policy: Option<SafetyPolicy>,
     pub state_machine: StateMachine,
 }
 
@@ -238,6 +335,87 @@ pub fn resolve_relative_anchor_xy(
     (x, y)
 }
 
+/// Merge a curated `<app_id>.json` overlay onto a version-pinned base recipe,
+/// preserving the base's `app_version`, `version_source`, `fingerprint_sha256`,
+/// and `tech_stack`.
+pub fn merge_curated_overlay(base: &mut AppRecipe, overlay: &AppRecipe) {
+    for (name, steps) in &overlay.flows {
+        base.flows.insert(name.clone(), steps.clone());
+    }
+    for (name, spec) in &overlay.capabilities {
+        base.capabilities.insert(name.clone(), spec.clone());
+    }
+    for anchor in &overlay.relative_anchors {
+        if let Some(existing) = base
+            .relative_anchors
+            .iter_mut()
+            .find(|a| a.name == anchor.name)
+        {
+            *existing = anchor.clone();
+        } else {
+            base.relative_anchors.push(anchor.clone());
+        }
+    }
+    for handler in &overlay.modal_handlers {
+        if let Some(existing) = base
+            .modal_handlers
+            .iter_mut()
+            .find(|h| h.pattern == handler.pattern)
+        {
+            *existing = handler.clone();
+        } else {
+            base.modal_handlers.push(handler.clone());
+        }
+    }
+    for shortcut in &overlay.verified_shortcuts {
+        if let Some(existing) = base
+            .verified_shortcuts
+            .iter_mut()
+            .find(|s| s.id == shortcut.id)
+        {
+            *existing = shortcut.clone();
+        } else {
+            base.verified_shortcuts.push(shortcut.clone());
+        }
+    }
+    if let Some(ref ov_policy) = overlay.safety_policy {
+        match base.safety_policy {
+            Some(ref mut base_policy) => {
+                base_policy.default_max_level = ov_policy.default_max_level;
+                for s in &ov_policy.blocked_shortcuts {
+                    if !base_policy.blocked_shortcuts.contains(s) {
+                        base_policy.blocked_shortcuts.push(s.clone());
+                    }
+                }
+                for f in &ov_policy.blocked_flows {
+                    if !base_policy.blocked_flows.contains(f) {
+                        base_policy.blocked_flows.push(f.clone());
+                    }
+                }
+                if ov_policy.notes.is_some() {
+                    base_policy.notes = ov_policy.notes.clone();
+                }
+            }
+            None => {
+                base.safety_policy = Some(ov_policy.clone());
+            }
+        }
+    }
+}
+
+fn apply_curated_overlay_if_present(dir: &Path, base_path: &Path, recipe: &mut AppRecipe) {
+    let overlay_filename = format!("{}.json", sanitize_component(&recipe.app_id));
+    let overlay_path = dir.join(overlay_filename);
+    if overlay_path == base_path || !overlay_path.is_file() {
+        return;
+    }
+    if let Ok(overlay) = load_recipe(&overlay_path) {
+        if overlay.app_id.eq_ignore_ascii_case(&recipe.app_id) {
+            merge_curated_overlay(recipe, &overlay);
+        }
+    }
+}
+
 /// Find a recipe in `dir` matching `(app_id, app_version, fp8)`.
 pub fn find_matching_recipe(
     dir: &Path,
@@ -247,7 +425,8 @@ pub fn find_matching_recipe(
 ) -> Option<AppRecipe> {
     let exact = dir.join(canonical_recipe_filename(app_id, app_version, sha256_hex));
     if exact.is_file() {
-        if let Ok(recipe) = load_recipe(&exact) {
+        if let Ok(mut recipe) = load_recipe(&exact) {
+            apply_curated_overlay_if_present(dir, &exact, &mut recipe);
             return Some(recipe);
         }
     }
@@ -257,24 +436,39 @@ pub fn find_matching_recipe(
 /// Find the highest-fidelity recipe for `app_id` in `dir`, preferring exact
 /// `(app_version, fp8)` matches and ranking `java_install4j` / `electron` /
 /// `dotnet_avalonia` recipes above lower-fidelity `native_elf` / `vunknown`
-/// fallbacks.
+/// fallbacks. When a version-pinned base recipe (`<app_id>_v<ver>_<fp8>.json`)
+/// is matched, any curated `<app_id>.json` overlay in the same directory is
+/// merged onto it.
 pub fn find_best_recipe_for_app(
     dir: &Path,
     app_id: &str,
     preferred_version: Option<&str>,
     preferred_sha256: Option<&str>,
 ) -> Option<AppRecipe> {
+    find_best_recipe_with_path(dir, app_id, preferred_version, preferred_sha256)
+        .map(|(recipe, _)| recipe)
+}
+
+/// Variant of [`find_best_recipe_for_app`] that also returns the base recipe's
+/// disk path for cache mtime/len tracking.
+pub fn find_best_recipe_with_path(
+    dir: &Path,
+    app_id: &str,
+    preferred_version: Option<&str>,
+    preferred_sha256: Option<&str>,
+) -> Option<(AppRecipe, PathBuf)> {
     if let (Some(ver), Some(sha)) = (preferred_version, preferred_sha256) {
         if ver != "unknown" {
+            let exact_path = dir.join(canonical_recipe_filename(app_id, ver, sha));
             if let Some(exact) = find_matching_recipe(dir, app_id, ver, sha) {
-                return Some(exact);
+                return Some((exact, exact_path));
             }
         }
     }
 
     let preferred_fp8 = preferred_sha256.map(fp8_of);
     let entries = std::fs::read_dir(dir).ok()?;
-    let mut best: Option<(i32, AppRecipe)> = None;
+    let mut best: Option<(i32, PathBuf, AppRecipe)> = None;
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -304,19 +498,34 @@ pub fn find_best_recipe_for_app(
             Some(_) => score += 10,
             None => {}
         }
-        if recipe.app_version != "unknown" {
+        if recipe.app_version != "unknown" && recipe.app_version != "seeded" {
             score += 10;
         }
         if !recipe.relative_anchors.is_empty() || !recipe.flows.is_empty() {
             score += 5;
         }
+        // Prefer version-pinned base files (<app_id>_v...) over unpinned <app_id>.json
+        // so the curated overlay can be cleanly merged onto the versioned base.
+        let is_version_pinned = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.contains("_v"));
+        if is_version_pinned {
+            score += 5;
+        }
 
-        if best.as_ref().is_none_or(|(best_score, _)| score > *best_score) {
-            best = Some((score, recipe));
+        if best
+            .as_ref()
+            .is_none_or(|(best_score, _, _)| score > *best_score)
+        {
+            best = Some((score, path, recipe));
         }
     }
 
-    best.map(|(_, recipe)| recipe)
+    best.map(|(_, base_path, mut recipe)| {
+        apply_curated_overlay_if_present(dir, &base_path, &mut recipe);
+        (recipe, base_path)
+    })
 }
 
 /// Machine-readable result from [`VersionGate::verify`].
@@ -382,10 +591,44 @@ impl VersionGate {
     }
 }
 
-/// In-memory hot cache for verified [`AppRecipe`] instances.
+fn file_stamp(path: &Path) -> (Option<u128>, Option<u64>) {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return (None, None);
+    };
+    let modified_ns = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos());
+    (modified_ns, Some(meta.len()))
+}
+
+fn overlay_path_for(base_path: &Path, app_id: &str) -> Option<PathBuf> {
+    let dir = base_path.parent()?;
+    let candidate = dir.join(format!("{}.json", sanitize_component(app_id)));
+    if candidate != base_path && candidate.is_file() {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+#[derive(Clone)]
+struct CachedRecipeEntry {
+    recipe: Arc<AppRecipe>,
+    source_path: Option<PathBuf>,
+    modified_ns: Option<u128>,
+    file_len: Option<u64>,
+    overlay_path: Option<PathBuf>,
+    overlay_modified_ns: Option<u128>,
+    overlay_file_len: Option<u64>,
+}
+
+/// In-memory hot cache for verified [`AppRecipe`] instances, with automatic
+/// disk `mtime` / `len` invalidation and reload.
 #[derive(Default)]
 pub struct AppRecipeCache {
-    entries: RwLock<HashMap<String, Arc<AppRecipe>>>,
+    entries: RwLock<HashMap<String, CachedRecipeEntry>>,
 }
 
 impl AppRecipeCache {
@@ -399,15 +642,76 @@ impl AppRecipeCache {
 
     pub fn get(&self, app_id: &str, app_version: &str, sha256_hex: &str) -> Option<Arc<AppRecipe>> {
         let key = Self::key(app_id, app_version, fp8_of(sha256_hex));
-        let guard = self.entries.read().ok()?;
-        guard.get(&key).cloned()
+        let entry = {
+            let guard = self.entries.read().ok()?;
+            guard.get(&key)?.clone()
+        };
+
+        if let Some(ref src) = entry.source_path {
+            let (cur_mtime, cur_len) = file_stamp(src);
+            let current_overlay = overlay_path_for(src, &entry.recipe.app_id);
+            let overlay_changed = match (&entry.overlay_path, &current_overlay) {
+                (Some(prev), Some(cur)) if prev == cur => {
+                    let (om, ol) = file_stamp(cur);
+                    om != entry.overlay_modified_ns || ol != entry.overlay_file_len
+                }
+                (None, None) => false,
+                _ => true,
+            };
+
+            if cur_mtime != entry.modified_ns || cur_len != entry.file_len || overlay_changed {
+                if let Ok(mut reloaded) = load_recipe(src) {
+                    if let Some(dir) = src.parent() {
+                        apply_curated_overlay_if_present(dir, src, &mut reloaded);
+                    }
+                    let arc = self.insert_with_path(reloaded, Some(src.clone()));
+                    return Some(arc);
+                }
+                if let Ok(mut guard) = self.entries.write() {
+                    guard.remove(&key);
+                }
+                return None;
+            }
+        }
+
+        Some(entry.recipe)
     }
 
     pub fn insert(&self, recipe: AppRecipe) -> Arc<AppRecipe> {
+        self.insert_with_path(recipe, None)
+    }
+
+    pub fn insert_with_path(
+        &self,
+        recipe: AppRecipe,
+        source_path: Option<PathBuf>,
+    ) -> Arc<AppRecipe> {
         let key = Self::key(&recipe.app_id, &recipe.app_version, recipe.fp8());
+        let (modified_ns, file_len) = source_path
+            .as_deref()
+            .map(file_stamp)
+            .unwrap_or((None, None));
+        let overlay_path = source_path
+            .as_deref()
+            .and_then(|p| overlay_path_for(p, &recipe.app_id));
+        let (overlay_modified_ns, overlay_file_len) = overlay_path
+            .as_deref()
+            .map(file_stamp)
+            .unwrap_or((None, None));
         let arc = Arc::new(recipe);
         if let Ok(mut guard) = self.entries.write() {
-            guard.insert(key, Arc::clone(&arc));
+            guard.insert(
+                key,
+                CachedRecipeEntry {
+                    recipe: Arc::clone(&arc),
+                    source_path,
+                    modified_ns,
+                    file_len,
+                    overlay_path,
+                    overlay_modified_ns,
+                    overlay_file_len,
+                },
+            );
         }
         arc
     }
@@ -460,6 +764,8 @@ mod tests {
                 key: Some("Escape".to_owned()),
             }],
             flows: HashMap::new(),
+            capabilities: HashMap::new(),
+            safety_policy: None,
             state_machine: StateMachine {
                 initial_state: "login".to_owned(),
                 states: vec![RecipeState {
@@ -565,5 +871,151 @@ mod tests {
             rel_y: 0.5,
         };
         assert_eq!(resolve_relative_anchor_xy(&anchor, 100, 50, 1000, 800), (350, 450));
+    }
+
+    #[test]
+    fn cache_invalidates_and_reloads_when_mtime_or_len_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r1 = sample_recipe("1994.1.16", "6f8008dc00000000");
+        r1.app_id = "thinkorswim".to_owned();
+        let path = save_recipe_to_dir(dir.path(), &r1).unwrap();
+
+        let cache = AppRecipeCache::new();
+        cache.insert_with_path(r1.clone(), Some(path.clone()));
+        assert_eq!(
+            cache.get("thinkorswim", "1994.1.16", "6f8008dc").unwrap().flows.len(),
+            0
+        );
+
+        // Modify file on disk (length & mtime change)
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        let mut r2 = r1;
+        r2.flows.insert(
+            "workspace_check".to_owned(),
+            vec![RecipeStep {
+                action: "verify_window_count_min".to_owned(),
+                args: serde_json::json!({ "min": 1 }),
+                wait_for_stable_frame_ms: None,
+                description: None,
+                method: Some("window_meta".to_owned()),
+                safety_level: Some(SafetyLevel::ReadOnly),
+                latency_ms_est: Some(20),
+                fallback_method: None,
+            }],
+        );
+        save_recipe_to_dir(dir.path(), &r2).unwrap();
+
+        let reloaded = cache.get("thinkorswim", "1994.1.16", "6f8008dc").unwrap();
+        assert_eq!(reloaded.flows.len(), 1);
+        assert!(reloaded.flows.contains_key("workspace_check"));
+    }
+
+    #[test]
+    fn find_best_recipe_merges_curated_overlay_onto_version_pinned_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut base = sample_recipe("1994.1.16", "6f8008dc11112222");
+        base.app_id = "thinkorswim".to_owned();
+        base.tech_stack = Some("java_install4j".to_owned());
+        base.relative_anchors.push(RelativeAnchor {
+            name: "charts_tab".to_owned(),
+            role: Some("tab".to_owned()),
+            title_pattern: None,
+            rel_x: 0.1,
+            rel_y: 0.1,
+        });
+        save_recipe_to_dir(dir.path(), &base).unwrap();
+
+        let mut overlay = sample_recipe("seeded", "seeded");
+        overlay.app_id = "thinkorswim".to_owned();
+        overlay.tech_stack = Some("overlay_stack".to_owned());
+        overlay.relative_anchors.push(RelativeAnchor {
+            name: "charts_tab".to_owned(),
+            role: Some("tab".to_owned()),
+            title_pattern: None,
+            rel_x: 0.33,
+            rel_y: 0.03,
+        });
+        overlay.flows.insert(
+            "curated_flow".to_owned(),
+            vec![RecipeStep {
+                action: "wait_for_stable_frame".to_owned(),
+                args: serde_json::json!({ "ms": 100 }),
+                wait_for_stable_frame_ms: None,
+                description: None,
+                method: None,
+                safety_level: None,
+                latency_ms_est: None,
+                fallback_method: None,
+            }],
+        );
+        overlay.capabilities.insert(
+            "workspace_health".to_owned(),
+            CapabilitySpec {
+                data_channel: DataChannel::WindowMeta,
+                flow: Some("curated_flow".to_owned()),
+                safety_level: SafetyLevel::ReadOnly,
+                latency_ms_est: Some(50),
+                artifact_path: None,
+                fallback_method: Some(DataChannel::ScreenshotRoi),
+                fallback_capability: None,
+                output_schema: None,
+            },
+        );
+        overlay.safety_policy = Some(SafetyPolicy {
+            default_max_level: SafetyLevel::ReadOnly,
+            blocked_shortcuts: vec!["ctrl+enter".to_owned()],
+            blocked_flows: vec!["submit_order".to_owned()],
+            notes: Some("no order submission".to_owned()),
+        });
+        std::fs::write(
+            dir.path().join("thinkorswim.json"),
+            serde_json::to_string_pretty(&overlay).unwrap(),
+        )
+        .unwrap();
+
+        let merged = find_best_recipe_for_app(
+            dir.path(),
+            "thinkorswim",
+            Some("1994.1.16"),
+            Some("6f8008dc11112222"),
+        )
+        .expect("merged recipe");
+
+        // Base identity preserved
+        assert_eq!(merged.app_version, "1994.1.16");
+        assert_eq!(merged.fingerprint_sha256, "6f8008dc11112222");
+        assert_eq!(merged.tech_stack.as_deref(), Some("java_install4j"));
+        // Overlay merged
+        assert!(merged.flows.contains_key("curated_flow"));
+        assert!(merged.capabilities.contains_key("workspace_health"));
+        assert_eq!(merged.relative_anchors[0].rel_x, 0.33);
+        assert_eq!(
+            merged.safety_policy.as_ref().unwrap().blocked_flows,
+            vec!["submit_order".to_owned()]
+        );
+    }
+
+    #[test]
+    fn backward_compatible_deserialization_and_capability_safety_schema() {
+        let legacy_json = serde_json::json!({
+            "schema_version": 1,
+            "app_id": "legacy_app",
+            "app_version": "1.0.0",
+            "version_source": "unknown",
+            "fingerprint_sha256": "deadbeef",
+            "flows": {
+                "ping": [{ "action": "wait_for_stable_frame", "args": { "ms": 10 } }]
+            },
+            "state_machine": {
+                "initial_state": "ready",
+                "states": [],
+                "transitions": []
+            }
+        });
+        let parsed: AppRecipe = serde_json::from_value(legacy_json).unwrap();
+        assert!(parsed.capabilities.is_empty());
+        assert!(parsed.safety_policy.is_none());
+        assert!(SafetyLevel::ReadOnly < SafetyLevel::AuthOnly);
+        assert!(SafetyLevel::AuthOnly < SafetyLevel::Restricted);
     }
 }

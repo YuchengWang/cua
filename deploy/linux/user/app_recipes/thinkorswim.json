@@ -166,6 +166,13 @@
       "title_pattern": ".*thinkorswim.*",
       "rel_x": 0.9531,
       "rel_y": 0.2315
+    },
+    {
+      "name": "probability_table_area",
+      "role": "table",
+      "title_pattern": ".*thinkorswim.*",
+      "rel_x": 0.50,
+      "rel_y": 0.45
     }
   ],
   "modal_handlers": [
@@ -463,8 +470,125 @@
         "action": "wait_for_stable_frame",
         "args": { "ms": 600 },
         "description": "Allow CSV export to flush to disk"
+      },
+      {
+        "action": "verify_file_export",
+        "args": {
+          "path": "/home/ycwang/.cua-ycwang/exports/tos_account_statement.csv",
+          "wait_ms": 3000,
+          "min_bytes": 32,
+          "preview_lines": 20
+        },
+        "method": "file_export",
+        "safety_level": "read_only",
+        "latency_ms_est": 500,
+        "description": "Verify exported account statement CSV and return structured preview"
+      }
+    ],
+    "copy_probability_analysis_table": [
+      {
+        "action": "click_anchor",
+        "args": { "anchor": "analyze_tab" },
+        "description": "Switch to Analyze tab (read-only)"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 300 }
+      },
+      {
+        "action": "click_anchor",
+        "args": { "anchor": "probability_subtab" },
+        "description": "Open Probability Analysis subtab (read-only)"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 300 }
+      },
+      {
+        "action": "click_anchor",
+        "args": { "anchor": "probability_table_area" },
+        "description": "Focus Probability Analysis table"
+      },
+      {
+        "action": "hotkey",
+        "args": { "keys": ["ctrl", "a"] },
+        "description": "Select table rows"
+      },
+      {
+        "action": "hotkey",
+        "args": { "keys": ["ctrl", "c"] },
+        "description": "Copy selected table rows to clipboard"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 200 }
+      },
+      {
+        "action": "read_clipboard",
+        "args": { "min_len": 4, "max_bytes": 65536, "clear_before": false },
+        "method": "clipboard",
+        "safety_level": "read_only",
+        "latency_ms_est": 150,
+        "description": "Read copied Probability Analysis table from clipboard"
       }
     ]
+  },
+  "capabilities": {
+    "workspace_health": {
+      "data_channel": "window_meta",
+      "flow": "verify_workspace_ready",
+      "safety_level": "read_only",
+      "latency_ms_est": 50,
+      "artifact_path": "/home/ycwang/work/schwab/thinkorswim/suit.usergui.log",
+      "fallback_method": "log",
+      "output_schema": {
+        "format": "json",
+        "fields": ["window_title", "pid", "log_match"]
+      }
+    },
+    "account_statement": {
+      "data_channel": "file_export",
+      "flow": "export_account_statement_csv",
+      "safety_level": "read_only",
+      "latency_ms_est": 3000,
+      "artifact_path": "/home/ycwang/.cua-ycwang/exports/tos_account_statement.csv",
+      "fallback_method": "screenshot_roi",
+      "output_schema": {
+        "format": "csv",
+        "delimiter": ",",
+        "sections": ["Cash Balance", "Account Trade History", "Positions", "Account Summary"],
+        "roi_norm": [0.05, 0.08, 0.90, 0.85]
+      }
+    },
+    "probability_table": {
+      "data_channel": "clipboard",
+      "flow": "copy_probability_analysis_table",
+      "safety_level": "read_only",
+      "latency_ms_est": 1200,
+      "fallback_method": "screenshot_roi",
+      "output_schema": {
+        "format": "tsv",
+        "delimiter": "\t",
+        "columns": ["Date", "Prob. Of Touching", "Prob. ITM", "Prob. OTM"],
+        "roi_norm": [0.08, 0.12, 0.84, 0.78]
+      }
+    },
+    "chart_visual": {
+      "data_channel": "screenshot_roi",
+      "safety_level": "read_only",
+      "latency_ms_est": 400,
+      "fallback_method": "screenshot_full",
+      "output_schema": {
+        "format": "png",
+        "roi_norm": [0.08, 0.10, 0.84, 0.80]
+      }
+    }
+  },
+  "safety_policy": {
+    "default_max_level": "read_only",
+    "blocked_shortcuts": ["ctrl+enter", "ctrl+shift+b", "ctrl+shift+s"],
+    "blocked_flows": ["submit_order", "cancel_order", "place_trade"],
+    "notes": "Read-only market data, account statement export, and auth-only login flows; order submission is strictly blocked."
   },
   "state_machine": {
     "initial_state": "ready",

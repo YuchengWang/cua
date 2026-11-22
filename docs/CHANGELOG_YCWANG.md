@@ -7,6 +7,16 @@
 
 ## [Unreleased] — `feat/x11-virtual-desktop`
 
+### P0–P2 4-Tier Interaction & Capability Routing (`acquire_app_data`, Curated Overlay, `SafetyLevel` Gate & `Artifact` Actions) (`2026-11-22`, Landed)
+- **Added / Changed**：
+  - `cua-driver-core/src/app_recipe.rs`: Added `DataChannel`, `SafetyLevel`, `OutputSchema`, `CapabilitySpec`, `SafetyPolicy`, and optional `RecipeStep` metadata (`method`, `safety_level`, `latency_ms_est`, `fallback_method`) with full `#[serde(default)]` backward compatibility; upgraded `AppRecipeCache` to track `(source_path, modified_ns, file_len)` (and overlay stamp) for automatic disk invalidation/reload; added `merge_curated_overlay()` and updated `find_best_recipe_for_app()` / `find_best_recipe_with_path()` to merge `<app_id>.json` curated overlays onto version-pinned `<app_id>_v<ver>_<fp8>.json` base recipes while preserving base identity fields.
+  - `platform-linux/src/app_inspector.rs`: Added `is_shell_only_atspi()` so `java_install4j` apps (TWS / Thinkorswim) exposing only top-level shell nodes remain `atspi_blind: true` (`visual_grounding_plus_hotkeys`) instead of being misclassified as `atspi_semantic`.
+  - `platform-linux/src/tools/mcp_app_recipe.rs` (plus `tools/impl_.rs`, `cua-driver-core/src/authorization.rs`, `cua-driver-core/src/tool.rs`): Added `read_clipboard` and `verify_file_export` flow actions returning structured `artifacts[]` alongside `steps`; added `acquire_app_data` MCP tool (`R3` / `app.data.acquire`) with 4-tier capability routing, `screenshot_roi` cropping via `roi_norm`, automatic fallback, and runtime `SafetyLevel` gate (`safety_gate_blocked` for `restricted`, `blocked_flows`, and `blocked_shortcuts`); enforced `SafetyLevel` gate (`allow_safety_level` default `"auth_only"`) in `run_app_recipe`.
+  - `deploy/linux/user/app_recipes/{thinkorswim.json,tws.json}`: Upgraded with `capabilities` (`workspace_health`, `account_statement`, `probability_table`, `chart_visual` for Thinkorswim; `workspace_health`, `watchlist_snapshot`, `portfolio_export` for TWS) and `safety_policy` while preserving all existing `login_*`, `switch_*`, and `export_account_statement_csv` flows.
+- **Verified / 已核验**：
+  - `cargo clippy -p cua-driver-core -p platform-linux -p cua-driver --all-targets -- -D warnings` passed.
+  - `cargo test -p cua-driver-core --lib`, `cargo test -p platform-linux --lib`, and `cargo test -p cua-driver --test schema_consistency_test` all passed.
+
 ### Out-of-Band `.env` Secret Typing (`type_secret_from_env`) for Thinkorswim & TWS (`2026-11-22`, Landed)
 - **Added / 新增**：
   - `platform-linux/src/tools/mcp_type_secret.rs`: Added `type_secret_from_env` MCP tool (registered in `tools/mod.rs`, `tools/impl_.rs`, `cua-driver-core/src/authorization.rs` as `R2`, and `cua-driver-core/src/tool.rs` with `input.keyboard.type`), enforcing strict `CUA_YCWANG_` key-prefix validation (`validate_env_key()`), `.env` resolution (`env_file` > `CUA_YCWANG_ENV_FILE` > `./.env` > `~/.config/cua-ycwang/.env` > process env fallback), clean `.env` parsing (`export `, comments, first-`=` split, matching quotes), `zeroize::Zeroizing` memory handling, Swing-safe `xtest_type_text()` + optional `Return` synthesis, and zero-leak output (`Typed env secret (key=..., len=...) on <display_id>`).

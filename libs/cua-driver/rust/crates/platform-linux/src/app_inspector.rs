@@ -268,7 +268,10 @@ pub fn inspect_app_flow(req: InspectAppFlowRequest) -> Result<AppFlowInspection>
         }
     }
 
-    let atspi_blind = ((pid.is_some() || req.window_id.is_some()) && interactive_elements_count == 0)
+    let atspi_blind = ((pid.is_some() || req.window_id.is_some())
+        && (interactive_elements_count == 0
+            || (tech_stack == "java_install4j"
+                && is_shell_only_atspi(&sample_roles, interactive_elements_count))))
         || (pid.is_none() && tech_stack == "java_install4j");
     let mut remediation_hints = Vec::new();
     let recommended_interaction = if atspi_blind {
@@ -323,6 +326,33 @@ pub fn inspect_app_flow(req: InspectAppFlowRequest) -> Result<AppFlowInspection>
         sample_roles: sample_roles.into_iter().collect(),
         notes,
     })
+}
+
+fn is_shell_only_atspi(sample_roles: &BTreeSet<String>, interactive_elements_count: usize) -> bool {
+    if interactive_elements_count == 0 {
+        return true;
+    }
+    let has_actionable = sample_roles.iter().any(|r| {
+        matches!(
+            r.as_str(),
+            "push button"
+                | "push_button"
+                | "menu item"
+                | "menu_item"
+                | "text"
+                | "password text"
+                | "table"
+                | "table cell"
+                | "page tab"
+                | "tab"
+                | "check box"
+                | "radio button"
+                | "combo box"
+                | "list item"
+                | "tree item"
+        )
+    });
+    !has_actionable
 }
 
 fn extract_visual_hotspots(
@@ -1168,5 +1198,17 @@ mod tests {
             .notes
             .iter()
             .any(|n| n.contains("JxBrowser")));
+    }
+
+    #[test]
+    fn java_install4j_shell_only_atspi_nodes_stay_atspi_blind() {
+        let mut shell_roles = BTreeSet::new();
+        shell_roles.insert("application".to_owned());
+        shell_roles.insert("frame".to_owned());
+        shell_roles.insert("panel".to_owned());
+        assert!(is_shell_only_atspi(&shell_roles, 3));
+
+        shell_roles.insert("push button".to_owned());
+        assert!(!is_shell_only_atspi(&shell_roles, 4));
     }
 }
