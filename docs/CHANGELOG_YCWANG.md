@@ -7,6 +7,10 @@
 
 ## [Unreleased] — `feat/x11-virtual-desktop`
 
+### Docs: Fork Notice, License Compliance & Security Disclaimer in `README.md` (`2026-11-22`, Landed)
+- **Added / 新增**：
+  - `README.md`: Added top-level GFM `[!IMPORTANT]` Fork Notice (`YuchengWang/cua` — `cua-ycwang` X11 Edition) acknowledging upstream `trycua/cua` and its MIT / component licenses, summarizing X11 virtual desktop customizations with bilingual doc links (`LINUX_X11_VIRTUAL_SCREEN_PLAN*.md`, `LINUX_X11_PERMISSIONS*.md`, `CHANGELOG_YCWANG.md`), and stating security/input risk disclosures, no-plaintext-credentials rule, personal-use-only scope, and AS-IS / user-assumption-of-risk disclaimer.
+
 ### Post-M5 Hotfix: Virtual `get_window_state` Contract & `xtest_type_text` Focus/Clipboard Hardening (`2026-11-22`, Landed)
 - **Fixed / 修复**：
   - `platform-linux/src/tools/mcp_virtual_screen.rs`: Replaced ad-hoc JSON in `virtual_get_window_state` with `cua_driver_contract::WindowStateOutput` serialization (`build_virtual_window_state_output`), guaranteeing non-null `pid: u32` (falling back to caller `pid` or `0` when `_NET_WM_PID` is absent) and aligned `window_title`, `screenshot_width`/`screenshot_height`, `screenshot_mime_type`, `screenshot_frame_valid`, and `window_bounds` fields to eliminate `typed_output_mismatch`. Added contract unit tests.

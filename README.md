@@ -22,6 +22,35 @@
 
 </div>
 
+---
+
+> [!IMPORTANT]
+> ## 📌 Fork Notice, Acknowledgements & Disclaimer (`YuchengWang/cua` — `cua-ycwang` X11 Edition)
+>
+> ### 1. License Compliance & Acknowledgements (致谢与开源许可声明)
+> - This repository (`YuchengWang/cua`) is a personal fork of **[trycua/cua](https://github.com/trycua/cua)**.
+> - We strictly respect and comply with the original authors' open-source licenses (including the **MIT License** for `cua-driver` / SDKs and the respective licenses of other components in the upstream repository). All upstream copyright notices and license terms remain fully intact.
+> - Sincere thanks and full credit go to the **Cua (`trycua/cua`)** authors and contributors for building an outstanding cross-platform Computer-Use architecture.
+> - 本仓库（`YuchengWang/cua`）派生自开源项目 **[trycua/cua](https://github.com/trycua/cua)**，完全尊重并遵守原作者的开源许可协议（包括 `cua-driver` 与 SDK 的 MIT License 及各子组件原有许可），保留全部原始版权声明，并对原作者及社区贡献者致以诚挚感谢。
+>
+> ### 2. Scope of Custom X11 Development (本次 X11 桌面定制化开发内容)
+> Based on upstream `cua-driver`, the `feat/x11-virtual-desktop` branch introduces Linux X11-specific customizations installed in isolation as **`cua-ycwang`** (non-conflicting with upstream `cua-driver`):
+> - **Isolated Multi-Virtual-Screen Management & Scheduling**: Dynamic `Xvfb` + `openbox` + isolated `dbus-daemon` (`AT-SPI`) + `XAUTHORITY` (`0600`) lifecycle (`create_virtual_screen`, `list_virtual_screens`, `destroy_virtual_screen`, `launch_in_virtual_screen`) and `X11ScreenPool` routing for background zero-focus-stealing GUI automation.
+> - **Off-Screen & Full X11 Desktop Control**: `XCompositeRedirectWindow` + `XCompositeNameWindowPixmap` off-screen capture, `XTest` real input inside virtual screens (supporting Java/Swing & Electron), `OverrideRedirect` popup/menu enumeration, non-ASCII/CJK clipboard-assisted input & isolated clipboard tools (`get_clipboard`, `set_clipboard`, `sync_clipboard`), and primary screen DPMS/lock-screen guards.
+> - **Centralized Config & Out-of-Band Elevation**: Centralized configuration under `deploy/linux/` (`~/.config/cua-ycwang/`), `cua-ycwang doctor --json`, and structured `elevation_required` + `pkexec` allowlisted out-of-band elevation (no plaintext passwords in LLM/MCP context).
+> - **Bilingual Documentation**:
+>   - Architecture & Verification Plan: [English](docs/LINUX_X11_VIRTUAL_SCREEN_PLAN.md) | [简体中文](docs/LINUX_X11_VIRTUAL_SCREEN_PLAN.zh.md)
+>   - Installation, Permissions & Dual-Version Switch Guide: [English](docs/LINUX_X11_PERMISSIONS.md) | [简体中文](docs/LINUX_X11_PERMISSIONS.zh.md)
+>   - Fork Changelog: [CHANGELOG_YCWANG.md](docs/CHANGELOG_YCWANG.md)
+>
+> ### 3. Security Risk Disclosure, Personal Use Only & Disclaimer (风险提示、个人使用与免责条款)
+> - **System Privileges & Input Risks (权限与输入风险提示)**: This customization interacts with low-level Linux X11 subsystems, `/dev/uinput` kernel virtual input devices, Polkit/`pkexec` privilege elevation, and automated keyboard/mouse/clipboard injection. Misconfiguration or unintended automation actions may affect local files, running desktop applications, or system security.
+> - **No Plaintext Credentials (严禁明文密码)**: Never type, store, or pass plaintext `sudo`/account passwords into LLM prompts, MCP parameters, or automated `type_text` calls. Always use out-of-band OS authentication prompts (such as Polkit `pkexec`) or dedicated local TTYs.
+> - **Personal Use Only (仅限个人使用)**: This modified branch is intended **solely for personal learning, research, and authorized local desktop automation**. It must **not** be used on unauthorized systems, third-party environments, or redistributed as a managed commercial service without independent security review.
+> - **As-Is & Assumption of Risk (按现状提供与后果自负)**: **THIS CUSTOMIZED FORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED.** Any system changes, data loss, unintended trades/actions, or security consequences resulting from building, installing, granting permissions to, or running `cua-ycwang` are **solely at the user's own risk and responsibility (后果自负)**. Upstream `trycua/cua` authors bear no responsibility or liability for modifications in this fork.
+
+---
+
 ## Choose your path
 
 <div align="center">
