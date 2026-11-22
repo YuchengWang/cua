@@ -483,12 +483,24 @@ impl Tool for RunAppRecipeTool {
                         "artifacts": artifacts,
                     })));
                 }
-                return Ok(ToolResult::text(format!(
-                    "Completed flow '{}' of {} ({} steps, non-screenshot verified)",
-                    flow,
-                    recipe.canonical_filename(),
-                    executed_steps.len()
-                ))
+                let summary = format_artifacts_summary(&artifacts);
+                let msg = if summary.is_empty() {
+                    format!(
+                        "Completed flow '{}' of {} ({} steps, non-screenshot verified)",
+                        flow,
+                        recipe.canonical_filename(),
+                        executed_steps.len()
+                    )
+                } else {
+                    format!(
+                        "Completed flow '{}' of {} ({} steps, non-screenshot verified)\n\n{}",
+                        flow,
+                        recipe.canonical_filename(),
+                        executed_steps.len(),
+                        summary
+                    )
+                };
+                return Ok(ToolResult::text(msg)
                 .with_structured(json!({
                     "status": "completed",
                     "app_id": recipe.app_id,
@@ -751,22 +763,34 @@ impl Tool for AcquireAppDataTool {
                 &capability,
                 spec,
             ) {
-                Ok((steps, artifacts)) => Ok(ToolResult::text(format!(
-                    "Acquired capability '{capability}' for {} ({} artifacts)",
-                    recipe.canonical_filename(),
-                    artifacts.len()
-                ))
-                .with_structured(json!({
-                    "status": "completed",
-                    "app_id": recipe.app_id,
-                    "app_version": recipe.app_version,
-                    "fp8": recipe.fp8(),
-                    "capability": capability,
-                    "data_channel": spec.data_channel,
-                    "fallback_used": false,
-                    "steps": steps,
-                    "artifacts": artifacts,
-                }))),
+                Ok((steps, artifacts)) => {
+                    let summary = format_artifacts_summary(&artifacts);
+                    let msg = if summary.is_empty() {
+                        format!(
+                            "Acquired capability '{capability}' for {} ({} artifacts)",
+                            recipe.canonical_filename(),
+                            artifacts.len()
+                        )
+                    } else {
+                        format!(
+                            "Acquired capability '{capability}' for {} ({} artifacts)\n\n{}",
+                            recipe.canonical_filename(),
+                            artifacts.len(),
+                            summary
+                        )
+                    };
+                    Ok(ToolResult::text(msg).with_structured(json!({
+                        "status": "completed",
+                        "app_id": recipe.app_id,
+                        "app_version": recipe.app_version,
+                        "fp8": recipe.fp8(),
+                        "capability": capability,
+                        "data_channel": spec.data_channel,
+                        "fallback_used": false,
+                        "steps": steps,
+                        "artifacts": artifacts,
+                    })))
+                }
                 Err(primary_err) if fallback => {
                     if let Some(fb_method) = spec.fallback_method {
                         let fb_artifact = execute_fallback_channel(
@@ -778,12 +802,23 @@ impl Tool for AcquireAppDataTool {
                             fb_method,
                             spec,
                         )?;
-                        return Ok(ToolResult::text(format!(
-                            "Acquired capability '{capability}' for {} via fallback {:?}",
-                            recipe.canonical_filename(),
-                            fb_method
-                        ))
-                        .with_structured(json!({
+                        let fb_artifacts = vec![fb_artifact];
+                        let summary = format_artifacts_summary(&fb_artifacts);
+                        let msg = if summary.is_empty() {
+                            format!(
+                                "Acquired capability '{capability}' for {} via fallback {:?}",
+                                recipe.canonical_filename(),
+                                fb_method
+                            )
+                        } else {
+                            format!(
+                                "Acquired capability '{capability}' for {} via fallback {:?}\n\n{}",
+                                recipe.canonical_filename(),
+                                fb_method,
+                                summary
+                            )
+                        };
+                        return Ok(ToolResult::text(msg).with_structured(json!({
                             "status": "completed_with_fallback",
                             "app_id": recipe.app_id,
                             "app_version": recipe.app_version,
@@ -793,7 +828,7 @@ impl Tool for AcquireAppDataTool {
                             "fallback_used": true,
                             "primary_error": format!("{primary_err:#}"),
                             "steps": [],
-                            "artifacts": [fb_artifact],
+                            "artifacts": fb_artifacts,
                         })));
                     }
                     if let Some(ref fb_cap_name) = spec.fallback_capability {
@@ -822,11 +857,20 @@ impl Tool for AcquireAppDataTool {
                             fb_cap_name,
                             fb_spec,
                         )?;
-                        return Ok(ToolResult::text(format!(
-                            "Acquired capability '{capability}' for {} via fallback capability '{fb_cap_name}'",
-                            recipe.canonical_filename()
-                        ))
-                        .with_structured(json!({
+                        let summary = format_artifacts_summary(&artifacts);
+                        let msg = if summary.is_empty() {
+                            format!(
+                                "Acquired capability '{capability}' for {} via fallback capability '{fb_cap_name}'",
+                                recipe.canonical_filename()
+                            )
+                        } else {
+                            format!(
+                                "Acquired capability '{capability}' for {} via fallback capability '{fb_cap_name}'\n\n{}",
+                                recipe.canonical_filename(),
+                                summary
+                            )
+                        };
+                        return Ok(ToolResult::text(msg).with_structured(json!({
                             "status": "completed_with_fallback",
                             "app_id": recipe.app_id,
                             "app_version": recipe.app_version,
@@ -887,6 +931,18 @@ fn normalize_shortcut_str(keys: &[String]) -> String {
         .join("+")
 }
 
+fn default_step_safety_level(action: &str) -> SafetyLevel {
+    match action {
+        "type_secret_from_env" => SafetyLevel::AuthOnly,
+        _ => SafetyLevel::ReadOnly,
+    }
+}
+
+fn effective_step_safety_level(step: &RecipeStep) -> SafetyLevel {
+    step.safety_level
+        .unwrap_or_else(|| default_step_safety_level(&step.action))
+}
+
 #[allow(clippy::result_large_err)]
 pub(crate) fn check_safety_gate(
     recipe: &AppRecipe,
@@ -927,20 +983,22 @@ pub(crate) fn check_safety_gate(
                 ));
             }
         }
-        for (idx, step) in steps.iter().enumerate() {
-            if let Some(step_lvl) = step.safety_level {
-                if step_lvl > allow_level {
-                    return Err(block(
-                        format!(
-                            "safety_gate_blocked: step {idx} ({}) requires '{}' > allowed '{}'",
-                            step.action,
-                            step_lvl.as_str(),
-                            allow_level.as_str()
-                        ),
-                        step_lvl,
-                    ));
-                }
-            }
+    }
+
+    for (idx, step) in steps.iter().enumerate() {
+        let step_lvl = effective_step_safety_level(step);
+        if step_lvl > allow_level {
+            return Err(block(
+                format!(
+                    "safety_gate_blocked: step {idx} ({}) requires '{}' > allowed '{}'",
+                    step.action,
+                    step_lvl.as_str(),
+                    allow_level.as_str()
+                ),
+                step_lvl,
+            ));
+        }
+        if let Some(ref policy) = recipe.safety_policy {
             if matches!(step.action.as_str(), "hotkey" | "shortcut" | "press_key") {
                 let keys = parse_shortcut_keys(&step.args);
                 let norm = normalize_shortcut_str(&keys);
@@ -955,22 +1013,6 @@ pub(crate) fn check_safety_gate(
                             "safety_gate_blocked: shortcut '{norm}' at step {idx} is blocked by safety_policy"
                         ),
                         SafetyLevel::Restricted,
-                    ));
-                }
-            }
-        }
-    } else {
-        for (idx, step) in steps.iter().enumerate() {
-            if let Some(step_lvl) = step.safety_level {
-                if step_lvl > allow_level {
-                    return Err(block(
-                        format!(
-                            "safety_gate_blocked: step {idx} ({}) requires '{}' > allowed '{}'",
-                            step.action,
-                            step_lvl.as_str(),
-                            allow_level.as_str()
-                        ),
-                        step_lvl,
                     ));
                 }
             }
@@ -1508,6 +1550,12 @@ fn execute_recipe_step(
                 anyhow::bail!("clipboard length {len} < min_len {min_len}")
             }
         }
+        "set_clipboard" => {
+            let xctx = ctx.ok_or_else(|| anyhow::anyhow!("X11 display context unavailable"))?;
+            let text = args.get("text").and_then(Value::as_str).unwrap_or("");
+            clipboard_set_for_context(xctx, text)?;
+            Ok(json!({ "bytes": text.len() }))
+        }
         "read_clipboard" => {
             let xctx = ctx.ok_or_else(|| anyhow::anyhow!("X11 display context unavailable"))?;
             let min_len = args.get("min_len").and_then(Value::as_u64).unwrap_or(1) as usize;
@@ -1515,15 +1563,16 @@ fn execute_recipe_step(
                 .get("max_bytes")
                 .and_then(Value::as_u64)
                 .unwrap_or(65_536) as usize;
-            let clear_before = args
-                .get("clear_before")
+            let clear_after = args
+                .get("clear_after")
+                .or_else(|| args.get("clear_before"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            if clear_before {
-                let _ = clipboard_set_for_context(xctx, "");
-            }
             let text = clipboard_get_for_context(xctx)?;
             let artifact = build_clipboard_artifact(&text, min_len, max_bytes)?;
+            if clear_after {
+                let _ = clipboard_set_for_context(xctx, "");
+            }
             Ok(json!({
                 "artifact": artifact,
                 "bytes": text.len(),
@@ -1620,6 +1669,66 @@ pub(crate) fn verify_file_export_at_path(
         "bytes": bytes,
         "min_bytes": min_bytes,
     }))
+}
+
+pub(crate) fn format_artifacts_summary(artifacts: &[Value]) -> String {
+    if artifacts.is_empty() {
+        return String::new();
+    }
+    let mut parts = Vec::with_capacity(artifacts.len());
+    for (idx, art) in artifacts.iter().enumerate() {
+        let kind = art.get("kind").and_then(Value::as_str).unwrap_or("unknown");
+        match kind {
+            "file_export" => {
+                let path = art.get("path").and_then(Value::as_str).unwrap_or("");
+                let bytes = art.get("bytes").and_then(Value::as_u64).unwrap_or(0);
+                let preview = art.get("preview").and_then(Value::as_str).unwrap_or("");
+                let snippet = truncate_utf8_snippet(preview, 2000);
+                parts.push(format!(
+                    "[artifact {idx} file_export] path={path} bytes={bytes}\n{snippet}"
+                ));
+            }
+            "clipboard" => {
+                let bytes = art.get("bytes").and_then(Value::as_u64).unwrap_or(0);
+                let content = art.get("content").and_then(Value::as_str).unwrap_or("");
+                let line_count = content.lines().count();
+                let snippet = truncate_utf8_snippet(content, 2000);
+                parts.push(format!(
+                    "[artifact {idx} clipboard] bytes={bytes} line_count={line_count}\n{snippet}"
+                ));
+            }
+            "screenshot_roi" | "screenshot_full" => {
+                let width = art.get("width").and_then(Value::as_u64).unwrap_or(0);
+                let height = art.get("height").and_then(Value::as_u64).unwrap_or(0);
+                let bytes = art.get("bytes").and_then(Value::as_u64).unwrap_or(0);
+                parts.push(format!(
+                    "[artifact {idx} {kind}] {width}x{height} bytes={bytes}"
+                ));
+            }
+            "window_meta" => {
+                let title = art.get("window_title").and_then(Value::as_str).unwrap_or("");
+                let pid = art.get("pid").and_then(Value::as_u64);
+                parts.push(format!(
+                    "[artifact {idx} window_meta] pid={pid:?} title={title:?}"
+                ));
+            }
+            _ => {
+                parts.push(format!("[artifact {idx} {kind}] {art}"));
+            }
+        }
+    }
+    parts.join("\n\n")
+}
+
+fn truncate_utf8_snippet(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 #[cfg(test)]
@@ -1813,5 +1922,71 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(blocked_key.structured_content.as_ref().unwrap()["code"], "safety_gate_blocked");
+
+        // type_secret_from_env defaults to AuthOnly when step.safety_level is None:
+        // rejected under allow_safety_level=read_only, allowed under auth_only.
+        let secret_step = RecipeStep {
+            action: "type_secret_from_env".to_owned(),
+            args: json!({ "env_key": "CUA_YCWANG_TOS_LIVE_USERNAME" }),
+            wait_for_stable_frame_ms: None,
+            description: None,
+            method: None,
+            safety_level: None,
+            latency_ms_est: None,
+            fallback_method: None,
+        };
+        let blocked_secret = check_safety_gate(
+            &recipe,
+            Some("login_live_from_env"),
+            std::slice::from_ref(&secret_step),
+            SafetyLevel::ReadOnly,
+            SafetyLevel::ReadOnly,
+        )
+        .unwrap_err();
+        assert_eq!(
+            blocked_secret.structured_content.as_ref().unwrap()["code"],
+            "safety_gate_blocked"
+        );
+        assert_eq!(
+            blocked_secret.structured_content.as_ref().unwrap()["required_level"],
+            "auth_only"
+        );
+        assert!(check_safety_gate(
+            &recipe,
+            Some("login_live_from_env"),
+            &[secret_step],
+            SafetyLevel::ReadOnly,
+            SafetyLevel::AuthOnly,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn format_artifacts_summary_renders_file_clipboard_and_screenshot_details() {
+        let artifacts = vec![
+            json!({
+                "kind": "file_export",
+                "path": "/tmp/tos.csv",
+                "bytes": 42,
+                "preview": "Account,Cash\n123,456",
+            }),
+            json!({
+                "kind": "clipboard",
+                "bytes": 18,
+                "content": "Date\tProb\n2026\t50%",
+            }),
+            json!({
+                "kind": "screenshot_roi",
+                "width": 800,
+                "height": 600,
+                "bytes": 12345,
+            }),
+        ];
+        let summary = format_artifacts_summary(&artifacts);
+        assert!(summary.contains("path=/tmp/tos.csv bytes=42"));
+        assert!(summary.contains("Account,Cash"));
+        assert!(summary.contains("bytes=18 line_count=2"));
+        assert!(summary.contains("Date\tProb"));
+        assert!(summary.contains("800x600 bytes=12345"));
     }
 }

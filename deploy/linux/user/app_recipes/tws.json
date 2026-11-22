@@ -125,26 +125,31 @@
       {
         "action": "verify_window_count_min",
         "args": { "min": 1 },
+        "safety_level": "auth_only",
         "description": "Verify TWS login window is mapped on display"
       },
       {
         "action": "type_secret_from_env",
         "args": { "env_key": "CUA_YCWANG_TWS_PAPER_USERNAME", "press_enter": false },
+        "safety_level": "auth_only",
         "description": "Type TWS paper username from .env without exposing plaintext (or CUA_YCWANG_TWS_LIVE_USERNAME)"
       },
       {
         "action": "press_key",
         "args": { "key": "Tab" },
+        "safety_level": "auth_only",
         "description": "Move focus from username field to password field"
       },
       {
         "action": "type_secret_from_env",
         "args": { "env_key": "CUA_YCWANG_TWS_PAPER_PASSWORD", "press_enter": true },
+        "safety_level": "auth_only",
         "description": "Type TWS paper password from .env and submit login (login-only; no order actions)"
       },
       {
         "action": "wait_for_stable_frame",
         "args": { "ms": 1000 },
+        "safety_level": "auth_only",
         "description": "Allow post-login transition to settle"
       }
     ],
