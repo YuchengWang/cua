@@ -118,6 +118,7 @@ pub mod recovery_hint;
 pub mod script_tool;
 pub mod security_prompt;
 pub mod server;
+pub mod totp;
 pub mod session;
 pub mod session_authorization;
 pub mod session_manifest;

@@ -31,7 +31,12 @@ use zeroize::Zeroizing;
 
 use crate::app_inspector::{inspect_app_flow, InspectAppFlowRequest};
 use crate::x11::context::{global_screen_pool, DisplayTarget, X11ScreenContext};
-use crate::tools::mcp_type_secret::{resolve_secret_from_env, type_secret_into_context, validate_env_key};
+use cua_driver_core::totp::{TotpConfig, DEFAULT_MIN_REMAINING_SECS};
+
+use crate::tools::mcp_type_secret::{
+    resolve_secret_from_env, resolve_totp_outcome_from_env, type_secret_into_context,
+    validate_env_key,
+};
 use crate::x11::virtual_input::{
     clipboard_get_for_context, clipboard_set_for_context, xtest_click, xtest_focus_window,
     xtest_hotkey, xtest_press_key, xtest_type_text,
@@ -502,14 +507,24 @@ impl Tool for RunAppRecipeTool {
 
                     // Out-of-band auth_gate handling (never logs or returns plaintext).
                     if let Some(ref gate) = state.auth_gate {
-                        let secret = resolve_auth_gate_secret(gate)?;
-                        if let Some(ref xctx) = ctx {
-                            xtest_type_text(xctx, &secret)?;
+                        if allow_safety_level < SafetyLevel::AuthOnly {
+                            return Ok(ToolResult::error(
+                                "safety_gate_blocked: auth_gate requires 'auth_only' or higher",
+                            )
+                            .with_structured(json!({
+                                "status": "safety_gate_blocked",
+                                "code": "safety_gate_blocked",
+                                "app_id": recipe.app_id,
+                                "state": state.id,
+                                "required_level": SafetyLevel::AuthOnly.as_str(),
+                                "allowed_level": allow_safety_level.as_str(),
+                            })));
                         }
-                        drop(secret);
+                        let details = execute_auth_gate(ctx.as_deref(), target_window_id, gate)?;
                         executed_steps.push(json!({
                             "state": state.id,
                             "status": "auth_step_completed",
+                            "details": details,
                         }));
                     }
                 }
@@ -864,7 +879,7 @@ fn normalize_shortcut_str(keys: &[String]) -> String {
 
 fn default_step_safety_level(action: &str) -> SafetyLevel {
     match action {
-        "type_secret_from_env" => SafetyLevel::AuthOnly,
+        "type_secret_from_env" | "type_totp_from_env" => SafetyLevel::AuthOnly,
         _ => SafetyLevel::ReadOnly,
     }
 }
@@ -1163,6 +1178,69 @@ fn capture_screenshot_roi_artifact(
         "roi_norm": roi_norm,
         "bytes": out_png.len(),
         "data_base64": b64,
+    }))
+}
+
+fn execute_auth_gate(
+    ctx: Option<&X11ScreenContext>,
+    target_window_id: Option<u64>,
+    gate: &AuthGate,
+) -> anyhow::Result<Value> {
+    let press_enter = gate.press_enter.unwrap_or(false);
+    if gate.kind.eq_ignore_ascii_case("totp") || gate.kind.eq_ignore_ascii_case("totp_env") {
+        let min_remaining_secs = gate
+            .min_remaining_secs
+            .unwrap_or(DEFAULT_MIN_REMAINING_SECS);
+        let outcome = if let Some(ref env_key) = gate.env_key {
+            validate_env_key(env_key)?;
+            resolve_totp_outcome_from_env(env_key, gate.env_file.as_deref(), min_remaining_secs)?
+        } else {
+            let raw = resolve_auth_gate_secret(gate)?;
+            let cfg = TotpConfig::from_secret_or_uri(&raw)?;
+            drop(raw);
+            cfg.generate_now_with_guard(min_remaining_secs)?
+        };
+        if let Some(xctx) = ctx {
+            if let Some(wid) = target_window_id {
+                let _ = xtest_focus_window(xctx, wid);
+            }
+            let key_label = gate.env_key.as_deref().unwrap_or("auth_gate_totp");
+            type_secret_into_context(xctx, key_label, &outcome.code, press_enter)?;
+        }
+        let meta = json!({
+            "kind": gate.kind,
+            "digits": outcome.digits,
+            "period": outcome.period,
+            "waited_boundary": outcome.waited_boundary,
+            "waited_ms": outcome.waited_ms,
+            "remaining_secs": outcome.remaining_secs,
+            "press_enter": press_enter,
+        });
+        drop(outcome);
+        return Ok(meta);
+    }
+
+    let secret = if let Some(ref env_key) = gate.env_key {
+        validate_env_key(env_key)?;
+        resolve_secret_from_env(env_key, gate.env_file.as_deref())?
+    } else {
+        resolve_auth_gate_secret(gate)?
+    };
+    let char_len = secret.chars().count();
+    if let Some(xctx) = ctx {
+        if let Some(wid) = target_window_id {
+            let _ = xtest_focus_window(xctx, wid);
+        }
+        xtest_type_text(xctx, &secret)?;
+        if press_enter {
+            xtest_press_key(xctx, "Return")?;
+        }
+    }
+    drop(secret);
+    Ok(json!({
+        "kind": gate.kind,
+        "length": char_len,
+        "press_enter": press_enter,
     }))
 }
 
@@ -1487,6 +1565,40 @@ fn execute_recipe_step(
                 "length": char_len,
                 "press_enter": press_enter,
             }))
+        }
+        "type_totp_from_env" => {
+            let env_key = args
+                .get("env_key")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("type_totp_from_env requires 'env_key'"))?;
+            validate_env_key(env_key)?;
+            let env_file = args.get("env_file").and_then(Value::as_str);
+            let press_enter = args
+                .get("press_enter")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let min_remaining_secs = args
+                .get("min_remaining_secs")
+                .and_then(Value::as_u64)
+                .unwrap_or(DEFAULT_MIN_REMAINING_SECS);
+            let xctx = ctx.ok_or_else(|| anyhow::anyhow!("X11 display context unavailable"))?;
+            let outcome = resolve_totp_outcome_from_env(env_key, env_file, min_remaining_secs)?;
+            if let Some(wid) = target_window_id {
+                let _ = xtest_focus_window(xctx, wid);
+            }
+            let char_len = type_secret_into_context(xctx, env_key, &outcome.code, press_enter)?;
+            let meta = json!({
+                "env_key": env_key,
+                "length": char_len,
+                "digits": outcome.digits,
+                "period": outcome.period,
+                "waited_boundary": outcome.waited_boundary,
+                "waited_ms": outcome.waited_ms,
+                "remaining_secs": outcome.remaining_secs,
+                "press_enter": press_enter,
+            });
+            drop(outcome);
+            Ok(meta)
         }
         "verify_window_title_regex" => {
             let xctx = ctx.ok_or_else(|| anyhow::anyhow!("X11 display context unavailable"))?;
@@ -1825,6 +1937,52 @@ mod tests {
         )
         .unwrap_err();
         assert!(prefix_err.to_string().contains("CUA_YCWANG_"));
+
+        let totp_missing_err = execute_recipe_step(
+            None,
+            &dummy_recipe,
+            None,
+            None,
+            "type_totp_from_env",
+            &json!({}),
+        )
+        .unwrap_err();
+        assert!(totp_missing_err.to_string().contains("env_key"));
+
+        let totp_prefix_err = execute_recipe_step(
+            None,
+            &dummy_recipe,
+            None,
+            None,
+            "type_totp_from_env",
+            &json!({ "env_key": "HOME" }),
+        )
+        .unwrap_err();
+        assert!(totp_prefix_err.to_string().contains("CUA_YCWANG_"));
+    }
+
+    #[test]
+    fn auth_gate_totp_deserializes_and_executes_without_x11_leaking_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let env_path = dir.path().join(".env.totp");
+        let seed = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+        std::fs::write(&env_path, format!("CUA_YCWANG_TEST_TOTP_SEED={seed}\n")).unwrap();
+
+        let gate_json = json!({
+            "kind": "totp",
+            "prompt_title": "IBKR 2FA",
+            "env_key": "CUA_YCWANG_TEST_TOTP_SEED",
+            "env_file": env_path.display().to_string(),
+            "press_enter": true,
+            "min_remaining_secs": 0
+        });
+        let gate: AuthGate = serde_json::from_value(gate_json).unwrap();
+        let meta = execute_auth_gate(None, None, &gate).unwrap();
+        assert_eq!(meta["kind"], "totp");
+        assert_eq!(meta["digits"], 6);
+        assert_eq!(meta["period"], 30);
+        assert_eq!(meta["press_enter"], true);
+        assert!(!meta.to_string().contains(seed));
     }
 
     #[test]

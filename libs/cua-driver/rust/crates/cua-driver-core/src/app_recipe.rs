@@ -77,6 +77,14 @@ pub struct AuthGate {
     pub keyring_service: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keyring_account: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub press_enter: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_remaining_secs: Option<u64>,
     #[serde(default = "default_true")]
     pub zeroize_after_use: bool,
 }

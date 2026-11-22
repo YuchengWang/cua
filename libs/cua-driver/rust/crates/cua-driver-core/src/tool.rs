@@ -997,6 +997,7 @@ pub fn default_capabilities_for(tool_name: &str) -> Vec<String> {
         // still accepts `element_token`, hence the tokens claim.
         "type_text_chars" => &["input.keyboard.type", "accessibility.element_tokens"],
         "type_secret_from_env" => &["input.keyboard.type"],
+        "type_totp_from_env" => &["input.keyboard.type"],
         "set_value" => &[
             // Bulk-set an editable field's value — semantically a
             // typing surface, even though the implementation skips
