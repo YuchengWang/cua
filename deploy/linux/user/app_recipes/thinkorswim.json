@@ -145,6 +145,27 @@
       "title_pattern": ".*thinkorswim.*",
       "rel_x": 0.15,
       "rel_y": 0.115
+    },
+    {
+      "name": "account_statement_subtab",
+      "role": "tab",
+      "title_pattern": ".*thinkorswim.*",
+      "rel_x": 0.275,
+      "rel_y": 0.047
+    },
+    {
+      "name": "monitor_panel_menu_button",
+      "role": "push_button",
+      "title_pattern": ".*thinkorswim.*",
+      "rel_x": 0.9927,
+      "rel_y": 0.0481
+    },
+    {
+      "name": "monitor_export_to_file_menuitem",
+      "role": "menu_item",
+      "title_pattern": ".*thinkorswim.*",
+      "rel_x": 0.9531,
+      "rel_y": 0.2315
     }
   ],
   "modal_handlers": [
@@ -378,6 +399,70 @@
         "action": "wait_for_stable_frame",
         "args": { "ms": 1000 },
         "description": "Allow post-login transition to settle"
+      }
+    ],
+    "export_account_statement_csv": [
+      {
+        "action": "click_anchor",
+        "args": { "anchor": "monitor_tab" },
+        "description": "Switch to Monitor tab (read-only)"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 300 }
+      },
+      {
+        "action": "click_anchor",
+        "args": { "anchor": "account_statement_subtab" },
+        "description": "Select Account Statement subtab (read-only)"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 300 }
+      },
+      {
+        "action": "click_anchor",
+        "args": { "anchor": "monitor_panel_menu_button" },
+        "description": "Open Account Statement panel menu"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 300 }
+      },
+      {
+        "action": "click_anchor",
+        "args": { "anchor": "monitor_export_to_file_menuitem" },
+        "description": "Click Export to file... menu item"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 600 },
+        "description": "Allow JFileChooser Save dialog to open and focus File Name"
+      },
+      {
+        "action": "hotkey",
+        "args": { "keys": ["ctrl", "a"] },
+        "description": "Select default filename in Save dialog"
+      },
+      {
+        "action": "press_key",
+        "args": { "key": "BackSpace" },
+        "description": "Clear default filename"
+      },
+      {
+        "action": "type_text",
+        "args": { "text": "/home/ycwang/.cua-ycwang/exports/tos_account_statement.csv" },
+        "description": "Type deterministic export CSV path"
+      },
+      {
+        "action": "press_key",
+        "args": { "key": "Return" },
+        "description": "Confirm Save dialog to write CSV"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 600 },
+        "description": "Allow CSV export to flush to disk"
       }
     ]
   },
