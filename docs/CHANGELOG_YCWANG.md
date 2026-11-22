@@ -7,6 +7,15 @@
 
 ## [Unreleased] — `feat/x11-virtual-desktop`
 
+### Out-of-Band `.env` Secret Typing (`type_secret_from_env`) for Thinkorswim & TWS (`2026-11-22`, Landed)
+- **Added / 新增**：
+  - `platform-linux/src/tools/mcp_type_secret.rs`: Added `type_secret_from_env` MCP tool (registered in `tools/mod.rs`, `tools/impl_.rs`, `cua-driver-core/src/authorization.rs` as `R2`, and `cua-driver-core/src/tool.rs` with `input.keyboard.type`), enforcing strict `CUA_YCWANG_` key-prefix validation (`validate_env_key()`), `.env` resolution (`env_file` > `CUA_YCWANG_ENV_FILE` > `./.env` > `~/.config/cua-ycwang/.env` > process env fallback), clean `.env` parsing (`export `, comments, first-`=` split, matching quotes), `zeroize::Zeroizing` memory handling, Swing-safe `xtest_type_text()` + optional `Return` synthesis, and zero-leak output (`Typed env secret (key=..., len=...) on <display_id>`).
+  - `platform-linux/src/tools/mcp_app_recipe.rs`: Added `"action": "type_secret_from_env"` support in `execute_recipe_step()` for `run_app_recipe` `flows`.
+  - `deploy/linux/user/app_recipes/{thinkorswim.json,tws.json}`: Added `login_from_env` / `login_live_from_env` / `login_paper_from_env` flow stubs (login-only; zero order-placement actions), `Logon to thinkorswim` bottom-bar toggle/input/continue anchors, `1920x1080` `Main@thinkorswim` tab/subtab anchors, and `tws.json` `.*(Interactive Brokers|Trader Workstation|Simulated Trading).*` title matching.
+- **Verified / 已核验**：
+  - `cargo clippy -p cua-driver-core -p platform-linux -p cua-driver --all-targets -- -D warnings` passed.
+  - `cargo test -p cua-driver-core --lib` (`1395 passed; 0 failed`) and `cargo test -p platform-linux --lib` (`1149 passed; 0 failed; 16 ignored`) passed.
+
 ### Thinkorswim & TWS Local-JSON Fast Execution, Non-Screenshot Verification & Launch Isolation (`2026-11-22`, Landed)
 - **Changed / 变更**：
   - `platform-linux/src/x11/virtual_screen.rs`: Added `build_x11vnc_args()` including `-xkb` by default when `vnc_interactive=true` (so Remmina keyboard typing works on `Xvfb` out-of-the-box) and `-viewonly` otherwise; added `should_unset_dbus_for_launch()` in `launch_app()` to unset `DBUS_SESSION_BUS_ADDRESS` for `thinkorswim` / `jxbrowser` (or `CUA_UNSET_DBUS=1`) so direct launches avoid the 25s OSCrypt Libsecret hang + `SIGTRAP` 133.

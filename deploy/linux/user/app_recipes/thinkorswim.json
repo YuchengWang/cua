@@ -35,53 +35,102 @@
   ],
   "relative_anchors": [
     {
+      "name": "login_toggle_live",
+      "role": "push_button",
+      "title_pattern": ".*Logon to thinkorswim.*",
+      "rel_x": 0.342,
+      "rel_y": 0.962
+    },
+    {
+      "name": "login_toggle_paper",
+      "role": "push_button",
+      "title_pattern": ".*Logon to thinkorswim.*",
+      "rel_x": 0.655,
+      "rel_y": 0.962
+    },
+    {
+      "name": "login_id_input",
+      "role": "text",
+      "title_pattern": ".*Logon to thinkorswim.*",
+      "rel_x": 0.50,
+      "rel_y": 0.273
+    },
+    {
+      "name": "login_continue_button",
+      "role": "push_button",
+      "title_pattern": ".*Logon to thinkorswim.*",
+      "rel_x": 0.50,
+      "rel_y": 0.459
+    },
+    {
       "name": "monitor_tab",
       "role": "tab",
       "title_pattern": ".*thinkorswim.*",
-      "rel_x": 0.13,
-      "rel_y": 0.045
+      "rel_x": 0.172,
+      "rel_y": 0.029
     },
     {
       "name": "trade_tab",
       "role": "tab",
       "title_pattern": ".*thinkorswim.*",
-      "rel_x": 0.19,
-      "rel_y": 0.045
+      "rel_x": 0.201,
+      "rel_y": 0.029
     },
     {
       "name": "analyze_tab",
       "role": "tab",
       "title_pattern": ".*thinkorswim.*",
-      "rel_x": 0.25,
-      "rel_y": 0.045
+      "rel_x": 0.232,
+      "rel_y": 0.029
     },
     {
       "name": "scan_tab",
       "role": "tab",
       "title_pattern": ".*thinkorswim.*",
-      "rel_x": 0.30,
-      "rel_y": 0.045
+      "rel_x": 0.260,
+      "rel_y": 0.029
     },
     {
       "name": "marketwatch_tab",
       "role": "tab",
       "title_pattern": ".*thinkorswim.*",
-      "rel_x": 0.36,
-      "rel_y": 0.045
+      "rel_x": 0.294,
+      "rel_y": 0.029
     },
     {
       "name": "charts_tab",
       "role": "tab",
       "title_pattern": ".*thinkorswim.*",
-      "rel_x": 0.43,
-      "rel_y": 0.045
+      "rel_x": 0.330,
+      "rel_y": 0.029
+    },
+    {
+      "name": "add_simulated_trades_subtab",
+      "role": "tab",
+      "title_pattern": ".*thinkorswim.*",
+      "rel_x": 0.195,
+      "rel_y": 0.047
+    },
+    {
+      "name": "risk_profile_subtab",
+      "role": "tab",
+      "title_pattern": ".*thinkorswim.*",
+      "rel_x": 0.258,
+      "rel_y": 0.047
     },
     {
       "name": "probability_subtab",
       "role": "tab",
       "title_pattern": ".*thinkorswim.*",
-      "rel_x": 0.34,
-      "rel_y": 0.075
+      "rel_x": 0.318,
+      "rel_y": 0.047
+    },
+    {
+      "name": "thinkback_subtab",
+      "role": "tab",
+      "title_pattern": ".*thinkorswim.*",
+      "rel_x": 0.432,
+      "rel_y": 0.047
     },
     {
       "name": "option_chain_subtab",
@@ -190,6 +239,125 @@
       {
         "action": "verify_window_title_regex",
         "args": { "pattern": "Main@thinkorswim \\[build \\d+\\]" }
+      }
+    ],
+    "login_from_env": [
+      {
+        "action": "verify_window_count_min",
+        "args": { "min": 1, "title_regex": ".*thinkorswim.*" },
+        "description": "Verify thinkorswim login window is mapped on display"
+      },
+      {
+        "action": "type_secret_from_env",
+        "args": { "env_key": "CUA_YCWANG_TOS_LIVE_USERNAME", "press_enter": false },
+        "description": "Type thinkorswim username from .env without exposing plaintext"
+      },
+      {
+        "action": "press_key",
+        "args": { "key": "Tab" },
+        "description": "Move focus from username field to password field"
+      },
+      {
+        "action": "type_secret_from_env",
+        "args": { "env_key": "CUA_YCWANG_TOS_LIVE_PASSWORD", "press_enter": true },
+        "description": "Type thinkorswim password from .env and submit login (login-only; no order actions)"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 1000 },
+        "description": "Allow post-login transition to settle"
+      }
+    ],
+    "login_live_from_env": [
+      {
+        "action": "verify_window_count_min",
+        "args": { "min": 1, "title_regex": ".*Logon to thinkorswim.*" },
+        "description": "Verify Logon to thinkorswim window is mapped on display"
+      },
+      {
+        "action": "click_anchor",
+        "args": { "anchor": "login_toggle_live" },
+        "description": "Select Live Trading mode on Logon to thinkorswim bottom bar"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 200 }
+      },
+      {
+        "action": "click_anchor",
+        "args": { "anchor": "login_id_input" },
+        "description": "Focus User ID field"
+      },
+      {
+        "action": "type_secret_from_env",
+        "args": { "env_key": "CUA_YCWANG_TOS_LIVE_USERNAME", "press_enter": false },
+        "description": "Type thinkorswim Live username from .env without exposing plaintext"
+      },
+      {
+        "action": "click_anchor",
+        "args": { "anchor": "login_continue_button" },
+        "description": "Click Continue to advance to password step"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 800 },
+        "description": "Allow password prompt to render"
+      },
+      {
+        "action": "type_secret_from_env",
+        "args": { "env_key": "CUA_YCWANG_TOS_LIVE_PASSWORD", "press_enter": true },
+        "description": "Type thinkorswim Live password from .env and submit login (login-only; no order actions)"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 1000 },
+        "description": "Allow post-login transition to settle"
+      }
+    ],
+    "login_paper_from_env": [
+      {
+        "action": "verify_window_count_min",
+        "args": { "min": 1, "title_regex": ".*Logon to thinkorswim.*" },
+        "description": "Verify Logon to thinkorswim window is mapped on display"
+      },
+      {
+        "action": "click_anchor",
+        "args": { "anchor": "login_toggle_paper" },
+        "description": "Select paperMoney mode on Logon to thinkorswim bottom bar"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 200 }
+      },
+      {
+        "action": "click_anchor",
+        "args": { "anchor": "login_id_input" },
+        "description": "Focus User ID field"
+      },
+      {
+        "action": "type_secret_from_env",
+        "args": { "env_key": "CUA_YCWANG_TOS_PAPER_USERNAME", "press_enter": false },
+        "description": "Type thinkorswim paperMoney username from .env without exposing plaintext"
+      },
+      {
+        "action": "click_anchor",
+        "args": { "anchor": "login_continue_button" },
+        "description": "Click Continue to advance to password step"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 800 },
+        "description": "Allow password prompt to render"
+      },
+      {
+        "action": "type_secret_from_env",
+        "args": { "env_key": "CUA_YCWANG_TOS_PAPER_PASSWORD", "press_enter": true },
+        "description": "Type thinkorswim paperMoney password from .env and submit login (login-only; no order actions)"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 1000 },
+        "description": "Allow post-login transition to settle"
       }
     ]
   },

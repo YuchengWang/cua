@@ -28,6 +28,7 @@ use zeroize::Zeroizing;
 
 use crate::app_inspector::{inspect_app_flow, InspectAppFlowRequest};
 use crate::x11::context::{global_screen_pool, DisplayTarget, X11ScreenContext};
+use crate::tools::mcp_type_secret::{resolve_secret_from_env, type_secret_into_context, validate_env_key};
 use crate::x11::virtual_input::{
     clipboard_get_for_context, xtest_click, xtest_focus_window, xtest_hotkey, xtest_press_key,
     xtest_type_text,
@@ -793,6 +794,30 @@ fn execute_recipe_step(
             xtest_type_text(xctx, text)?;
             Ok(json!({ "chars": text.chars().count() }))
         }
+        "type_secret_from_env" => {
+            let env_key = args
+                .get("env_key")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("type_secret_from_env requires 'env_key'"))?;
+            validate_env_key(env_key)?;
+            let env_file = args.get("env_file").and_then(Value::as_str);
+            let press_enter = args
+                .get("press_enter")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let xctx = ctx.ok_or_else(|| anyhow::anyhow!("X11 display context unavailable"))?;
+            let secret = resolve_secret_from_env(env_key, env_file)?;
+            if let Some(wid) = target_window_id {
+                let _ = xtest_focus_window(xctx, wid);
+            }
+            let char_len = type_secret_into_context(xctx, env_key, &secret, press_enter)?;
+            drop(secret);
+            Ok(json!({
+                "env_key": env_key,
+                "length": char_len,
+                "press_enter": press_enter,
+            }))
+        }
         "verify_window_title_regex" => {
             let xctx = ctx.ok_or_else(|| anyhow::anyhow!("X11 display context unavailable"))?;
             let pattern = args
@@ -904,5 +929,52 @@ mod tests {
 
         assert!(verify_log_pattern_in_file(&log_path, r"Main@thinkorswim\s+ready", 4096).unwrap());
         assert!(!verify_log_pattern_in_file(&log_path, r"FATAL_CRASH", 4096).unwrap());
+    }
+
+    #[test]
+    fn type_secret_from_env_recipe_step_validates_prefix_and_required_key() {
+        let dummy_recipe = AppRecipe {
+            schema_version: 1,
+            app_id: "thinkorswim".to_owned(),
+            app_version: "seeded".to_owned(),
+            version_source: cua_driver_core::app_recipe::VersionSource::Install4j,
+            fingerprint_sha256: "seeded".to_owned(),
+            tech_stack: None,
+            atspi_blind: false,
+            recommended_interaction: None,
+            launch_isolation_hints: Vec::new(),
+            verified_shortcuts: Vec::new(),
+            menu_topology: Vec::new(),
+            relative_anchors: Vec::new(),
+            modal_handlers: Vec::new(),
+            flows: HashMap::new(),
+            state_machine: StateMachine {
+                initial_state: "ready".to_owned(),
+                states: Vec::new(),
+                transitions: Vec::new(),
+            },
+        };
+
+        let missing_err = execute_recipe_step(
+            None,
+            &dummy_recipe,
+            None,
+            None,
+            "type_secret_from_env",
+            &json!({}),
+        )
+        .unwrap_err();
+        assert!(missing_err.to_string().contains("env_key"));
+
+        let prefix_err = execute_recipe_step(
+            None,
+            &dummy_recipe,
+            None,
+            None,
+            "type_secret_from_env",
+            &json!({ "env_key": "HOME" }),
+        )
+        .unwrap_err();
+        assert!(prefix_err.to_string().contains("CUA_YCWANG_"));
     }
 }

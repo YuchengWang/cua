@@ -48,21 +48,21 @@
     {
       "name": "new_window_button",
       "role": "push_button",
-      "title_pattern": ".*Trader Workstation.*",
+      "title_pattern": ".*(Interactive Brokers|Trader Workstation|Simulated Trading).*",
       "rel_x": 0.04,
       "rel_y": 0.06
     },
     {
       "name": "watchlist_panel",
       "role": "panel",
-      "title_pattern": ".*Trader Workstation.*",
+      "title_pattern": ".*(Interactive Brokers|Trader Workstation|Simulated Trading).*",
       "rel_x": 0.15,
       "rel_y": 0.35
     },
     {
       "name": "trades_panel",
       "role": "panel",
-      "title_pattern": ".*Trader Workstation.*",
+      "title_pattern": ".*(Interactive Brokers|Trader Workstation|Simulated Trading).*",
       "rel_x": 0.18,
       "rel_y": 0.12
     }
@@ -120,6 +120,33 @@
         "args": { "pattern": ".*Trader Workstation.*" },
         "description": "Verify TWS main window title without screenshot"
       }
+    ],
+    "login_from_env": [
+      {
+        "action": "verify_window_count_min",
+        "args": { "min": 1 },
+        "description": "Verify TWS login window is mapped on display"
+      },
+      {
+        "action": "type_secret_from_env",
+        "args": { "env_key": "CUA_YCWANG_TWS_PAPER_USERNAME", "press_enter": false },
+        "description": "Type TWS paper username from .env without exposing plaintext (or CUA_YCWANG_TWS_LIVE_USERNAME)"
+      },
+      {
+        "action": "press_key",
+        "args": { "key": "Tab" },
+        "description": "Move focus from username field to password field"
+      },
+      {
+        "action": "type_secret_from_env",
+        "args": { "env_key": "CUA_YCWANG_TWS_PAPER_PASSWORD", "press_enter": true },
+        "description": "Type TWS paper password from .env and submit login (login-only; no order actions)"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 1000 },
+        "description": "Allow post-login transition to settle"
+      }
     ]
   },
   "state_machine": {
@@ -128,7 +155,7 @@
       {
         "id": "ready",
         "description": "Initial state for IBKR Trader Workstation",
-        "title_regex": ".*Trader Workstation.*",
+        "title_regex": ".*(Interactive Brokers|Trader Workstation|Simulated Trading).*",
         "expected_roles": ["window"],
         "captcha_patterns": ["Verify you are human", "CAPTCHA", "Turnstile"]
       },
