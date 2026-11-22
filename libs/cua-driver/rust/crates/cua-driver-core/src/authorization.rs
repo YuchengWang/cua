@@ -957,6 +957,7 @@ pub fn advertised_risk_for(tool: &str) -> RiskAssessment {
         | "clipboard_read"
         | "get_clipboard"
         | "sync_clipboard"
+        | "inspect_app_flow"
         | "list_apps"
         | "list_windows"
         | "debug_window_info"
@@ -999,7 +1000,9 @@ pub fn advertised_risk_for(tool: &str) -> RiskAssessment {
         | "browser_download"
         | "create_virtual_screen"
         | "destroy_virtual_screen"
-        | "launch_in_virtual_screen" => RiskClass::R3,
+        | "launch_in_virtual_screen"
+        | "generate_app_recipe"
+        | "run_app_recipe" => RiskClass::R3,
 
         _ => RiskClass::Unclassified,
     };
@@ -1093,7 +1096,8 @@ pub fn classify_tool_call(tool: &str, args: &Value) -> RiskAssessment {
         | "zoom"
         | "clipboard_read"
         | "get_clipboard"
-        | "sync_clipboard" => RiskAssessment {
+        | "sync_clipboard"
+        | "inspect_app_flow" => RiskAssessment {
             class: RiskClass::R2,
             enforcement: RiskEnforcement::Active,
             operation_sensitive: true,
@@ -1117,7 +1121,11 @@ pub fn classify_tool_call(tool: &str, args: &Value) -> RiskAssessment {
             enforcement: RiskEnforcement::MetadataOnly,
             operation_sensitive: false,
         },
-        "create_virtual_screen" | "destroy_virtual_screen" | "launch_in_virtual_screen" => {
+        "create_virtual_screen"
+        | "destroy_virtual_screen"
+        | "launch_in_virtual_screen"
+        | "generate_app_recipe"
+        | "run_app_recipe" => {
             RiskAssessment {
                 class: RiskClass::R3,
                 enforcement: RiskEnforcement::Active,

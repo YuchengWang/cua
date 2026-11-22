@@ -29,6 +29,8 @@ pub mod overlay_capture;
 pub mod tools;
 
 #[cfg(target_os = "linux")]
+pub mod app_inspector;
+#[cfg(target_os = "linux")]
 pub mod x11;
 
 #[cfg(any(target_os = "linux", test))]

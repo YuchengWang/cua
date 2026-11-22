@@ -3537,6 +3537,8 @@ dependencies = [
  "x11rb",
  "xkbcommon",
  "zbus",
+ "zeroize",
+ "zip",
 ]
 
 [[package]]

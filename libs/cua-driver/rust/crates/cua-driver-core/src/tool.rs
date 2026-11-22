@@ -1035,6 +1035,9 @@ pub fn default_capabilities_for(tool_name: &str) -> Vec<String> {
         // ── apps / windows ───────────────────────────────────────────
         "launch_app" => &["app.launch"],
         "list_apps" => &["app.list"],
+        "inspect_app_flow" => &["app.inspect"],
+        "generate_app_recipe" => &["app.recipe.write"],
+        "run_app_recipe" => &["app.recipe.run"],
         "kill_app" => &["app.kill"],
         "agent_display"
         | "create_virtual_screen"

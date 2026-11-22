@@ -41,6 +41,7 @@ use super::{
     launch_app::LaunchAppTool,
     list_apps::ListAppsTool,
     list_windows::ListWindowsTool,
+    mcp_app_recipe::{GenerateAppRecipeTool, InspectAppFlowTool, RunAppRecipeTool},
     mcp_clipboard::{GetClipboardTool, SetClipboardTool, SyncClipboardTool},
     mcp_virtual_screen::{
         CreateVirtualScreenTool, DestroyVirtualScreenTool, LaunchInVirtualScreenTool,
@@ -5289,6 +5290,9 @@ pub fn build_registry_with_provider(
     r.register(Box::new(GetClipboardTool));
     r.register(Box::new(SetClipboardTool));
     r.register(Box::new(SyncClipboardTool));
+    r.register(Box::new(InspectAppFlowTool));
+    r.register(Box::new(GenerateAppRecipeTool));
+    r.register(Box::new(RunAppRecipeTool));
     r.register(Box::new(ListAppsTool));
     r.register(Box::new(ListWindowsTool));
     r.register(Box::new(GetWindowStateTool {

@@ -7,6 +7,21 @@
 
 ## [Unreleased] — `feat/x11-virtual-desktop`
 
+### R1–R3: Versioned `AppRecipe`, Layered `inspect_app_flow` & Deterministic FSM Replay (`2026-11-22`, Landed)
+- **Added / 新增**：
+  - `libs/cua-driver/rust/crates/cua-driver-core/src/app_recipe.rs` (exported via `lib.rs`): `AppRecipe`, `VersionGate::verify()`, `RecipeState`, `RecipeTransition`, `AuthGate`, `ModalHandler`, `VerifyResult`, `AppRecipeCache` (`RwLock<HashMap<...>>`), and `sanitize_component()` enforcing `<app_id>_v<version>_<fp8>.json` immutability under `$CUA_YCWANG_CONFIG_DIR/app_recipes/`.
+  - `libs/cua-driver/rust/crates/platform-linux/src/app_inspector.rs` (exported via `lib.rs`): `inspect_app_flow()` supporting Chrome `browser_exempt`, Java `install4j` (`response.varfile` + highest-version JAR `META-INF/MANIFEST.MF`), `.NET / Avalonia` (`*.deps.json`), Electron / VS Code (`resources/app/package.json` + `keybindings.json`), `dpkg-query` / ELF fallback, and Tier 1 X11 `WM_CLASS` + AT-SPI2 `walk_tree()`.
+  - `libs/cua-driver/rust/crates/platform-linux/src/tools/mcp_app_recipe.rs`: Registered `inspect_app_flow` (`R2` / `app.inspect`), `generate_app_recipe` (`R3` / `app.recipe.write`), and `run_app_recipe` (`R3` / `app.recipe.run`) in `authorization.rs`, `tool.rs`, `tools/mod.rs`, and `tools/impl_.rs`; enforced out-of-band `secret-tool` / `zenity --password` with `zeroize::Zeroizing` (`auth_step_completed`) and immediate CAPTCHA pause (`human_verification_required`).
+- **Verified / 全量验收**：
+  - `cargo clippy -p cua-driver-core -p platform-linux -p cua-driver --all-targets -- -D warnings` passed.
+  - Unit & contract tests passed: `app_recipe` (3/3), `app_inspector` (4/4), `schema_consistency_test` (4/4).
+  - Live stdio MCP (`cua-ycwang mcp`, 75 tools) verified across IBKR TWS (`10.52.1d`, `ff4b4710`), v2rayN (`7.25.1`, `ab9e208e`), VS Code (`1.146.0`), Google Chrome (`browser_exempt`), `VersionGate` `version_mismatch` block, hot-cache replay, and virtual-screen `human_verification_required` CAPTCHA pause.
+  - Security audit (`cua-security-auditor`) passed across `app_recipe.rs`, `app_inspector.rs`, `mcp_app_recipe.rs`, `authorization.rs`, and `tool.rs`.
+
+---
+
+## [ycwang-x11-v0.57.0-m5] — `3e27a062ab` (`2026-11-22`)
+
 ### Docs: Fork Notice, License Compliance & Security Disclaimer in `README.md` (`2026-11-22`, Landed)
 - **Added / 新增**：
   - `README.md`: Added top-level GFM `[!IMPORTANT]` Fork Notice (`YuchengWang/cua` — `cua-ycwang` X11 Edition) acknowledging upstream `trycua/cua` and its MIT / component licenses, summarizing X11 virtual desktop customizations with bilingual doc links (`LINUX_X11_VIRTUAL_SCREEN_PLAN*.md`, `LINUX_X11_PERMISSIONS*.md`, `CHANGELOG_YCWANG.md`), and stating security/input risk disclosures, no-plaintext-credentials rule, personal-use-only scope, and AS-IS / user-assumption-of-risk disclaimer.
