@@ -12,6 +12,7 @@ use std::path::Path;
 
 pub const RELEASE_CLI_NAME: &str = "cua-driver";
 pub const LOCAL_CLI_NAME: &str = "cua-driver-local";
+pub const YCWANG_CLI_NAME: &str = "cua-ycwang";
 
 #[cfg(target_os = "macos")]
 pub const RELEASE_APP_NAME: &str = "CuaDriver";
@@ -34,6 +35,26 @@ pub(crate) fn path_is_local(path: &Path) -> bool {
             .any(|component| component.as_os_str().to_str() == Some("CuaDriverLocal.app"))
 }
 
+pub(crate) fn path_is_ycwang(path: &Path) -> bool {
+    cua_driver_core::ycwang_env::is_ycwang_exe_path(path)
+}
+
+/// Whether this process is the isolated `cua-ycwang` product (via executable
+/// name `cua-ycwang` or `CUA_DRIVER_STATE_NAMESPACE=cua-ycwang`).
+pub fn is_ycwang_installation() -> bool {
+    if cua_driver_core::ycwang_env::resolve_state_namespace_from_env().as_deref()
+        == Some(cua_driver_core::ycwang_env::YCWANG_NAMESPACE)
+    {
+        return true;
+    }
+    std::env::current_exe().ok().is_some_and(|path| {
+        path_is_ycwang(&path)
+            || std::fs::canonicalize(&path)
+                .ok()
+                .is_some_and(|canon| path_is_ycwang(&canon))
+    })
+}
+
 /// Whether this process is the explicitly-installed source-build product.
 pub fn is_local_installation() -> bool {
     std::env::current_exe()
@@ -43,7 +64,9 @@ pub fn is_local_installation() -> bool {
 }
 
 pub fn cli_name() -> &'static str {
-    if is_local_installation() {
+    if is_ycwang_installation() {
+        YCWANG_CLI_NAME
+    } else if is_local_installation() {
         LOCAL_CLI_NAME
     } else {
         RELEASE_CLI_NAME
@@ -51,7 +74,9 @@ pub fn cli_name() -> &'static str {
 }
 
 pub fn state_namespace() -> &'static str {
-    if is_local_installation() {
+    if is_ycwang_installation() {
+        cua_driver_core::ycwang_env::YCWANG_NAMESPACE
+    } else if is_local_installation() {
         "cua-driver-local"
     } else {
         "cua-driver"
@@ -59,7 +84,9 @@ pub fn state_namespace() -> &'static str {
 }
 
 pub fn user_home_subdirectory() -> &'static str {
-    if is_local_installation() {
+    if is_ycwang_installation() {
+        cua_driver_core::ycwang_env::YCWANG_HOME_SUBDIR
+    } else if is_local_installation() {
         ".cua-driver-local"
     } else {
         ".cua-driver"
@@ -142,6 +169,16 @@ mod tests {
             "/Applications/CuaDriver.app/Contents/MacOS/cua-driver"
         )));
         assert!(!path_is_local(Path::new("/tmp/cua-driver-local-test")));
+    }
+
+    #[test]
+    fn ycwang_identity_matches_cua_ycwang_executable() {
+        assert!(path_is_ycwang(Path::new("/usr/local/bin/cua-ycwang")));
+        assert!(path_is_ycwang(Path::new("/dev/.cua-ycwang/cua-ycwang.exe")));
+        assert!(!path_is_ycwang(Path::new("/usr/local/bin/cua-driver")));
+        assert!(!path_is_ycwang(Path::new(
+            "/usr/local/bin/cua-driver-local"
+        )));
     }
 
     #[cfg(target_os = "windows")]

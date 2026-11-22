@@ -369,7 +369,10 @@ fn installed_package_helper_path() -> anyhow::Result<PathBuf> {
         .map(PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("user home is unavailable"))?;
     let local = crate::bundle::is_local_installation();
-    let product_home = if local {
+    let product_home = if crate::bundle::is_ycwang_installation() {
+        cua_driver_core::ycwang_env::resolve_ycwang_home()
+            .unwrap_or_else(|| user_home.join(".cua-ycwang"))
+    } else if local {
         std::env::var_os("CUA_DRIVER_LOCAL_HOME")
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)

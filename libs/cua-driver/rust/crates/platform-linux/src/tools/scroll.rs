@@ -272,6 +272,9 @@ impl Tool for ScrollTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        if let Some(display_id) = super::mcp_virtual_screen::resolve_virtual_display_from_args(&args) {
+            return super::mcp_virtual_screen::virtual_scroll(display_id, &args).await;
+        }
         let cursor_id = resolve_cursor_key(&args);
         if args.opt_str("scope").as_deref() == Some("desktop")
             && args.get("pid").is_none()

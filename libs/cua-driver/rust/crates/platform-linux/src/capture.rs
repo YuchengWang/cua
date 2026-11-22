@@ -54,6 +54,72 @@ pub fn screenshot_window(xid: u64) -> Result<(String, u32, u32)> {
     Ok((BASE64.encode(&bytes), w, h))
 }
 
+/// Capture a window on a specific [`X11ScreenContext`], preferring XComposite
+/// offscreen pixmap capture (occluded-window safe) and falling back to direct
+/// drawable `GetImage` when unmapped or unsupported.
+pub fn screenshot_window_bytes_with_context(
+    ctx: &crate::x11::context::X11ScreenContext,
+    xid: u64,
+) -> Result<Vec<u8>> {
+    use x11rb::protocol::xproto::ConnectionExt as _;
+
+    let window = xid_to_window(xid)?;
+    match crate::x11::composite_capture::capture_window_composite(&ctx.conn, window)? {
+        crate::x11::composite_capture::CompositeCaptureOutcome::Captured(png) => Ok(png),
+        crate::x11::composite_capture::CompositeCaptureOutcome::UnmappedFallback { reason } => {
+            tracing::debug!(
+                target: "cua-driver",
+                display = %ctx.display_id,
+                xid,
+                %reason,
+                "XComposite unavailable/unmapped; falling back to direct GetImage"
+            );
+            let geom = ctx
+                .conn
+                .get_geometry(window)
+                .map_err(|e| anyhow!("get_geometry request: {e}"))?
+                .reply()
+                .map_err(|e| anyhow!("get_geometry reply: {e}"))?;
+            let w = u32::from(geom.width);
+            let h = u32::from(geom.height);
+            if w == 0 || h == 0 {
+                bail!("window {xid} on display {} has 0x0 geometry", ctx.display_id);
+            }
+            let pixels = PixelCatalog::from_setup(ctx.conn.setup());
+            let rgba = read_drawable_rgba(&ctx.conn, &pixels, window, Rect { x: 0, y: 0, w, h }, false)?;
+            cua_driver_core::image_utils::encode_rgba_to_png(&rgba, w, h)
+        }
+    }
+}
+
+/// Capture the root display of a specific [`X11ScreenContext`] as PNG bytes.
+pub fn screenshot_display_bytes_with_context(
+    ctx: &crate::x11::context::X11ScreenContext,
+) -> Result<Vec<u8>> {
+    use x11rb::protocol::xproto::ConnectionExt as _;
+
+    let root = ctx.root_window();
+    let pixels = PixelCatalog::from_setup(ctx.conn.setup());
+    let geom = ctx.conn.get_geometry(root)?.reply()?;
+    let w = u32::from(geom.width);
+    let h = u32::from(geom.height);
+    if w == 0 || h == 0 {
+        bail!(
+            "X11 root window on display {} reports a 0x0 geometry",
+            ctx.display_id
+        );
+    }
+    let full = Rect { x: 0, y: 0, w, h };
+    let rgba = match read_drawable_rgba(&ctx.conn, &pixels, root, full, false) {
+        Ok(rgba) => rgba,
+        Err(e) if is_root_unreadable(&e) => {
+            compose_top_level_windows(&ctx.conn, &pixels, root, (w, h))?
+        }
+        Err(e) => return Err(e),
+    };
+    cua_driver_core::image_utils::encode_rgba_to_png(&rgba, w, h)
+}
+
 /// Ordered window-capture backend cascade.
 ///
 /// Non-empty XShm success returns immediately; otherwise try non-empty
@@ -135,7 +201,7 @@ fn capture_via_import(xid: u64) -> Result<Vec<u8>> {
 // ── shared pixel conversion ───────────────────────────────────────────────
 
 #[derive(Clone)]
-struct PixelCatalog {
+pub(crate) struct PixelCatalog {
     image_byte_order: ImageOrder,
     formats: Vec<Format>,
     visuals: Vec<Visualtype>,
@@ -159,7 +225,7 @@ struct PixelDecoder {
 }
 
 impl PixelCatalog {
-    fn from_setup(setup: &Setup) -> Self {
+    pub(crate) fn from_setup(setup: &Setup) -> Self {
         Self {
             image_byte_order: setup.image_byte_order,
             formats: setup.pixmap_formats.clone(),
@@ -411,7 +477,7 @@ fn packed_zpixmap_to_rgba(
     Ok(rgba)
 }
 
-fn xid_to_window(xid: u64) -> Result<u32> {
+pub(crate) fn xid_to_window(xid: u64) -> Result<u32> {
     u32::try_from(xid).map_err(|_| anyhow!("X11 window id {xid} does not fit u32"))
 }
 
@@ -1090,11 +1156,11 @@ fn is_root_unreadable(error: &anyhow::Error) -> bool {
 
 /// A screen rectangle in root coordinates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Rect {
-    x: i32,
-    y: i32,
-    w: u32,
-    h: u32,
+pub(crate) struct Rect {
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+    pub(crate) w: u32,
+    pub(crate) h: u32,
 }
 
 impl Rect {
@@ -1117,12 +1183,23 @@ impl Rect {
 /// `GetImage` of `rect` (in `drawable`'s own coordinates) decoded to RGBA
 /// through the server's pixmap formats and the reply's visual. With `alpha`,
 /// a depth-32 reply keeps its alpha channel.
-fn read_drawable_rgba(
+pub(crate) fn read_drawable_rgba(
     conn: &x11rb::rust_connection::RustConnection,
     pixels: &PixelCatalog,
     drawable: u32,
     rect: Rect,
     alpha: bool,
+) -> Result<Vec<u8>> {
+    read_drawable_rgba_with_visual(conn, pixels, drawable, rect, alpha, None)
+}
+
+pub(crate) fn read_drawable_rgba_with_visual(
+    conn: &x11rb::rust_connection::RustConnection,
+    pixels: &PixelCatalog,
+    drawable: u32,
+    rect: Rect,
+    alpha: bool,
+    fallback_visual: Option<u32>,
 ) -> Result<Vec<u8>> {
     use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat};
     checked_capture_dimensions(rect.w, rect.h)?;
@@ -1137,7 +1214,12 @@ fn read_drawable_rgba(
             !0u32,
         )?
         .reply()?;
-    let decoder = pixels.decoder(rect.w, rect.h, img.depth, img.visual, |visual| {
+    let visual_id = if img.visual != 0 {
+        img.visual
+    } else {
+        fallback_visual.unwrap_or(0)
+    };
+    let decoder = pixels.decoder(rect.w, rect.h, img.depth, visual_id, |visual| {
         query_direct_colors(conn, drawable, visual)
     })?;
     packed_zpixmap_to_rgba(

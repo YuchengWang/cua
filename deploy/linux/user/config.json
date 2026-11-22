@@ -1,0 +1,23 @@
+{
+  "namespace": "cua-ycwang",
+  "display": {
+    "default_profile": "desktop-1080p",
+    "display_id": ":99",
+    "fallback_display_id": "primary"
+  },
+  "capture": {
+    "backend": "x11",
+    "scale_mode": "logical",
+    "cursor_overlay": false
+  },
+  "input": {
+    "backend": "uinput_or_xtest",
+    "prefer_uinput": true,
+    "default_delivery_mode": "foreground"
+  },
+  "isolation": {
+    "config_dir_env": "CUA_YCWANG_CONFIG_DIR",
+    "home_dir_env": "CUA_YCWANG_HOME",
+    "state_namespace_env": "CUA_DRIVER_STATE_NAMESPACE"
+  }
+}

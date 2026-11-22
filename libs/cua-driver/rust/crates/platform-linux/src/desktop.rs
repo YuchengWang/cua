@@ -79,6 +79,25 @@ pub(crate) fn reclassify() -> Desktop {
     desktop
 }
 
+/// Classify a specific display target without mutating the global [`DESKTOP`] cache.
+/// Virtual X11 display targets (such as `":99"`) always classify as [`Desktop::X11`].
+pub fn classify_for(
+    display_id: Option<&str>,
+    wayland_display: Option<&str>,
+    enable_wayland: Option<&str>,
+) -> Desktop {
+    if let Some(id) = display_id {
+        if id != "primary" && cua_driver_core::action_target::is_valid_display_id(id) {
+            return Desktop::X11;
+        }
+    }
+    classify(|name| match name {
+        "WAYLAND_DISPLAY" => wayland_display.map(OsString::from),
+        ENABLE_WAYLAND_ENV => enable_wayland.map(OsString::from),
+        _ => std::env::var_os(name),
+    })
+}
+
 /// Whether `value` of [`ENABLE_WAYLAND_ENV`] opts in: any
 /// value other than empty, `0` or `false`.
 pub(crate) fn opted_in(value: Option<&str>) -> bool {

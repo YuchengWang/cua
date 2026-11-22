@@ -86,6 +86,7 @@ pub mod desktop_capture_scale;
 pub mod element_frame;
 pub mod element_query;
 pub mod element_token;
+pub mod elevation;
 pub mod expectation;
 pub mod fast_path;
 pub mod ffmpeg_install;
@@ -140,6 +141,7 @@ pub mod window_inspection;
 pub mod window_observation;
 pub mod window_state_view;
 pub mod window_target;
+pub mod ycwang_env;
 
 pub use cua_driver_contract::{CaptureScope, TOOL_INVOCATION_FAILED_CODE};
 pub use recording::RecordingSession;

@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "namespace": "cua-ycwang",
+  "default_effect": "allow",
+  "desktop_targets": {
+    "allowed_display_ids": [
+      "primary",
+      ":99",
+      ":99.0",
+      ":98",
+      ":98.0"
+    ]
+  },
+  "elevation": {
+    "allow_pkexec_helper": true,
+    "helper_path": "/usr/local/libexec/cua-elevated-helper",
+    "allowed_subcommands": [
+      "probe-uinput",
+      "reload-udev",
+      "ensure-uinput-module",
+      "verify-rules"
+    ],
+    "never_accept_plaintext_password": true
+  }
+}

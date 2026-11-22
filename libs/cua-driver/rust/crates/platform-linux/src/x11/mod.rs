@@ -9,6 +9,12 @@
 //! extension when the server can prove it is a local client (see
 //! [`crate::x11_client_pid`]); otherwise its `pid` stays `None`.
 
+pub mod composite_capture;
+pub mod context;
+pub mod screen_guard;
+pub mod virtual_input;
+pub mod virtual_screen;
+
 use anyhow::Result;
 use x11rb::connection::Connection;
 use x11rb::protocol::res::{ClientIdMask, ClientIdSpec, ConnectionExt as _};
@@ -53,8 +59,17 @@ fn root_windows(conn: &RustConnection, root: Window, name: &[u8], max: u32) -> O
 /// on the root), if any.
 pub fn active_window() -> Option<u64> {
     let (conn, screen_num) = RustConnection::connect(None).ok()?;
-    let root = conn.setup().roots[screen_num].root;
-    let id = *root_windows(&conn, root, b"_NET_ACTIVE_WINDOW", 1)?.first()?;
+    active_window_on(&conn, screen_num)
+}
+
+/// Active window on an explicit [`context::X11ScreenContext`].
+pub fn active_window_with_context(ctx: &context::X11ScreenContext) -> Option<u64> {
+    active_window_on(&ctx.conn, ctx.screen_num)
+}
+
+fn active_window_on(conn: &RustConnection, screen_num: usize) -> Option<u64> {
+    let root = conn.setup().roots.get(screen_num)?.root;
+    let id = *root_windows(conn, root, b"_NET_ACTIVE_WINDOW", 1)?.first()?;
     (id != 0).then_some(u64::from(id))
 }
 
@@ -80,15 +95,36 @@ fn is_a_client(active: &[Window], clients: &[Window]) -> Option<bool> {
 
 /// List top-level windows, optionally filtered by pid.
 pub fn list_windows(filter_pid: Option<u32>) -> Vec<WindowInfo> {
-    list_windows_inner(filter_pid).unwrap_or_default()
+    let Ok((conn, screen_num)) = RustConnection::connect(None) else {
+        return Vec::new();
+    };
+    list_windows_on(&conn, screen_num, filter_pid, false).unwrap_or_default()
+}
+
+/// List top-level windows on an explicit [`context::X11ScreenContext`],
+/// including `MapState::VIEWABLE` + `override_redirect` popup/dropdown windows.
+pub fn list_windows_with_context(
+    ctx: &context::X11ScreenContext,
+    filter_pid: Option<u32>,
+) -> Vec<WindowInfo> {
+    list_windows_on(&ctx.conn, ctx.screen_num, filter_pid, true).unwrap_or_default()
 }
 
 /// Whether the X server still knows a window by this id.
 pub fn window_exists(xid: u64) -> bool {
-    let Ok(xid) = u32::try_from(xid) else {
+    let Ok((conn, _)) = RustConnection::connect(None) else {
         return false;
     };
-    let Ok((conn, _)) = RustConnection::connect(None) else {
+    window_exists_on(&conn, xid)
+}
+
+/// Whether a window exists on an explicit [`context::X11ScreenContext`].
+pub fn window_exists_with_context(ctx: &context::X11ScreenContext, xid: u64) -> bool {
+    window_exists_on(&ctx.conn, xid)
+}
+
+fn window_exists_on(conn: &RustConnection, xid: u64) -> bool {
+    let Ok(xid) = u32::try_from(xid) else {
         return false;
     };
     conn.get_window_attributes(xid)
@@ -116,15 +152,37 @@ fn window_owner_matches(owner: Option<u32>, requested_pid: u32) -> bool {
     owner == Some(requested_pid)
 }
 
-fn list_windows_inner(filter_pid: Option<u32>) -> Result<Vec<WindowInfo>> {
-    let (conn, screen_num) = RustConnection::connect(None)?;
+fn list_windows_on(
+    conn: &RustConnection,
+    screen_num: usize,
+    filter_pid: Option<u32>,
+    include_override_redirect: bool,
+) -> Result<Vec<WindowInfo>> {
     let screen = &conn.setup().roots[screen_num];
     let root = screen.root;
 
     // Prefer _NET_CLIENT_LIST_STACKING; an unordered client list reports null z_index.
-    let (windows, source) = get_window_list(&conn, root)?;
+    let (mut windows, source) = get_window_list(conn, root)?;
+    if include_override_redirect {
+        if let Some(tree) = conn.query_tree(root).ok().and_then(|c| c.reply().ok()) {
+            for child in tree.children {
+                if windows.contains(&child) {
+                    continue;
+                }
+                if let Some(attrs) = conn
+                    .get_window_attributes(child)
+                    .ok()
+                    .and_then(|c| c.reply().ok())
+                {
+                    if attrs.override_redirect && attrs.map_state == MapState::VIEWABLE {
+                        windows.push(child);
+                    }
+                }
+            }
+        }
+    }
 
-    let owners = OwnerResolver::new(&conn);
+    let owners = OwnerResolver::new(conn);
     let mut result = Vec::new();
     for xid in windows {
         let pid = owners.owner_pid(xid);
@@ -134,11 +192,11 @@ fn list_windows_inner(filter_pid: Option<u32>) -> Result<Vec<WindowInfo>> {
             }
         }
 
-        let title = get_window_title(&conn, xid).unwrap_or_default();
+        let title = get_window_title(conn, xid).unwrap_or_default();
         if !window_is_listable(source, &title) {
             continue;
         }
-        let app_name = get_window_class(&conn, xid)
+        let app_name = get_window_class(conn, xid)
             .map(|(instance, class)| if class.is_empty() { instance } else { class })
             .unwrap_or_default();
         let is_on_screen = conn
@@ -579,9 +637,18 @@ pub fn pick_pid_window(
 /// popup menu included), unlike [`list_windows`], which only enumerates the
 /// WM's client list. `None` when the window does not exist.
 pub fn window_info(xid: u64) -> Option<WindowInfo> {
-    let window = u32::try_from(xid).ok()?;
     let (conn, screen_num) = RustConnection::connect(None).ok()?;
-    let root = conn.setup().roots[screen_num].root;
+    window_info_on(&conn, screen_num, xid)
+}
+
+/// Geometry, title and owner of a window on an explicit [`context::X11ScreenContext`].
+pub fn window_info_with_context(ctx: &context::X11ScreenContext, xid: u64) -> Option<WindowInfo> {
+    window_info_on(&ctx.conn, ctx.screen_num, xid)
+}
+
+fn window_info_on(conn: &RustConnection, screen_num: usize, xid: u64) -> Option<WindowInfo> {
+    let window = u32::try_from(xid).ok()?;
+    let root = conn.setup().roots.get(screen_num)?.root;
     let attributes = conn.get_window_attributes(window).ok()?.reply().ok()?;
     let geom = conn.get_geometry(window).ok()?.reply().ok()?;
     let trans = conn
@@ -589,9 +656,9 @@ pub fn window_info(xid: u64) -> Option<WindowInfo> {
         .ok()?
         .reply()
         .ok()?;
-    let pid = get_window_pid(&conn, window).ok().flatten();
-    let title = get_window_title(&conn, window).unwrap_or_default();
-    let app_name = get_window_class(&conn, window)
+    let pid = get_window_pid(conn, window).ok().flatten();
+    let title = get_window_title(conn, window).unwrap_or_default();
+    let app_name = get_window_class(conn, window)
         .map(|(instance, class)| if class.is_empty() { instance } else { class })
         .unwrap_or_default();
     Some(WindowInfo {

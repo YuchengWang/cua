@@ -143,6 +143,11 @@ pub enum Command {
         /// macOS: make LaunchServices forget every other copy of the app.
         fix: bool,
     },
+    /// `cua-ycwang elevate --action-id <id> [--json]` — invoke allowlisted pkexec helper.
+    Elevate {
+        action_id: String,
+        json: bool,
+    },
     Diagnose,
     /// `cua-driver test [--json]` - check a new install end to end.
     Test {
@@ -397,6 +402,7 @@ fn finite_command_name_from_args(args: &[String]) -> Option<&'static str> {
         Some("check-update") => Some("check_update"),
         Some("channel") => Some("channel"),
         Some("doctor") => Some("doctor"),
+        Some("elevate") => Some("elevate"),
         Some("diagnose") => Some("diagnose"),
         Some("test") => Some("test"),
         Some("permissions") => Some("permissions"),
@@ -1009,6 +1015,27 @@ pub fn parse_command() -> Command {
             let json = args.iter().any(|a| a == "--json");
             let fix = args.iter().any(|a| a == "--fix");
             Command::Doctor { json, fix }
+        }
+        Some("elevate") => {
+            let json = args.iter().any(|a| a == "--json");
+            let mut action_id = None;
+            let mut i = 1;
+            while i < args.len() {
+                if args[i] == "--action-id" {
+                    action_id = args.get(i + 1).cloned();
+                    i += 2;
+                    continue;
+                }
+                if let Some(val) = args[i].strip_prefix("--action-id=") {
+                    action_id = Some(val.to_owned());
+                }
+                i += 1;
+            }
+            let Some(action_id) = action_id.filter(|s| !s.is_empty()) else {
+                eprintln!("Usage: cua-ycwang elevate --action-id <action_id> [--json]");
+                process::exit(64);
+            };
+            Command::Elevate { action_id, json }
         }
         Some("diagnose") => Command::Diagnose,
         Some("test") => Command::Test {
@@ -2286,6 +2313,12 @@ pub fn build_manifest() -> serde_json::Value {
               "args": [
                   { "name": "--json", "type": "flag", "description": "Machine-readable doctor report." },
                   { "name": "--fix", "type": "flag", "description": "macOS: make LaunchServices forget every other copy of CuaDriver.app (no files are deleted)." }
+              ] },
+            { "name": "elevate",
+              "description": "Invoke an allowlisted polkit/pkexec helper action by action_id.",
+              "args": [
+                  { "name": "--action-id", "type": "string", "description": "Allowlisted Polkit action ID." },
+                  { "name": "--json", "type": "flag", "description": "Emit machine-readable output." }
               ] },
             { "name": "test",
               "description": "Check a new install end to end: permissions, screen read, pointer, and typing in TextEdit (macOS). Exit 0 when it all works.",
@@ -4616,6 +4649,7 @@ const HELP_SUBCOMMANDS: &[&str] = &[
     "update",
     "check-update",
     "doctor",
+    "elevate",
     "diagnose",
     "permissions",
     "autostart",
@@ -5109,6 +5143,15 @@ fn cli_docs_literal() -> serde_json::Value {
                 "subcommands": no_subcommands
             },
             {
+                "name": "elevate",
+                "abstract": "Invoke an allowlisted polkit/pkexec helper action by action_id.",
+                "discussion": "Runs an explicitly allowlisted elevated helper subcommand via pkexec without plaintext passwords.",
+                "arguments": no_args,
+                "options": [{"name":"action-id","short_name":null,"help":"Allowlisted Polkit action ID.","value_name":"ACTION_ID","default_value":null}],
+                "flags": [{"name":"json","short_name":null,"help":"Emit machine-readable output.","default_value":false}],
+                "subcommands": no_subcommands
+            },
+            {
                 "name": "test",
                 "abstract": "Check that Cua Driver works on this computer.",
                 "discussion": "Checks permissions, a screen read, Cua Driver's own pointer, and (macOS) typing in a background TextEdit window that is closed without saving. Exit code is 0 when everything works and 1 when something needs fixing.",
@@ -5338,6 +5381,9 @@ const CLI_EXAMPLES: &[(&str, &[(&str, &str)])] = &[
         ("cua-driver doctor", "Run the diagnostic probes"),
         ("cua-driver doctor --json", "Emit the probe report as JSON"),
         ("cua-driver doctor --fix", "macOS: make macOS forget extra copies of the app (deletes no files)"),
+    ]),
+    ("elevate", &[
+        ("cua-driver elevate --action-id io.github.yuchengwang.cua.helper.verify --json", "Run an allowlisted elevated helper action via pkexec"),
     ]),
     ("test", &[
         ("cua-driver test", "Check that Cua Driver works on this computer"),
@@ -5980,6 +6026,74 @@ pub fn run_doctor_cmd(json: bool, fix: bool) {
 
     if report.has_errors() {
         process::exit(1);
+    }
+}
+
+pub fn run_elevate_cmd(action_id: &str, json: bool) {
+    let helper = std::path::Path::new(cua_driver_core::elevation::DEFAULT_ELEVATED_HELPER_PATH);
+    let subcommands: &[&str] = match action_id {
+        "io.github.yuchengwang.cua.uinput.setup" => &["ensure-uinput-module", "reload-udev"],
+        "io.github.yuchengwang.cua.helper.verify" => &["verify-rules"],
+        other => {
+            let msg = format!("unsupported action_id: {other}");
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "ok": false, "action_id": other, "error": msg })
+                );
+            } else {
+                eprintln!("{msg}");
+            }
+            process::exit(2);
+        }
+    };
+
+    for sub in subcommands {
+        match cua_driver_core::elevation::run_pkexec_allowlisted(helper, sub, &[]) {
+            Ok(out) if out.success() => {}
+            Ok(out) => {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "ok": false,
+                            "action_id": action_id,
+                            "subcommand": sub,
+                            "exit_code": out.exit_code,
+                            "stderr": out.stderr,
+                        })
+                    );
+                } else {
+                    eprintln!("elevate '{sub}' failed ({:?}): {}", out.exit_code, out.stderr);
+                }
+                process::exit(1);
+            }
+            Err(e) => {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "ok": false,
+                            "action_id": action_id,
+                            "subcommand": sub,
+                            "error": e.to_string(),
+                        })
+                    );
+                } else {
+                    eprintln!("elevate '{sub}' error: {e}");
+                }
+                process::exit(1);
+            }
+        }
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "ok": true, "action_id": action_id, "subcommands": subcommands })
+        );
+    } else {
+        println!("Elevated action '{action_id}' completed.");
     }
 }
 

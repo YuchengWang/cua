@@ -41,6 +41,11 @@ use super::{
     launch_app::LaunchAppTool,
     list_apps::ListAppsTool,
     list_windows::ListWindowsTool,
+    mcp_clipboard::{GetClipboardTool, SetClipboardTool, SyncClipboardTool},
+    mcp_virtual_screen::{
+        CreateVirtualScreenTool, DestroyVirtualScreenTool, LaunchInVirtualScreenTool,
+        ListVirtualScreensTool,
+    },
     mouse_button_down::MouseButtonDownTool,
     mouse_button_up::MouseButtonUpTool,
     mouse_drag::MouseDragTool,
@@ -5246,6 +5251,8 @@ pub fn build_registry_with_provider(
                 crate::overlay::remove_cursor(session_id.to_owned());
                 crate::input::forget_master_pointer(session_id);
                 crate::wayland::hyprland_input::cleanup_session(session_id);
+                crate::x11::virtual_screen::global_virtual_screen_manager()
+                    .destroy_for_session(session_id);
                 Ok(())
             },
         )
@@ -5274,6 +5281,14 @@ pub fn build_registry_with_provider(
             }
         });
     }
+    let _ = crate::x11::virtual_screen::global_virtual_screen_manager().reap_stale_runtime();
+    r.register(Box::new(CreateVirtualScreenTool));
+    r.register(Box::new(ListVirtualScreensTool));
+    r.register(Box::new(DestroyVirtualScreenTool));
+    r.register(Box::new(LaunchInVirtualScreenTool));
+    r.register(Box::new(GetClipboardTool));
+    r.register(Box::new(SetClipboardTool));
+    r.register(Box::new(SyncClipboardTool));
     r.register(Box::new(ListAppsTool));
     r.register(Box::new(ListWindowsTool));
     r.register(Box::new(GetWindowStateTool {

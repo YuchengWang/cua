@@ -20,6 +20,26 @@ pub fn supports_typed_target(tool_name: &str) -> bool {
     TARGETED_TOOLS.contains(&tool_name)
 }
 
+/// Validates a `desktop` target `display_id`.
+/// Allows `"primary"` or an X11 display specifier matching `^:\d+(\.\d+)?$` (e.g. `":99"`, `":99.0"`).
+pub fn is_valid_display_id(id: &str) -> bool {
+    if id == "primary" {
+        return true;
+    }
+    let Some(rest) = id.strip_prefix(':') else {
+        return false;
+    };
+    match rest.split_once('.') {
+        None => !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()),
+        Some((display, screen)) => {
+            !display.is_empty()
+                && !screen.is_empty()
+                && display.bytes().all(|b| b.is_ascii_digit())
+                && screen.bytes().all(|b| b.is_ascii_digit())
+        }
+    }
+}
+
 fn invalid_target(message: impl Into<String>) -> ToolResult {
     ToolResult::error(message.into()).with_structured(json!({
         "code": "invalid_action_target",
@@ -94,9 +114,9 @@ pub fn normalize_action_target(tool_name: &str, args: &mut Value) -> Result<(), 
                     "desktop target accepts only kind and display_id",
                 ));
             }
-            if display_id != "primary" {
+            if !is_valid_display_id(display_id) {
                 return Err(invalid_target(
-                    "this release supports only display_id='primary'",
+                    "desktop target display_id must be 'primary' or an X11 display like ':99' or ':99.0'",
                 ));
             }
             object.insert("scope".into(), Value::String("desktop".into()));
@@ -196,6 +216,34 @@ mod tests {
         normalize_action_target("click", &mut desktop).unwrap();
         assert_eq!(desktop["scope"], "desktop");
         assert!(desktop.get("pid").is_none());
+
+        let mut x11_desktop = json!({
+            "x": 10,
+            "y": 20,
+            "target": {"kind": "desktop", "display_id": ":99"}
+        });
+        normalize_action_target("click", &mut x11_desktop).unwrap();
+        assert_eq!(x11_desktop["scope"], "desktop");
+
+        let mut x11_screen = json!({
+            "x": 10,
+            "y": 20,
+            "target": {"kind": "desktop", "display_id": ":99.0"}
+        });
+        normalize_action_target("click", &mut x11_screen).unwrap();
+        assert_eq!(x11_screen["scope"], "desktop");
+    }
+
+    #[test]
+    fn display_id_validation_allows_primary_and_x11_displays() {
+        for valid in ["primary", ":0", ":99", ":99.0", ":10.12"] {
+            assert!(is_valid_display_id(valid), "expected valid: {valid:?}");
+        }
+        for invalid in [
+            "", ":", ":.", ":99.", ":.0", ":99.0.1", "99", "secondary", ":abc", ":99a", "primary ",
+        ] {
+            assert!(!is_valid_display_id(invalid), "expected invalid: {invalid:?}");
+        }
     }
 
     #[test]

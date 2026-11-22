@@ -1036,7 +1036,11 @@ pub fn default_capabilities_for(tool_name: &str) -> Vec<String> {
         "launch_app" => &["app.launch"],
         "list_apps" => &["app.list"],
         "kill_app" => &["app.kill"],
-        "agent_display" => &["display.virtual"],
+        "agent_display"
+        | "create_virtual_screen"
+        | "list_virtual_screens"
+        | "destroy_virtual_screen"
+        | "launch_in_virtual_screen" => &["display.virtual"],
         "list_windows" => &["window.list"],
         "bring_to_front" => &["window.activate"],
         "set_window_frame" => &["window.frame.set"],
@@ -1055,6 +1059,8 @@ pub fn default_capabilities_for(tool_name: &str) -> Vec<String> {
         ],
         "get_config" => &["system.config.read"],
         "set_config" => &["system.config.write"],
+        "get_clipboard" => &["clipboard.read"],
+        "set_clipboard" | "sync_clipboard" => &["clipboard.write"],
 
         // ── agent cursor ─────────────────────────────────────────────
         "set_agent_cursor_enabled" => &["agent_cursor.set_enabled"],

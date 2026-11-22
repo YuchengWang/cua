@@ -69,10 +69,20 @@ impl Tool for ListWindowsTool {
         use cua_driver_core::tool_args::ArgsExt;
         let filter_pid = args.opt_u64("pid").map(|v| v as u32);
         let on_screen_only = args.bool_or("on_screen_only", false);
-        let mut windows =
-            tokio::task::spawn_blocking(move || crate::wayland::list_windows_dispatch(filter_pid))
-                .await
-                .unwrap_or_default();
+        let virtual_display = crate::x11::virtual_screen::global_virtual_screen_manager()
+            .resolve_display_for_session(args.opt_str("session").as_deref(), None);
+        let mut windows = tokio::task::spawn_blocking(move || {
+            if let Some(ref display_id) = virtual_display {
+                if let Ok(ctx) = crate::x11::virtual_screen::global_virtual_screen_manager()
+                    .connect_context(display_id)
+                {
+                    return crate::x11::list_windows_with_context(&ctx, filter_pid);
+                }
+            }
+            crate::wayland::list_windows_dispatch(filter_pid)
+        })
+        .await
+        .unwrap_or_default();
         let none_listed = windows.is_empty();
         retain_listed(
             &mut windows,

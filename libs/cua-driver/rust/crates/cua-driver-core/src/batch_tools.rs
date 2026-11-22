@@ -138,7 +138,15 @@ pub const MAX_EXPECTS: usize = 4;
 /// client call timeouts.
 pub const MAX_BATCH_MS: u64 = 60_000;
 /// Fields a step object may carry besides one action.
-const STEP_KEYS: &[&str] = &["tool", "args", "wait_for", "expect", "timeout_ms"];
+const STEP_KEYS: &[&str] = &[
+    "tool",
+    "args",
+    "wait_for",
+    "expect",
+    "timeout_ms",
+    "wait_for_stable_frame",
+    "on_error",
+];
 const OBSERVE_TOOL: &str = "get_window_state";
 /// Batch-level fields that name the window every step inherits.
 const BATCH_WINDOW_KEYS: &[&str] = &["pid", "window_id", "app", "window"];
@@ -319,6 +327,8 @@ struct Step {
     action: Option<Action>,
     wait_for: Option<Check>,
     expect: Vec<Check>,
+    wait_for_stable_frame_ms: Option<u64>,
+    on_error: Option<String>,
     /// A read-only tool placed between actions. It cannot change what later
     /// steps do, so it is skipped (with a note) instead of failing the batch.
     skipped_read: Option<&'static str>,
@@ -534,6 +544,8 @@ impl Plan {
                     action: None,
                     wait_for: None,
                     expect: Vec::new(),
+                    wait_for_stable_frame_ms: None,
+                    on_error: None,
                     skipped_read: Some(tool),
                 });
                 continue;
@@ -861,6 +873,14 @@ async fn run_step(
         };
     }
 
+    if let Some(stable_ms) = step.wait_for_stable_frame_ms {
+        let clamped = stable_ms.min(2_000);
+        if clamped > 0 {
+            tokio::time::sleep(Duration::from_millis(clamped)).await;
+        }
+        report["wait_for_stable_frame_ms"] = json!(clamped);
+    }
+
     if let Some(check) = &step.wait_for {
         match locator.check(check, context).await {
             Ok(checked) => {
@@ -1004,6 +1024,15 @@ async fn run_step(
                 result = registry.invoke(tool, retry.clone()).await;
                 attempt = StepAttempt::Refound { args: retry, note };
             }
+        }
+        if result.is_error == Some(true)
+            && step.on_error.as_deref() == Some("dismiss_modal_and_retry")
+        {
+            let _ = registry
+                .invoke("press_key", json!({ "key": "Escape" }))
+                .await;
+            result = registry.invoke(tool, args.clone()).await;
+            report["on_error_recovery"] = json!("dismiss_modal_and_retry");
         }
         let attempt_tool = attempt.tool(tool);
         let wants_foreground = result.is_error == Some(true)
@@ -1769,10 +1798,34 @@ fn parse_step(
             inherits_window,
         )?),
     };
+    let wait_for_stable_frame_ms = match object.get("wait_for_stable_frame") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => None,
+        Some(Value::Bool(true)) => Some(250),
+        Some(Value::Number(n)) => n.as_u64(),
+        Some(_) => {
+            return Err(PlanError::step(
+                index,
+                "wait_for_stable_frame must be a boolean or milliseconds integer",
+            ))
+        }
+    };
+    let on_error = match object.get("on_error") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if s == "dismiss_modal_and_retry" => Some(s.clone()),
+        Some(_) => {
+            return Err(PlanError::step(
+                index,
+                "on_error currently supports only 'dismiss_modal_and_retry'",
+            ))
+        }
+    };
+
     Ok(Step {
         action,
         wait_for,
         expect,
+        wait_for_stable_frame_ms,
+        on_error,
         skipped_read: None,
     })
 }

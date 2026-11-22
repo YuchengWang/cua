@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "app_id": "tws",
+  "display_name": "Interactive Brokers Trader Workstation",
+  "recommended_profile": "desktop-1080p",
+  "x11_env": {
+    "GDK_SCALE": "1",
+    "_JAVA_AWT_WM_NONREPARENTING": "1",
+    "AWT_TOOLKIT": "MToolkit"
+  },
+  "window_matchers": [
+    {
+      "wm_class": "install4j-jclient-LoginFrame",
+      "role": "login"
+    },
+    {
+      "title_regex": ".*Trader Workstation.*",
+      "role": "main"
+    }
+  ],
+  "notes": "Run TWS inside Xvfb + Openbox (:99) to isolate trading GUI from the host desktop."
+}
