@@ -117,7 +117,7 @@
       },
       {
         "action": "verify_window_title_regex",
-        "args": { "pattern": ".*Trader Workstation.*" },
+        "args": { "pattern": ".*(Interactive Brokers|Trader Workstation|Simulated Trading).*" },
         "description": "Verify TWS main window title without screenshot"
       }
     ],

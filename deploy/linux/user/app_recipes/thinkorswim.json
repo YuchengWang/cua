@@ -289,6 +289,16 @@
         "description": "Focus User ID field"
       },
       {
+        "action": "hotkey",
+        "args": { "keys": ["ctrl", "a"] },
+        "description": "Select any pre-filled Remembered Login ID"
+      },
+      {
+        "action": "press_key",
+        "args": { "key": "BackSpace" },
+        "description": "Clear pre-filled Login ID before typing"
+      },
+      {
         "action": "type_secret_from_env",
         "args": { "env_key": "CUA_YCWANG_TOS_LIVE_USERNAME", "press_enter": false },
         "description": "Type thinkorswim Live username from .env without exposing plaintext"
@@ -300,7 +310,7 @@
       },
       {
         "action": "wait_for_stable_frame",
-        "args": { "ms": 800 },
+        "args": { "ms": 2500 },
         "description": "Allow password prompt to render"
       },
       {
@@ -335,6 +345,16 @@
         "description": "Focus User ID field"
       },
       {
+        "action": "hotkey",
+        "args": { "keys": ["ctrl", "a"] },
+        "description": "Select any pre-filled Remembered Login ID"
+      },
+      {
+        "action": "press_key",
+        "args": { "key": "BackSpace" },
+        "description": "Clear pre-filled Login ID before typing"
+      },
+      {
         "action": "type_secret_from_env",
         "args": { "env_key": "CUA_YCWANG_TOS_PAPER_USERNAME", "press_enter": false },
         "description": "Type thinkorswim paperMoney username from .env without exposing plaintext"
@@ -346,7 +366,7 @@
       },
       {
         "action": "wait_for_stable_frame",
-        "args": { "ms": 800 },
+        "args": { "ms": 2500 },
         "description": "Allow password prompt to render"
       },
       {
