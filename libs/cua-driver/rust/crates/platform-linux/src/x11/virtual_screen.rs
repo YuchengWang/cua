@@ -91,6 +91,7 @@ struct ManagedScreen {
     vnc_passwd_path: Option<PathBuf>,
     children: Vec<Child>,
     launched_children: Vec<Child>,
+    launched_pids: HashSet<u32>,
 }
 
 impl Drop for ManagedScreen {
@@ -359,6 +360,7 @@ impl VirtualScreenManager {
                 vnc_passwd_path,
                 children,
                 launched_children: Vec::new(),
+                launched_pids: HashSet::new(),
             },
         );
         Ok(info)
@@ -485,6 +487,7 @@ impl VirtualScreenManager {
                     .launched_children
                     .retain_mut(|c| matches!(c.try_wait(), Ok(None)));
                 screen.launched_children.push(child);
+                screen.launched_pids.insert(pid);
             }
         }
 
@@ -526,9 +529,207 @@ impl VirtualScreenManager {
                 vnc_passwd_path: None,
                 children: Vec::new(),
                 launched_children: Vec::new(),
+                launched_pids: HashSet::new(),
             },
         );
     }
+
+    #[cfg(test)]
+    pub(crate) fn insert_test_launched_pid(&self, display_id: &str, pid: u32) {
+        let mut guard = self.screens.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(screen) = guard.get_mut(display_id) {
+            screen.launched_pids.insert(pid);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_test_screen(&self, display_id: &str) {
+        let mut guard = self.screens.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(mut screen) = guard.remove(display_id) {
+            screen.children.clear();
+            screen.launched_children.clear();
+            std::mem::forget(screen);
+        }
+    }
+
+    /// Resolve a virtual display (and its [`X11ScreenContext`] when matched by
+    /// `pid` / `window_id`) from tool arguments, enforcing Fail-Closed when a
+    /// process's `/proc/<pid>/environ` `DISPLAY` points to a non-primary
+    /// virtual screen (`:99..:199`) that has been destroyed or is unreachable.
+    pub fn resolve_target_for_args(
+        &self,
+        session_id: Option<&str>,
+        explicit_display_id: Option<&str>,
+        pid: Option<u32>,
+        window_id: Option<u64>,
+    ) -> Result<Option<ResolvedVirtualDisplay>> {
+        self.resolve_target_for_args_with(
+            session_id,
+            explicit_display_id,
+            pid,
+            window_id,
+            read_proc_display,
+            |display_id| self.connect_context(display_id),
+            |ctx, wid| crate::x11::window_exists_with_context(ctx, wid),
+            |ctx, p| !crate::x11::list_windows_with_context(ctx, Some(p)).is_empty(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn resolve_target_for_args_with<C>(
+        &self,
+        session_id: Option<&str>,
+        explicit_display_id: Option<&str>,
+        pid: Option<u32>,
+        window_id: Option<u64>,
+        proc_display_fn: impl Fn(u32) -> Option<String>,
+        connect_fn: impl Fn(&str) -> Result<C>,
+        window_match_fn: impl Fn(&C, u64) -> bool,
+        pid_window_match_fn: impl Fn(&C, u32) -> bool,
+    ) -> Result<Option<ResolvedVirtualDisplayWith<C>>> {
+        if let Some(id) = explicit_display_id.filter(|s| !s.trim().is_empty()) {
+            if id == "primary" {
+                return Ok(None);
+            }
+            return Ok(Some(ResolvedVirtualDisplayWith {
+                display_id: id.to_owned(),
+                context: None,
+            }));
+        }
+
+        if let Some(sid) = session_id.filter(|s| !s.trim().is_empty()) {
+            let guard = self.screens.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(screen) = guard
+                .values()
+                .find(|s| s.info.session_id.as_deref() == Some(sid))
+            {
+                return Ok(Some(ResolvedVirtualDisplayWith {
+                    display_id: screen.info.display_id.clone(),
+                    context: None,
+                }));
+            }
+        }
+
+        // 1. Reverse-lookup in `launched_children` / `launched_pids` by `pid`.
+        if let Some(target_pid) = pid.filter(|&p| p > 0) {
+            let matched_display = {
+                let guard = self.screens.lock().unwrap_or_else(|e| e.into_inner());
+                guard
+                    .values()
+                    .find(|s| {
+                        s.launched_pids.contains(&target_pid)
+                            || s.launched_children.iter().any(|c| c.id() == target_pid)
+                    })
+                    .map(|s| s.info.display_id.clone())
+            };
+            if let Some(display_id) = matched_display {
+                let ctx = connect_fn(&display_id).with_context(|| {
+                    format!(
+                        "virtual screen '{display_id}' for pid {target_pid} is unreachable (fail-closed)"
+                    )
+                })?;
+                return Ok(Some(ResolvedVirtualDisplayWith {
+                    display_id,
+                    context: Some(ctx),
+                }));
+            }
+
+            // 2. Check `/proc/<pid>/environ` `DISPLAY` variable.
+            if let Some(proc_display) = proc_display_fn(target_pid) {
+                if let Some(virt_display) = normalize_virtual_display_id(&proc_display) {
+                    let is_managed = {
+                        let guard = self.screens.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.contains_key(&virt_display)
+                    };
+                    if !is_managed {
+                        bail!(
+                            "process {target_pid} belongs to virtual display '{virt_display}' \
+                             (DISPLAY='{proc_display}'), which has been destroyed or is not managed; \
+                             refusing fallback to primary display"
+                        );
+                    }
+                    let ctx = connect_fn(&virt_display).with_context(|| {
+                        format!(
+                            "virtual screen '{virt_display}' for pid {target_pid} is unreachable (fail-closed)"
+                        )
+                    })?;
+                    return Ok(Some(ResolvedVirtualDisplayWith {
+                        display_id: virt_display,
+                        context: Some(ctx),
+                    }));
+                }
+            }
+        }
+
+        // 3. Scan active virtual screens' window lists for `window_id` or `pid`.
+        if window_id.is_some() || pid.is_some_and(|p| p > 0) {
+            let active_displays: Vec<String> = {
+                let guard = self.screens.lock().unwrap_or_else(|e| e.into_inner());
+                guard.keys().cloned().collect()
+            };
+            for display_id in active_displays {
+                let Ok(ctx) = connect_fn(&display_id) else {
+                    continue;
+                };
+                if let Some(wid) = window_id {
+                    if window_match_fn(&ctx, wid) {
+                        return Ok(Some(ResolvedVirtualDisplayWith {
+                            display_id,
+                            context: Some(ctx),
+                        }));
+                    }
+                } else if let Some(target_pid) = pid.filter(|&p| p > 0) {
+                    if pid_window_match_fn(&ctx, target_pid) {
+                        return Ok(Some(ResolvedVirtualDisplayWith {
+                            display_id,
+                            context: Some(ctx),
+                        }));
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+}
+
+/// Generic resolution result carrying either `X11ScreenContext` or a test stub.
+#[derive(Debug, Clone)]
+pub struct ResolvedVirtualDisplayWith<C> {
+    pub display_id: String,
+    pub context: Option<C>,
+}
+
+pub type ResolvedVirtualDisplay = ResolvedVirtualDisplayWith<std::sync::Arc<X11ScreenContext>>;
+
+/// Normalize a `DISPLAY` string such as `":99"` or `":99.0"` into `Some(":99")`
+/// when its display number falls within `VIRTUAL_DISPLAY_MIN..=VIRTUAL_DISPLAY_MAX`.
+pub(crate) fn normalize_virtual_display_id(display: &str) -> Option<String> {
+    let trimmed = display.trim();
+    let rest = trimmed.strip_prefix(':')?;
+    let num_part = rest.split('.').next()?;
+    let num = num_part.parse::<u16>().ok()?;
+    (VIRTUAL_DISPLAY_MIN..=VIRTUAL_DISPLAY_MAX)
+        .contains(&num)
+        .then(|| format!(":{num}"))
+}
+
+/// Extract the `DISPLAY` variable value from NUL-delimited `/proc/<pid>/environ` bytes.
+pub(crate) fn read_proc_display_from_bytes(bytes: &[u8]) -> Option<String> {
+    for entry in bytes.split(|&b| b == 0) {
+        if let Some(val) = entry.strip_prefix(b"DISPLAY=") {
+            let s = String::from_utf8_lossy(val).trim().to_owned();
+            if !s.is_empty() {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
+fn read_proc_display(pid: u32) -> Option<String> {
+    let bytes = fs::read(format!("/proc/{pid}/environ")).ok()?;
+    read_proc_display_from_bytes(&bytes)
 }
 
 /// Process-wide shared [`VirtualScreenManager`].
@@ -1024,5 +1225,140 @@ mod tests {
                 "{removed} should be explicitly removed"
             );
         }
+    }
+
+    #[test]
+    fn proc_display_parsing_and_virtual_normalization() {
+        let env_bytes = b"PATH=/usr/bin\0DISPLAY=:105.0\0HOME=/home/user\0";
+        assert_eq!(
+            read_proc_display_from_bytes(env_bytes).as_deref(),
+            Some(":105.0")
+        );
+        assert_eq!(read_proc_display_from_bytes(b"HOME=/root\0DISPLAY=\0"), None);
+
+        assert_eq!(
+            normalize_virtual_display_id(":99").as_deref(),
+            Some(":99")
+        );
+        assert_eq!(
+            normalize_virtual_display_id(":105.0").as_deref(),
+            Some(":105")
+        );
+        assert_eq!(normalize_virtual_display_id(":0"), None);
+        assert_eq!(normalize_virtual_display_id(":0.0"), None);
+        assert_eq!(normalize_virtual_display_id(":98"), None);
+        assert_eq!(normalize_virtual_display_id(":200"), None);
+    }
+
+    #[test]
+    fn reverse_lookup_launched_pid_and_window_id_routes_to_virtual_screen() {
+        let mgr = VirtualScreenManager::new();
+        mgr.insert_test_screen_for_routing(":132", "sess-a");
+        mgr.insert_test_launched_pid(":132", 4242);
+
+        // 1. Matched by launched_pids
+        let hit = mgr
+            .resolve_target_for_args_with(
+                None,
+                None,
+                Some(4242),
+                None,
+                |_| None,
+                |d| Ok(format!("ctx:{d}")),
+                |_, _| false,
+                |_, _| false,
+            )
+            .expect("should resolve")
+            .expect("should match virtual screen");
+        assert_eq!(hit.display_id, ":132");
+        assert_eq!(hit.context.as_deref(), Some("ctx::132"));
+
+        // 2. Matched by active window list for window_id
+        let hit_wid = mgr
+            .resolve_target_for_args_with(
+                None,
+                None,
+                None,
+                Some(0x0040_0007),
+                |_| None,
+                |d| Ok(format!("ctx:{d}")),
+                |ctx, wid| ctx == "ctx::132" && wid == 0x0040_0007,
+                |_, _| false,
+            )
+            .expect("should resolve")
+            .expect("should match virtual screen by window_id");
+        assert_eq!(hit_wid.display_id, ":132");
+        assert_eq!(hit_wid.context.as_deref(), Some("ctx::132"));
+
+        mgr.remove_test_screen(":132");
+    }
+
+    #[test]
+    fn reverse_lookup_proc_environ_fail_closed_when_destroyed_or_unreachable() {
+        let mgr = VirtualScreenManager::new();
+        mgr.insert_test_screen_for_routing(":135", "sess-b");
+
+        // Active virtual screen in /proc/<pid>/environ -> resolves to :135
+        let ok = mgr
+            .resolve_target_for_args_with(
+                None,
+                None,
+                Some(5555),
+                None,
+                |_| Some(":135.0".to_owned()),
+                |d| Ok(format!("ctx:{d}")),
+                |_, _| false,
+                |_, _| false,
+            )
+            .expect("active virtual screen should succeed")
+            .expect("should hit :135");
+        assert_eq!(ok.display_id, ":135");
+
+        // Active virtual screen but X11 connect fails -> Fail-Closed Err
+        let err = mgr
+            .resolve_target_for_args_with::<String>(
+                None,
+                None,
+                Some(5555),
+                None,
+                |_| Some(":135".to_owned()),
+                |d| Err(anyhow!("connection refused on {d}")),
+                |_, _| false,
+                |_, _| false,
+            )
+            .expect_err("unreachable virtual screen must fail-closed");
+        assert!(err.to_string().contains("fail-closed"));
+
+        // Destroyed / unmanaged virtual screen (:136) -> Fail-Closed Err (never falls back to :0.0)
+        let destroyed_err = mgr
+            .resolve_target_for_args_with::<String>(
+                None,
+                None,
+                Some(6666),
+                None,
+                |_| Some(":136".to_owned()),
+                |d| Ok(format!("ctx:{d}")),
+                |_, _| false,
+                |_, _| false,
+            )
+            .expect_err("destroyed virtual screen must fail-closed");
+        assert!(destroyed_err.to_string().contains("refusing fallback"));
+
+        // Primary display (:0.0) -> Ok(None) (allowed to proceed on primary)
+        let primary = mgr
+            .resolve_target_for_args_with(
+                None,
+                None,
+                Some(7777),
+                None,
+                |_| Some(":0.0".to_owned()),
+                |d| Ok(format!("ctx:{d}")),
+                |_, _| false,
+                |_, _| false,
+            )
+            .expect("primary display should not error");
+        assert!(primary.is_none());
+
+        mgr.remove_test_screen(":135");
     }
 }

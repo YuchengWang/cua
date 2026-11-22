@@ -88,11 +88,30 @@ pub fn ensure_session_bus_discovered() -> bool {
     }
 }
 
+/// Check whether `display_id` refers to an isolated virtual X11 display (`:99`..`:199`).
+fn is_virtual_display_id(display_id: &str) -> bool {
+    let Some(rest) = display_id.trim().strip_prefix(':') else {
+        return false;
+    };
+    let num_part = rest.split('.').next().unwrap_or("");
+    let Ok(num) = num_part.parse::<u16>() else {
+        return false;
+    };
+    (99..=199).contains(&num)
+}
+
 /// Resolve `DBUS_SESSION_BUS_ADDRESS` for a specific X11 `display_id` (e.g. `":99"`)
 /// without mutating process-global environment variables.
+///
+/// For virtual displays (`:99`..`:199`), never fall back to the host process's
+/// `DBUS_SESSION_BUS_ADDRESS` or host session discovery when no display-scoped
+/// bus is found.
 pub fn resolve_for_display(display_id: &str) -> Option<String> {
     if let Some(addr) = discover_session_bus_for_display(display_id) {
         return Some(addr);
+    }
+    if is_virtual_display_id(display_id) {
+        return None;
     }
     if let Ok(existing) = std::env::var("DBUS_SESSION_BUS_ADDRESS") {
         let trimmed = existing.trim();
@@ -248,5 +267,30 @@ mod tests {
             dbus_address_from_environ(b"OLD_DBUS_SESSION_BUS_ADDRESS=x\0"),
             None
         );
+    }
+
+    #[test]
+    fn virtual_display_detection_matches_virtual_range() {
+        assert!(is_virtual_display_id(":99"));
+        assert!(is_virtual_display_id(":132"));
+        assert!(is_virtual_display_id(":199"));
+        assert!(is_virtual_display_id(":99.0"));
+        assert!(!is_virtual_display_id(":0"));
+        assert!(!is_virtual_display_id(":1"));
+        assert!(!is_virtual_display_id("primary"));
+    }
+
+    #[test]
+    fn virtual_display_does_not_fallback_to_host_dbus_env() {
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var_os("DBUS_SESSION_BUS_ADDRESS");
+        std::env::set_var("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/host-session-bus");
+        let resolved = resolve_for_display(":198");
+        match prev {
+            Some(v) => std::env::set_var("DBUS_SESSION_BUS_ADDRESS", v),
+            None => std::env::remove_var("DBUS_SESSION_BUS_ADDRESS"),
+        }
+        assert_eq!(resolved, None);
     }
 }

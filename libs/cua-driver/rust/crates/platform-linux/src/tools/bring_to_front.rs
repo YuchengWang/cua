@@ -50,6 +50,13 @@ impl Tool for BringToFrontTool {
 
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
+        match super::mcp_virtual_screen::resolve_virtual_target_from_args(&args) {
+            Ok(Some(target)) => {
+                return super::mcp_virtual_screen::virtual_bring_to_front(target, &args).await;
+            }
+            Err(err) => return err,
+            Ok(None) => {}
+        }
         let pid = args.u64_or("pid", 0) as u32;
         if crate::wayland::is_wayland() {
             let window_id = match args.opt_u64("window_id") {

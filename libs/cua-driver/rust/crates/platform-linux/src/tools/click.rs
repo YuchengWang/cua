@@ -1001,8 +1001,12 @@ impl Tool for ClickTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
-        if let Some(display_id) = super::mcp_virtual_screen::resolve_virtual_display_from_args(&args) {
-            return super::mcp_virtual_screen::virtual_click(display_id, &args).await;
+        match super::mcp_virtual_screen::resolve_virtual_target_from_args(&args) {
+            Ok(Some(target)) => {
+                return super::mcp_virtual_screen::virtual_click(target.display_id, &args).await;
+            }
+            Err(err) => return err,
+            Ok(None) => {}
         }
         let cursor_id = resolve_cursor_key(&args);
         let modifiers: Vec<String> = args.str_array("modifier");

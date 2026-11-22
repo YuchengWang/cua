@@ -18,18 +18,75 @@ use cua_driver_core::{
 use serde_json::{json, Value};
 
 use crate::x11::virtual_input::{
-    xtest_click, xtest_drag, xtest_focus_window, xtest_hotkey, xtest_press_key, xtest_scroll,
-    xtest_type_text,
+    xtest_click, xtest_double_click, xtest_drag, xtest_focus_window, xtest_hotkey,
+    xtest_mouse_button_down, xtest_mouse_button_up, xtest_move_cursor, xtest_press_key,
+    xtest_scroll, xtest_type_text,
 };
-use crate::x11::virtual_screen::{global_virtual_screen_manager, CreateVirtualScreenRequest};
+use crate::x11::virtual_screen::{
+    global_virtual_screen_manager, CreateVirtualScreenRequest, ResolvedVirtualDisplay,
+};
 
-pub(crate) fn resolve_virtual_display_from_args(args: &Value) -> Option<String> {
-    let session = args.opt_str("session");
-    let explicit = args
-        .get("target")
+fn extract_explicit_display_id(args: &Value) -> Option<&str> {
+    args.get("target")
         .and_then(|t| t.get("display_id"))
-        .and_then(Value::as_str);
-    global_virtual_screen_manager().resolve_display_for_session(session.as_deref(), explicit)
+        .and_then(Value::as_str)
+        .or_else(|| args.get("display_id").and_then(Value::as_str))
+}
+
+fn extract_target_pid(args: &Value) -> Option<u32> {
+    args.get("pid")
+        .and_then(Value::as_u64)
+        .or_else(|| args.get("target").and_then(|t| t.get("pid")).and_then(Value::as_u64))
+        .and_then(|v| u32::try_from(v).ok())
+}
+
+fn extract_target_window_id(args: &Value) -> Option<u64> {
+    args.get("window_id")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            args.get("target")
+                .and_then(|t| t.get("window_id"))
+                .and_then(Value::as_u64)
+        })
+}
+
+pub(crate) fn resolve_virtual_target_from_args(
+    args: &Value,
+) -> Result<Option<ResolvedVirtualDisplay>, ToolResult> {
+    let session = args.opt_str("session");
+    let explicit = extract_explicit_display_id(args);
+    let pid = extract_target_pid(args);
+    let window_id = extract_target_window_id(args);
+    global_virtual_screen_manager()
+        .resolve_target_for_args(session.as_deref(), explicit, pid, window_id)
+        .map_err(|err| {
+            ToolResult::error(format!(
+                "virtual display routing failed (fail-closed): {err:#}"
+            ))
+            .with_structured(json!({
+                "code": "virtual_screen_unavailable",
+                "fail_closed": true,
+            }))
+        })
+}
+
+#[allow(dead_code)]
+pub(crate) fn resolve_virtual_display_from_args(args: &Value) -> Option<String> {
+    resolve_virtual_target_from_args(args)
+        .ok()
+        .flatten()
+        .map(|resolved| resolved.display_id)
+}
+
+fn resolve_target_context(
+    target: ResolvedVirtualDisplay,
+) -> anyhow::Result<(String, std::sync::Arc<crate::x11::context::X11ScreenContext>)> {
+    let display_id = target.display_id;
+    let ctx = match target.context {
+        Some(ctx) => ctx,
+        None => global_virtual_screen_manager().connect_context(&display_id)?,
+    };
+    Ok((display_id, ctx))
 }
 
 fn resolve_target_xy(
@@ -307,6 +364,631 @@ pub(crate) async fn virtual_get_window_state(display_id: String, args: &Value) -
     }
 }
 
+pub(crate) async fn virtual_double_click(
+    target: ResolvedVirtualDisplay,
+    args: &Value,
+) -> ToolResult {
+    let args = args.clone();
+    match tokio::task::spawn_blocking(move || -> anyhow::Result<ToolResult> {
+        let (display_id, ctx) = resolve_target_context(target)?;
+        let (x, y) = resolve_target_xy(&ctx, &args)?;
+        let button = match args.opt_str("button").as_deref() {
+            Some("right") => 3,
+            Some("middle") => 2,
+            _ => 1,
+        };
+        xtest_double_click(&ctx, x, y, button)?;
+        Ok(ToolResult::text(format!(
+            "Double-clicked ({x}, {y}) on {display_id}"
+        ))
+        .with_structured(json!({ "display_id": display_id, "x": x, "y": y, "ok": true })))
+    })
+    .await
+    {
+        Ok(Ok(res)) => res,
+        Ok(Err(e)) => ToolResult::error(format!("virtual double_click failed: {e:#}")),
+        Err(e) => ToolResult::error(format!("virtual double_click panicked: {e}")),
+    }
+}
+
+pub(crate) async fn virtual_right_click(
+    target: ResolvedVirtualDisplay,
+    args: &Value,
+) -> ToolResult {
+    let args = args.clone();
+    match tokio::task::spawn_blocking(move || -> anyhow::Result<ToolResult> {
+        let (display_id, ctx) = resolve_target_context(target)?;
+        let (x, y) = resolve_target_xy(&ctx, &args)?;
+        xtest_click(&ctx, x, y, 3)?;
+        Ok(ToolResult::text(format!(
+            "Right-clicked ({x}, {y}) on {display_id}"
+        ))
+        .with_structured(json!({ "display_id": display_id, "x": x, "y": y, "ok": true })))
+    })
+    .await
+    {
+        Ok(Ok(res)) => res,
+        Ok(Err(e)) => ToolResult::error(format!("virtual right_click failed: {e:#}")),
+        Err(e) => ToolResult::error(format!("virtual right_click panicked: {e}")),
+    }
+}
+
+pub(crate) async fn virtual_move_cursor(
+    target: ResolvedVirtualDisplay,
+    args: &Value,
+) -> ToolResult {
+    let args = args.clone();
+    match tokio::task::spawn_blocking(move || -> anyhow::Result<ToolResult> {
+        let (display_id, ctx) = resolve_target_context(target)?;
+        let (x, y) = resolve_target_xy(&ctx, &args)?;
+        xtest_move_cursor(&ctx, x, y)?;
+        Ok(ToolResult::text(format!(
+            "Moved cursor to ({x}, {y}) on {display_id}"
+        ))
+        .with_structured(json!({ "display_id": display_id, "x": x, "y": y, "ok": true })))
+    })
+    .await
+    {
+        Ok(Ok(res)) => res,
+        Ok(Err(e)) => ToolResult::error(format!("virtual move_cursor failed: {e:#}")),
+        Err(e) => ToolResult::error(format!("virtual move_cursor panicked: {e}")),
+    }
+}
+
+pub(crate) async fn virtual_mouse_button_down(
+    state: std::sync::Arc<super::impl_::ToolState>,
+    target: ResolvedVirtualDisplay,
+    args: &Value,
+) -> ToolResult {
+    let cursor_id = super::impl_::resolve_cursor_key(args);
+    if let Some(held) = state.mouse_hold.lock().unwrap().get(&cursor_id).cloned() {
+        return ToolResult::error(format!(
+            "Cursor '{cursor_id}' already has a held mouse button. Call mouse_button_up first."
+        ))
+        .with_structured(super::impl_::mouse_hold_json(&cursor_id, Some(&held)));
+    }
+    let pid = args.u64_or("pid", 0) as u32;
+    let xid = args.opt_u64("window_id").unwrap_or(0);
+    let button_name = args.str_or("button", "left");
+    let button = super::impl_::parse_mouse_button(button_name.as_str());
+    let args_clone = args.clone();
+    match tokio::task::spawn_blocking(move || -> anyhow::Result<(String, i16, i16)> {
+        let (display_id, ctx) = resolve_target_context(target)?;
+        let (x, y) = resolve_target_xy(&ctx, &args_clone)?;
+        xtest_mouse_button_down(&ctx, x, y, button)?;
+        Ok((display_id, x, y))
+    })
+    .await
+    {
+        Ok(Ok((display_id, x, y))) => {
+            let hold = super::impl_::MouseHoldState {
+                pid,
+                xid,
+                button,
+                x: f64::from(x),
+                y: f64::from(y),
+            };
+            state
+                .mouse_hold
+                .lock()
+                .unwrap()
+                .insert(cursor_id.clone(), hold.clone());
+            let mut structured = super::impl_::mouse_hold_json(&cursor_id, Some(&hold));
+            structured["display_id"] = json!(display_id);
+            ToolResult::text(format!(
+                "Held {} button down at ({x}, {y}) on {display_id}",
+                super::impl_::mouse_button_name(button)
+            ))
+            .with_structured(structured)
+        }
+        Ok(Err(e)) => ToolResult::error(format!("virtual mouse_button_down failed: {e:#}")),
+        Err(e) => ToolResult::error(format!("virtual mouse_button_down panicked: {e}")),
+    }
+}
+
+pub(crate) async fn virtual_mouse_button_up(
+    state: std::sync::Arc<super::impl_::ToolState>,
+    target: ResolvedVirtualDisplay,
+    args: &Value,
+) -> ToolResult {
+    let cursor_id = super::impl_::resolve_cursor_key(args);
+    let held = state.mouse_hold.lock().unwrap().get(&cursor_id).cloned();
+    let button = held
+        .as_ref()
+        .map(|h| h.button)
+        .unwrap_or_else(|| super::impl_::parse_mouse_button(args.str_or("button", "left").as_str()));
+    let fallback_xy = held
+        .as_ref()
+        .map(|h| (h.x.round() as i16, h.y.round() as i16))
+        .unwrap_or((0, 0));
+    let args_clone = args.clone();
+    match tokio::task::spawn_blocking(move || -> anyhow::Result<(String, i16, i16)> {
+        let (display_id, ctx) = resolve_target_context(target)?;
+        let (x, y) = resolve_target_xy(&ctx, &args_clone).unwrap_or(fallback_xy);
+        xtest_mouse_button_up(&ctx, x, y, button)?;
+        Ok((display_id, x, y))
+    })
+    .await
+    {
+        Ok(Ok((display_id, x, y))) => {
+            super::impl_::clear_mouse_hold_after_release(&state, &cursor_id);
+            let mut structured = super::impl_::mouse_hold_json(&cursor_id, None);
+            structured["display_id"] = json!(display_id);
+            structured["x"] = json!(x);
+            structured["y"] = json!(y);
+            ToolResult::text(format!(
+                "Released {} button at ({x}, {y}) on {display_id}",
+                super::impl_::mouse_button_name(button)
+            ))
+            .with_structured(structured)
+        }
+        Ok(Err(e)) => ToolResult::error(format!("virtual mouse_button_up failed: {e:#}")),
+        Err(e) => ToolResult::error(format!("virtual mouse_button_up panicked: {e}")),
+    }
+}
+
+pub(crate) async fn virtual_mouse_drag(
+    state: std::sync::Arc<super::impl_::ToolState>,
+    target: ResolvedVirtualDisplay,
+    args: &Value,
+) -> ToolResult {
+    let cursor_id = super::impl_::resolve_cursor_key(args);
+    let Some(mut hold) = state.mouse_hold.lock().unwrap().get(&cursor_id).cloned() else {
+        return ToolResult::error(format!(
+            "No mouse button is currently held for cursor '{cursor_id}'. Call mouse_button_down first."
+        ))
+        .with_structured(super::impl_::mouse_hold_json(&cursor_id, None));
+    };
+    let steps = super::impl_::drag_steps(args);
+    let duration_ms = args.u64_or("duration_ms", 500);
+    let args_clone = args.clone();
+    let from_x = hold.x;
+    let from_y = hold.y;
+    match tokio::task::spawn_blocking(move || -> anyhow::Result<(String, i16, i16)> {
+        let (display_id, ctx) = resolve_target_context(target)?;
+        let (to_x, to_y) = resolve_target_xy(&ctx, &args_clone)?;
+        let step_delay_ms = if steps > 1 {
+            duration_ms / steps as u64
+        } else {
+            duration_ms
+        };
+        for i in 1..=steps {
+            let t = i as f64 / steps as f64;
+            let ix = (from_x + (f64::from(to_x) - from_x) * t).round() as i16;
+            let iy = (from_y + (f64::from(to_y) - from_y) * t).round() as i16;
+            xtest_move_cursor(&ctx, ix, iy)?;
+            if step_delay_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(step_delay_ms));
+            }
+        }
+        Ok((display_id, to_x, to_y))
+    })
+    .await
+    {
+        Ok(Ok((display_id, to_x, to_y))) => {
+            hold.x = f64::from(to_x);
+            hold.y = f64::from(to_y);
+            state
+                .mouse_hold
+                .lock()
+                .unwrap()
+                .insert(cursor_id.clone(), hold.clone());
+            let mut structured = super::impl_::mouse_hold_json(&cursor_id, Some(&hold));
+            structured["display_id"] = json!(display_id);
+            ToolResult::text(format!(
+                "Dragged held {} button to ({to_x}, {to_y}) on {display_id}",
+                super::impl_::mouse_button_name(hold.button)
+            ))
+            .with_structured(structured)
+        }
+        Ok(Err(e)) => ToolResult::error(format!("virtual mouse_drag failed: {e:#}")),
+        Err(e) => ToolResult::error(format!("virtual mouse_drag panicked: {e}")),
+    }
+}
+
+pub(crate) async fn virtual_parallel_mouse_drag(
+    target: ResolvedVirtualDisplay,
+    args: &Value,
+) -> ToolResult {
+    let args = args.clone();
+    match tokio::task::spawn_blocking(move || -> anyhow::Result<ToolResult> {
+        let (display_id, ctx) = resolve_target_context(target)?;
+        let Some(items) = args.get("drags").and_then(Value::as_array) else {
+            anyhow::bail!("drags[] is required");
+        };
+        for item in items {
+            let xid = item.get("window_id").and_then(Value::as_u64);
+            let win_offset = xid
+                .and_then(|w| crate::x11::window_info_with_context(&ctx, w))
+                .map(|info| (info.x, info.y))
+                .unwrap_or((0, 0));
+            let button = super::impl_::parse_mouse_button(
+                item.get("button")
+                    .and_then(Value::as_str)
+                    .unwrap_or("left"),
+            );
+            let points: Vec<(i16, i16)> =
+                if let Some(pts) = item.get("path").and_then(Value::as_array) {
+                    pts.iter()
+                        .filter_map(|p| {
+                            let arr = p.as_array()?;
+                            let px = arr.first()?.as_f64()?;
+                            let py = arr.get(1)?.as_f64()?;
+                            Some((
+                                (win_offset.0 + px.round() as i32) as i16,
+                                (win_offset.1 + py.round() as i32) as i16,
+                            ))
+                        })
+                        .collect()
+                } else {
+                    let g = |k: &str| item.get(k).and_then(Value::as_f64);
+                    match (g("from_x"), g("from_y"), g("to_x"), g("to_y")) {
+                        (Some(fx), Some(fy), Some(tx), Some(ty)) => vec![
+                            (
+                                (win_offset.0 + fx.round() as i32) as i16,
+                                (win_offset.1 + fy.round() as i32) as i16,
+                            ),
+                            (
+                                (win_offset.0 + tx.round() as i32) as i16,
+                                (win_offset.1 + ty.round() as i32) as i16,
+                            ),
+                        ],
+                        _ => anyhow::bail!("each drag item requires path[] or from_x/from_y/to_x/to_y"),
+                    }
+                };
+            if let (Some(&first), Some(&last)) = (points.first(), points.last()) {
+                xtest_mouse_button_down(&ctx, first.0, first.1, button)?;
+                for &(px, py) in &points[1..] {
+                    xtest_move_cursor(&ctx, px, py)?;
+                }
+                xtest_mouse_button_up(&ctx, last.0, last.1, button)?;
+            }
+        }
+        Ok(ToolResult::text(format!(
+            "Executed {} parallel drags on {display_id}",
+            items.len()
+        ))
+        .with_structured(json!({ "display_id": display_id, "count": items.len(), "ok": true })))
+    })
+    .await
+    {
+        Ok(Ok(res)) => res,
+        Ok(Err(e)) => ToolResult::error(format!("virtual parallel_mouse_drag failed: {e:#}")),
+        Err(e) => ToolResult::error(format!("virtual parallel_mouse_drag panicked: {e}")),
+    }
+}
+
+pub(crate) async fn virtual_type_text_chars(
+    target: ResolvedVirtualDisplay,
+    args: &Value,
+) -> ToolResult {
+    let Some(text_raw) = args.opt_str("text") else {
+        return ToolResult::error("text is required");
+    };
+    let text = cua_driver_core::text_sanitize::strip_trailing_agent_protocol_tags(&text_raw)
+        .into_owned();
+    let delay_ms = cua_driver_core::type_pacing::delay_from_args(args);
+    let window_id = extract_target_window_id(args);
+    let pid = extract_target_pid(args);
+    match tokio::task::spawn_blocking(move || -> anyhow::Result<ToolResult> {
+        let (display_id, ctx) = resolve_target_context(target)?;
+        let focus_wid = window_id.or_else(|| {
+            pid.and_then(|p| {
+                crate::x11::list_windows_with_context(&ctx, Some(p))
+                    .into_iter()
+                    .next()
+                    .map(|w| w.xid)
+            })
+        });
+        if let Some(wid) = focus_wid {
+            xtest_focus_window(&ctx, wid)?;
+        }
+        if delay_ms == 0 || !text.is_ascii() {
+            xtest_type_text(&ctx, &text)?;
+        } else {
+            for ch in text.chars() {
+                let key_str = match ch {
+                    '\n' | '\r' => "Return".to_owned(),
+                    '\t' => "Tab".to_owned(),
+                    ' ' => "space".to_owned(),
+                    _ => ch.to_string(),
+                };
+                xtest_press_key(&ctx, &key_str)?;
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            }
+        }
+        let char_count = text.chars().count();
+        Ok(ToolResult::text(format!(
+            "Typed {char_count} character(s) with {delay_ms}ms delay on {display_id}."
+        ))
+        .with_structured(json!({ "display_id": display_id, "characters": char_count, "ok": true })))
+    })
+    .await
+    {
+        Ok(Ok(res)) => res,
+        Ok(Err(e)) => ToolResult::error(format!("virtual type_text_chars failed: {e:#}")),
+        Err(e) => ToolResult::error(format!("virtual type_text_chars panicked: {e}")),
+    }
+}
+
+pub(crate) async fn virtual_bring_to_front(
+    target: ResolvedVirtualDisplay,
+    args: &Value,
+) -> ToolResult {
+    let pid = extract_target_pid(args).unwrap_or(0);
+    let window_id = extract_target_window_id(args);
+    match tokio::task::spawn_blocking(move || -> anyhow::Result<ToolResult> {
+        let (display_id, ctx) = resolve_target_context(target)?;
+        let xid = match window_id {
+            Some(w) => w,
+            None => crate::x11::list_windows_with_context(
+                &ctx,
+                if pid == 0 { None } else { Some(pid) },
+            )
+            .into_iter()
+            .next()
+            .map(|w| w.xid)
+            .ok_or_else(|| anyhow::anyhow!("no windows found on {display_id} for pid {pid}"))?,
+        };
+        let prior = crate::x11::active_window_with_context(&ctx);
+        xtest_focus_window(&ctx, xid)?;
+        Ok(ToolResult::text(format!(
+            "Brought window {xid} to front on {display_id}."
+        ))
+        .with_structured(json!({
+            "display_id": display_id,
+            "window_id": xid,
+            "prior_active": prior,
+            "platform": "linux",
+        })))
+    })
+    .await
+    {
+        Ok(Ok(res)) => res,
+        Ok(Err(e)) => ToolResult::error(format!("virtual bring_to_front failed: {e:#}")),
+        Err(e) => ToolResult::error(format!("virtual bring_to_front panicked: {e}")),
+    }
+}
+
+pub(crate) async fn virtual_set_window_frame(
+    target: ResolvedVirtualDisplay,
+    args: &Value,
+) -> ToolResult {
+    let args = args.clone();
+    match tokio::task::spawn_blocking(move || -> anyhow::Result<ToolResult> {
+        let (display_id, ctx) = resolve_target_context(target)?;
+        let pid = extract_target_pid(&args).ok_or_else(|| anyhow::anyhow!("pid is required"))?;
+        let window_id =
+            extract_target_window_id(&args).ok_or_else(|| anyhow::anyhow!("window_id is required"))?;
+        let x = args
+            .get("x")
+            .and_then(Value::as_f64)
+            .ok_or_else(|| anyhow::anyhow!("x is required"))?
+            .round() as i32;
+        let y = args
+            .get("y")
+            .and_then(Value::as_f64)
+            .ok_or_else(|| anyhow::anyhow!("y is required"))?
+            .round() as i32;
+        let width = args
+            .get("width")
+            .and_then(Value::as_f64)
+            .ok_or_else(|| anyhow::anyhow!("width is required"))?
+            .round() as u32;
+        let height = args
+            .get("height")
+            .and_then(Value::as_f64)
+            .ok_or_else(|| anyhow::anyhow!("height is required"))?
+            .round() as u32;
+        let (observed, confirmed, mutation_error) =
+            crate::x11::set_window_frame_with_context(&ctx, window_id, pid, x, y, width, height)?;
+        let observed_frame = observed.map(|w| (w.x, w.y, w.width, w.height));
+        Ok(ToolResult::text(if confirmed {
+            format!("Set and verified window {window_id} frame on {display_id}.")
+        } else {
+            format!("Attempted window {window_id} frame mutation on {display_id}.")
+        })
+        .with_structured(json!({
+            "display_id": display_id,
+            "window_id": window_id,
+            "confirmed": confirmed,
+            "observed": observed_frame,
+            "mutation_error": mutation_error,
+        })))
+    })
+    .await
+    {
+        Ok(Ok(res)) => res,
+        Ok(Err(e)) => ToolResult::error(format!("virtual set_window_frame failed: {e:#}")),
+        Err(e) => ToolResult::error(format!("virtual set_window_frame panicked: {e}")),
+    }
+}
+
+pub(crate) async fn virtual_get_cursor_position(target: ResolvedVirtualDisplay) -> ToolResult {
+    match tokio::task::spawn_blocking(move || -> anyhow::Result<ToolResult> {
+        use x11rb::protocol::xproto::ConnectionExt as _;
+        let (display_id, ctx) = resolve_target_context(target)?;
+        let root = ctx.root_window();
+        let reply = ctx.conn.query_pointer(root)?.reply()?;
+        let x = i32::from(reply.root_x);
+        let y = i32::from(reply.root_y);
+        Ok(ToolResult::text(format!("Cursor at ({x}, {y}) on {display_id}"))
+            .with_structured(json!({
+                "display_id": display_id,
+                "x": x,
+                "y": y,
+                "source": "x11_virtual",
+            })))
+    })
+    .await
+    {
+        Ok(Ok(res)) => res,
+        Ok(Err(e)) => ToolResult::error(format!("virtual get_cursor_position failed: {e:#}")),
+        Err(e) => ToolResult::error(format!("virtual get_cursor_position panicked: {e}")),
+    }
+}
+
+pub(crate) async fn virtual_get_accessibility_tree(target: ResolvedVirtualDisplay) -> ToolResult {
+    match tokio::task::spawn_blocking(move || -> anyhow::Result<ToolResult> {
+        let (display_id, ctx) = resolve_target_context(target)?;
+        let windows = super::impl_::visible_live_desktop_windows(
+            crate::x11::list_windows_with_context(&ctx, None),
+        );
+        let procs = crate::proc_fs::list_processes();
+        let mut lines = vec![format!(
+            "{} running process(es), {} visible window(s) on {}",
+            procs.len(),
+            windows.len(),
+            display_id
+        )];
+        for w in &windows {
+            let title = if w.title.is_empty() {
+                "(no title)".to_owned()
+            } else {
+                format!("\"{}\"", w.title)
+            };
+            lines.push(format!(
+                "- pid={} window_id={} {} {}x{}+{}+{}",
+                w.pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
+                w.xid,
+                title,
+                w.width,
+                w.height,
+                w.x,
+                w.y
+            ));
+        }
+        Ok(ToolResult::text(lines.join("\n")).with_structured(json!({
+            "display_id": display_id,
+            "processes": procs.iter().map(|p| json!({"pid": p.pid, "name": p.name})).collect::<Vec<_>>(),
+            "windows": windows.iter().map(super::impl_::window_record_json).collect::<Vec<_>>(),
+        })))
+    })
+    .await
+    {
+        Ok(Ok(res)) => res,
+        Ok(Err(e)) => ToolResult::error(format!("virtual get_accessibility_tree failed: {e:#}")),
+        Err(e) => ToolResult::error(format!("virtual get_accessibility_tree panicked: {e}")),
+    }
+}
+
+pub(crate) async fn virtual_invoke_menu(
+    target: ResolvedVirtualDisplay,
+    args: &Value,
+) -> ToolResult {
+    let args = args.clone();
+    match tokio::task::spawn_blocking(move || -> anyhow::Result<ToolResult> {
+        let (display_id, ctx) = resolve_target_context(target)?;
+        let pid = extract_target_pid(&args).ok_or_else(|| anyhow::anyhow!("pid is required"))?;
+        let window_id =
+            extract_target_window_id(&args).ok_or_else(|| anyhow::anyhow!("window_id is required"))?;
+        let windows = crate::x11::list_windows_with_context(&ctx, Some(pid));
+        if !windows.iter().any(|w| w.xid == window_id) {
+            anyhow::bail!("window_id {window_id} does not belong to pid {pid} on {display_id}");
+        }
+        let path: Vec<String> = args
+            .get("path")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(ToOwned::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if path.is_empty() {
+            anyhow::bail!("path is required");
+        }
+        xtest_focus_window(&ctx, window_id)?;
+        crate::atspi::native::invoke_menu_path_in(
+            pid,
+            window_id,
+            &path,
+            crate::atspi::native::MenuOpening::Allowed,
+        )?;
+        Ok(ToolResult::text(format!(
+            "Invoked menu path {:?} on window {window_id} ({display_id})",
+            path
+        ))
+        .with_structured(json!({ "display_id": display_id, "window_id": window_id, "ok": true })))
+    })
+    .await
+    {
+        Ok(Ok(res)) => res,
+        Ok(Err(e)) => ToolResult::error(format!("virtual invoke_menu failed: {e:#}")),
+        Err(e) => ToolResult::error(format!("virtual invoke_menu panicked: {e}")),
+    }
+}
+
+pub(crate) async fn virtual_set_value(
+    state: std::sync::Arc<super::impl_::ToolState>,
+    target: ResolvedVirtualDisplay,
+    args: &Value,
+) -> ToolResult {
+    let value = match args.get("value") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        _ => return ToolResult::error("set_value: 'value' must be a string or a number."),
+    };
+    let pid = extract_target_pid(args).unwrap_or(0);
+    let resolved = match state.snapshots.resolve(pid as i32, args) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let window_id = match &resolved {
+        cua_driver_core::element_token::ResolvedElement::Element { window_id, .. } => {
+            Some(*window_id)
+        }
+        cua_driver_core::element_token::ResolvedElement::None => extract_target_window_id(args),
+    };
+    let args_clone = args.clone();
+    match tokio::task::spawn_blocking(move || -> anyhow::Result<ToolResult> {
+        let (display_id, ctx) = resolve_target_context(target)?;
+        let focus_wid = window_id.or_else(|| {
+            if pid > 0 {
+                crate::x11::list_windows_with_context(&ctx, Some(pid))
+                    .into_iter()
+                    .next()
+                    .map(|w| w.xid)
+            } else {
+                None
+            }
+        });
+        if let Some(wid) = focus_wid {
+            xtest_focus_window(&ctx, wid)?;
+        }
+        if let (Some(x), Some(y)) = (
+            args_clone.get("x").and_then(Value::as_f64),
+            args_clone.get("y").and_then(Value::as_f64),
+        ) {
+            let (sx, sy) = if let Some(info) =
+                focus_wid.and_then(|wid| crate::x11::window_info_with_context(&ctx, wid))
+            {
+                (
+                    (info.x + x.round() as i32) as i16,
+                    (info.y + y.round() as i32) as i16,
+                )
+            } else {
+                (x.round() as i16, y.round() as i16)
+            };
+            xtest_click(&ctx, sx, sy, 1)?;
+        }
+        xtest_hotkey(&ctx, &["ctrl".to_owned(), "a".to_owned()])?;
+        xtest_type_text(&ctx, &value)?;
+        xtest_press_key(&ctx, "Tab")?;
+        Ok(ToolResult::text(format!(
+            "Set value on {display_id} ({} chars)",
+            value.chars().count()
+        ))
+        .with_structured(json!({ "display_id": display_id, "ok": true })))
+    })
+    .await
+    {
+        Ok(Ok(res)) => res,
+        Ok(Err(e)) => ToolResult::error(format!("virtual set_value failed: {e:#}")),
+        Err(e) => ToolResult::error(format!("virtual set_value panicked: {e}")),
+    }
+}
+
 // ── create_virtual_screen ─────────────────────────────────────────────────────
 
 pub struct CreateVirtualScreenTool;
@@ -556,5 +1238,38 @@ mod tests {
         assert_eq!(val_with_pid["pid"], 4242);
         cua_driver_contract::validate_success_output("get_window_state", val_with_pid)
             .expect("WindowStateOutput with pid must pass contract validation");
+    }
+
+    #[test]
+    fn resolve_virtual_display_from_args_handles_target_top_level_and_session() {
+        use super::{resolve_virtual_display_from_args, resolve_virtual_target_from_args};
+        use crate::x11::virtual_screen::global_virtual_screen_manager;
+        use serde_json::json;
+
+        assert_eq!(
+            resolve_virtual_display_from_args(&json!({ "target": { "display_id": ":140" } }))
+                .as_deref(),
+            Some(":140")
+        );
+        assert_eq!(
+            resolve_virtual_display_from_args(&json!({ "display_id": ":141" })).as_deref(),
+            Some(":141")
+        );
+        assert_eq!(
+            resolve_virtual_display_from_args(&json!({ "display_id": "primary" })),
+            None
+        );
+
+        let mgr = global_virtual_screen_manager();
+        mgr.insert_test_screen_for_routing(":142", "routing-test-session");
+        let by_session = resolve_virtual_target_from_args(&json!({
+            "session": "routing-test-session",
+            "x": 10,
+            "y": 20
+        }))
+        .expect("session lookup should succeed")
+        .expect("should match :142");
+        assert_eq!(by_session.display_id, ":142");
+        mgr.remove_test_screen(":142");
     }
 }

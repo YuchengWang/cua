@@ -148,6 +148,14 @@ impl Tool for InvokeMenuTool {
             ActionEffect, ActionExecutionRecord, ActionTransport, ActualDelivery, RequestedDelivery,
         };
 
+        match super::mcp_virtual_screen::resolve_virtual_target_from_args(&args) {
+            Ok(Some(target)) => {
+                return super::mcp_virtual_screen::virtual_invoke_menu(target, &args).await;
+            }
+            Err(err) => return err,
+            Ok(None) => {}
+        }
+
         // Menu paths are resolved and fired through AT-SPI, which needs no
         // window activation on X11: the default is background (focus-free,
         // under the focus guard). `delivery_mode:"foreground"` is the explicit

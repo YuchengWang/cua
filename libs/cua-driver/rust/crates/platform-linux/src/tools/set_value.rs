@@ -48,6 +48,18 @@ impl Tool for SetValueTool {
 
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
+        match super::mcp_virtual_screen::resolve_virtual_target_from_args(&args) {
+            Ok(Some(target)) => {
+                return super::mcp_virtual_screen::virtual_set_value(
+                    self.state.clone(),
+                    target,
+                    &args,
+                )
+                .await;
+            }
+            Err(err) => return err,
+            Ok(None) => {}
+        }
         let pid = match args.require_u32("pid") {
             Ok(v) => v,
             Err(e) => return e,

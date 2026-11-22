@@ -52,9 +52,34 @@ pub fn ensure_xauthority_discovered() {
     });
 }
 
+/// Parse virtual X11 display number (`:99`..`:199`, optionally with `.screen`).
+fn parse_virtual_display_num(display_id: &str) -> Option<u16> {
+    let rest = display_id.trim().strip_prefix(':')?;
+    let num_part = rest.split('.').next().unwrap_or("");
+    let num = num_part.parse::<u16>().ok()?;
+    (99..=199).contains(&num).then_some(num)
+}
+
+fn virtual_screen_xauth_path(display_num: u16) -> Option<String> {
+    let path = crate::x11::virtual_screen::VirtualScreenManager::runtime_root()
+        .join(format!("display_{display_num}"))
+        .join("Xauthority");
+    path.exists().then(|| path.to_string_lossy().into_owned())
+}
+
 /// Resolve `XAUTHORITY` for a specific X11 `display_id` (e.g. `":99"`) without
 /// mutating process-global environment variables.
+///
+/// For virtual displays (`:99`..`:199`), only the virtual screen's dedicated
+/// `Xauthority` or a `/proc` X server matching `display_id` is used; never fall
+/// back to the host `XAUTHORITY` environment variable or host X server discovery.
 pub fn resolve_for_display(display_id: &str) -> Option<String> {
+    if let Some(display_num) = parse_virtual_display_num(display_id) {
+        if let Some(auth) = virtual_screen_xauth_path(display_num) {
+            return Some(auth);
+        }
+        return discover_xauth_for_display_from_proc(display_id);
+    }
     if let Some(auth) = discover_xauth_for_display_from_proc(display_id) {
         return Some(auth);
     }
@@ -129,4 +154,68 @@ fn discover_xauth_from_proc() -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn virtual_display_xauth_never_falls_back_to_host_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let host_xauth = dir.path().join("host_Xauthority");
+        std::fs::write(&host_xauth, b"host-cookie").unwrap();
+
+        let prev_home = std::env::var_os("CUA_YCWANG_HOME");
+        let prev_xauth = std::env::var_os("XAUTHORITY");
+        std::env::set_var("CUA_YCWANG_HOME", dir.path());
+        std::env::set_var("XAUTHORITY", &host_xauth);
+
+        let resolved = resolve_for_display(":198");
+
+        match prev_home {
+            Some(v) => std::env::set_var("CUA_YCWANG_HOME", v),
+            None => std::env::remove_var("CUA_YCWANG_HOME"),
+        }
+        match prev_xauth {
+            Some(v) => std::env::set_var("XAUTHORITY", v),
+            None => std::env::remove_var("XAUTHORITY"),
+        }
+
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn virtual_display_prefers_dedicated_virtual_screen_xauthority() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let host_xauth = dir.path().join("host_Xauthority");
+        std::fs::write(&host_xauth, b"host-cookie").unwrap();
+        let virtual_dir = dir.path().join("virtual_screens").join("display_198");
+        std::fs::create_dir_all(&virtual_dir).unwrap();
+        let virtual_xauth = virtual_dir.join("Xauthority");
+        std::fs::write(&virtual_xauth, b"virtual-cookie").unwrap();
+
+        let prev_home = std::env::var_os("CUA_YCWANG_HOME");
+        let prev_xauth = std::env::var_os("XAUTHORITY");
+        std::env::set_var("CUA_YCWANG_HOME", dir.path());
+        std::env::set_var("XAUTHORITY", &host_xauth);
+
+        let resolved = resolve_for_display(":198");
+
+        match prev_home {
+            Some(v) => std::env::set_var("CUA_YCWANG_HOME", v),
+            None => std::env::remove_var("CUA_YCWANG_HOME"),
+        }
+        match prev_xauth {
+            Some(v) => std::env::set_var("XAUTHORITY", v),
+            None => std::env::remove_var("XAUTHORITY"),
+        }
+
+        assert_eq!(resolved.as_deref(), Some(virtual_xauth.to_string_lossy().as_ref()));
+    }
 }

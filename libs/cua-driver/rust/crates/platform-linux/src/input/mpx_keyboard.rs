@@ -67,6 +67,9 @@ fn slave_keyboard_name(master_name: &str) -> String {
 /// The keyboard route needs exactly what the MPX pointer route needs: a real
 /// Xorg with udev/libinput hotplug and a writable `/dev/uinput`.
 pub fn real_keyboard_input_available() -> bool {
+    if !prefer_uinput_enabled() {
+        return false;
+    }
     real_pointer_input_available()
 }
 
@@ -1269,5 +1272,14 @@ mod tests {
         let name = slave_keyboard_name(&owner.master_name(u64::MAX));
         assert!(name.len() <= EVDEV_UINPUT_NAME_MAX_BYTES, "{name}");
         assert!(name.ends_with(UINPUT_KEYBOARD_SUFFIX));
+    }
+
+    #[test]
+    fn real_keyboard_input_disabled_when_prefer_uinput_is_false() {
+        if !prefer_uinput_enabled() {
+            assert!(!real_keyboard_input_available());
+            assert!(!real_pointer_input_available());
+            assert!(!uinput_accessible());
+        }
     }
 }

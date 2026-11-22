@@ -39,6 +39,14 @@ impl Tool for SetWindowFrameTool {
             ActualDelivery, EvidenceKind, RequestedDelivery,
         };
 
+        match super::mcp_virtual_screen::resolve_virtual_target_from_args(&args) {
+            Ok(Some(target)) => {
+                return super::mcp_virtual_screen::virtual_set_window_frame(target, &args).await;
+            }
+            Err(err) => return err,
+            Ok(None) => {}
+        }
+
         let input: SetWindowFrameInput =
             match cua_driver_core::tool_args::parse_typed_input("set_window_frame", args) {
                 Ok(input) => input,

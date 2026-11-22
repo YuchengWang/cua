@@ -57,6 +57,13 @@ impl Tool for MoveCursorTool {
     }
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
+        match super::mcp_virtual_screen::resolve_virtual_target_from_args(&args) {
+            Ok(Some(target)) => {
+                return super::mcp_virtual_screen::virtual_move_cursor(target, &args).await;
+            }
+            Err(err) => return err,
+            Ok(None) => {}
+        }
         if cursor_control_scope(&args) == CursorControlScope::Desktop {
             let input = match parse_typed_projection::<MoveCursorInput>("move_cursor", &args) {
                 Ok(input) => input,

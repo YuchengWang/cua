@@ -33,6 +33,13 @@ impl Tool for GetCursorPositionTool {
         })
     }
     async fn invoke(&self, args: Value) -> ToolResult {
+        match super::mcp_virtual_screen::resolve_virtual_target_from_args(&args) {
+            Ok(Some(target)) => {
+                return super::mcp_virtual_screen::virtual_get_cursor_position(target).await;
+            }
+            Err(err) => return err,
+            Ok(None) => {}
+        }
         if let Err(result) =
             parse_typed_input::<GetCursorPositionInput>("get_cursor_position", args)
         {

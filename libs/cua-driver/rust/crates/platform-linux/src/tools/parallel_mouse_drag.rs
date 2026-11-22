@@ -128,6 +128,28 @@ impl Tool for ParallelMouseDragTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        match super::mcp_virtual_screen::resolve_virtual_target_from_args(&args) {
+            Ok(Some(target)) => {
+                return super::mcp_virtual_screen::virtual_parallel_mouse_drag(target, &args)
+                    .await;
+            }
+            Err(err) => return err,
+            Ok(None) => {}
+        }
+        if let Some(first) = args
+            .get("drags")
+            .and_then(Value::as_array)
+            .and_then(|arr| arr.first())
+        {
+            match super::mcp_virtual_screen::resolve_virtual_target_from_args(first) {
+                Ok(Some(target)) => {
+                    return super::mcp_virtual_screen::virtual_parallel_mouse_drag(target, &args)
+                        .await;
+                }
+                Err(err) => return err,
+                Ok(None) => {}
+            }
+        }
         // Nested cua-compositor: run the drags as concurrent multi-cursor
         // injections (window-local, no X11 MPX/geometry needed).
         if crate::wayland::is_inject_mode() {

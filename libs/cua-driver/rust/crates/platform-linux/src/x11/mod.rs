@@ -415,6 +415,77 @@ pub(crate) fn get_atom(conn: &RustConnection, name: &str) -> Result<Atom> {
 /// Ask the X11 window manager to set one exact top-level window frame, then
 /// read the window geometry back in the same desktop coordinate space exposed
 /// by `list_windows`. Uses EWMH rather than configuring a client directly.
+pub fn set_window_frame_with_context(
+    ctx: &context::X11ScreenContext,
+    xid: u64,
+    pid: u32,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+) -> Result<(Option<WindowInfo>, bool, Option<String>)> {
+    let xid = u32::try_from(xid).map_err(|_| anyhow::anyhow!("window_id is out of X11 range"))?;
+    let conn = &*ctx.conn;
+    let root = ctx.root_window();
+    match OwnerResolver::new(conn).owner_pid(xid) {
+        Some(owner) if owner == pid => {}
+        Some(owner) => anyhow::bail!("window_id {xid} belongs to pid {owner}, not pid {pid}"),
+        None => anyhow::bail!("window_id {xid} has no verifiable owner pid ({UNATTRIBUTED_OWNER})"),
+    }
+
+    let atom = get_atom(conn, "_NET_MOVERESIZE_WINDOW")?;
+    let fields = moveresize_window_flags();
+    let source_indication = 1_u32 << 12; // normal application (EWMH §4.1.5)
+    let event = ClientMessageEvent::new(
+        32,
+        xid,
+        atom,
+        ClientMessageData::from([
+            fields | source_indication,
+            x as u32,
+            y as u32,
+            width,
+            height,
+        ]),
+    );
+    let mutation_error = conn
+        .send_event(
+            false,
+            root,
+            EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+            event,
+        )
+        .and_then(|_| conn.flush())
+        .err()
+        .map(|error| format!("_NET_MOVERESIZE_WINDOW request failed: {error}"));
+
+    let requested = (x, y, width, height);
+    let mut observed = None;
+    let deadline = crate::interaction::operation_deadline(std::time::Duration::from_millis(320));
+    for _ in 0..8 {
+        observed = list_windows_with_context(ctx, Some(pid))
+            .into_iter()
+            .find(|window| window.xid == u64::from(xid));
+        if observed
+            .as_ref()
+            .is_some_and(|window| (window.x, window.y, window.width, window.height) == requested)
+        {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(
+            std::time::Duration::from_millis(40)
+                .min(deadline.saturating_duration_since(std::time::Instant::now())),
+        );
+    }
+    let confirmed = observed
+        .as_ref()
+        .is_some_and(|window| (window.x, window.y, window.width, window.height) == requested);
+    Ok((observed, confirmed, mutation_error))
+}
+
 pub fn set_window_frame(
     xid: u64,
     pid: u32,

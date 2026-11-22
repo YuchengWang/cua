@@ -672,7 +672,95 @@ fn kde_x11_uinput_hotplug_is_unsafe_from_env() -> bool {
     )
 }
 
+static PREFER_UINPUT_CACHE: OnceLock<bool> = OnceLock::new();
+
+fn non_empty_env_str<F>(get_env: &F, key: &str) -> Option<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    get_env(key)
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+}
+
+fn parse_prefer_uinput_from_config_json(raw: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return true;
+    };
+    let Some(input) = value.get("input") else {
+        return true;
+    };
+    if input
+        .get("prefer_uinput")
+        .and_then(serde_json::Value::as_bool)
+        == Some(false)
+    {
+        return false;
+    }
+    if input
+        .get("backend")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|backend| backend.trim().eq_ignore_ascii_case("xtest"))
+    {
+        return false;
+    }
+    true
+}
+
+fn resolve_prefer_uinput_with<F>(get_env: F) -> bool
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(disable) = non_empty_env_str(&get_env, "CUA_DISABLE_UINPUT") {
+        if matches!(
+            disable.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes"
+        ) {
+            return false;
+        }
+    }
+    if let Some(prefer) = non_empty_env_str(&get_env, "CUA_PREFER_UINPUT") {
+        let lower = prefer.to_ascii_lowercase();
+        if matches!(lower.as_str(), "0" | "false" | "no") {
+            return false;
+        }
+        if matches!(lower.as_str(), "1" | "true" | "yes") {
+            return true;
+        }
+    }
+
+    let config_path = non_empty_env_str(&get_env, "CUA_YCWANG_CONFIG_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            non_empty_env_str(&get_env, "CUA_DRIVER_CONFIG_DIR").map(std::path::PathBuf::from)
+        })
+        .or_else(|| {
+            non_empty_env_str(&get_env, "HOME")
+                .map(|home| std::path::PathBuf::from(home).join(".config").join("cua-ycwang"))
+        })
+        .map(|dir| dir.join("config.json"));
+
+    if let Some(path) = config_path {
+        if let Ok(raw) = fs::read_to_string(&path) {
+            return parse_prefer_uinput_from_config_json(&raw);
+        }
+    }
+
+    true
+}
+
+fn resolve_prefer_uinput_from_env_and_config() -> bool {
+    resolve_prefer_uinput_with(|key| std::env::var(key).ok())
+}
+
+pub(crate) fn prefer_uinput_enabled() -> bool {
+    *PREFER_UINPUT_CACHE.get_or_init(resolve_prefer_uinput_from_env_and_config)
+}
+
 pub(crate) fn uinput_accessible() -> bool {
+    if !prefer_uinput_enabled() {
+        return false;
+    }
     fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -681,6 +769,10 @@ pub(crate) fn uinput_accessible() -> bool {
 }
 
 pub fn real_pointer_input_available() -> bool {
+    if !prefer_uinput_enabled() {
+        return false;
+    }
+
     // Do not even probe /dev/uinput on an affected KDE/X11 session. Creating
     // the device is itself the dangerous operation; a later fallback is too
     // late once Xorg has announced the hotplug to Qt clients.
@@ -710,6 +802,11 @@ pub fn real_pointer_input_available() -> bool {
 }
 
 fn ensure_master_pointer(cursor_id: &str) -> Result<MasterPointerIds> {
+    if !prefer_uinput_enabled() {
+        return Err(uinput_unavailable(
+            "disabled by config/env (prefer_uinput=false); retry with delivery_mode='foreground'",
+        ));
+    }
     ensure_master_pointer_for_session(cursor_id, kde_x11_uinput_hotplug_is_unsafe_from_env())
 }
 
@@ -6485,5 +6582,84 @@ mod mpx_pool_tests {
             offenders.is_empty(),
             "XI2 master removal crashes Qt 6.5+ apps (#7325): {offenders:?}"
         );
+    }
+
+    #[test]
+    fn prefer_uinput_env_flags_disable_uinput() {
+        use super::resolve_prefer_uinput_with;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"input":{"backend":"uinput_or_xtest","prefer_uinput":true}}"#,
+        )
+        .unwrap();
+        let cfg_dir = dir.path().to_string_lossy().into_owned();
+
+        assert!(resolve_prefer_uinput_with(|k| match k {
+            "CUA_YCWANG_CONFIG_DIR" => Some(cfg_dir.clone()),
+            _ => None,
+        }));
+        assert!(!resolve_prefer_uinput_with(|k| match k {
+            "CUA_DISABLE_UINPUT" => Some("1".to_owned()),
+            "CUA_YCWANG_CONFIG_DIR" => Some(cfg_dir.clone()),
+            _ => None,
+        }));
+        assert!(!resolve_prefer_uinput_with(|k| match k {
+            "CUA_DISABLE_UINPUT" => Some("true".to_owned()),
+            "CUA_YCWANG_CONFIG_DIR" => Some(cfg_dir.clone()),
+            _ => None,
+        }));
+        assert!(!resolve_prefer_uinput_with(|k| match k {
+            "CUA_PREFER_UINPUT" => Some("0".to_owned()),
+            "CUA_YCWANG_CONFIG_DIR" => Some(cfg_dir.clone()),
+            _ => None,
+        }));
+        assert!(!resolve_prefer_uinput_with(|k| match k {
+            "CUA_PREFER_UINPUT" => Some("false".to_owned()),
+            "CUA_YCWANG_CONFIG_DIR" => Some(cfg_dir.clone()),
+            _ => None,
+        }));
+    }
+
+    #[test]
+    fn prefer_uinput_reads_config_json_and_xtest_backend() {
+        use super::resolve_prefer_uinput_with;
+        let ycwang_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ycwang_dir.path().join("config.json"),
+            r#"{"input":{"backend":"uinput_or_xtest","prefer_uinput":false}}"#,
+        )
+        .unwrap();
+        let ycwang_path = ycwang_dir.path().to_string_lossy().into_owned();
+        assert!(!resolve_prefer_uinput_with(|k| match k {
+            "CUA_YCWANG_CONFIG_DIR" => Some(ycwang_path.clone()),
+            _ => None,
+        }));
+
+        let driver_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            driver_dir.path().join("config.json"),
+            r#"{"input":{"backend":"xtest","prefer_uinput":true}}"#,
+        )
+        .unwrap();
+        let driver_path = driver_dir.path().to_string_lossy().into_owned();
+        assert!(!resolve_prefer_uinput_with(|k| match k {
+            "CUA_DRIVER_CONFIG_DIR" => Some(driver_path.clone()),
+            _ => None,
+        }));
+
+        let home_dir = tempfile::tempdir().unwrap();
+        let cfg_sub = home_dir.path().join(".config").join("cua-ycwang");
+        std::fs::create_dir_all(&cfg_sub).unwrap();
+        std::fs::write(
+            cfg_sub.join("config.json"),
+            r#"{"input":{"backend":"xtest"}}"#,
+        )
+        .unwrap();
+        let home_path = home_dir.path().to_string_lossy().into_owned();
+        assert!(!resolve_prefer_uinput_with(|k| match k {
+            "HOME" => Some(home_path.clone()),
+            _ => None,
+        }));
     }
 }

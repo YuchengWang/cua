@@ -357,8 +357,13 @@ impl Tool for TypeTextTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
-        if let Some(display_id) = super::mcp_virtual_screen::resolve_virtual_display_from_args(&args) {
-            return super::mcp_virtual_screen::virtual_type_text(display_id, &args).await;
+        match super::mcp_virtual_screen::resolve_virtual_target_from_args(&args) {
+            Ok(Some(target)) => {
+                return super::mcp_virtual_screen::virtual_type_text(target.display_id, &args)
+                    .await;
+            }
+            Err(err) => return err,
+            Ok(None) => {}
         }
         use cua_driver_core::tool_args::ArgsExt;
         let pacing = crate::input::TypePacing::from_args(&args);

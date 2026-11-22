@@ -59,6 +59,38 @@ pub fn xtest_double_click(ctx: &X11ScreenContext, x: i16, y: i16, button: u8) ->
     Ok(())
 }
 
+/// Press and hold mouse `button` at `(x, y)` on `ctx`.
+pub fn xtest_mouse_button_down(
+    ctx: &X11ScreenContext,
+    x: i16,
+    y: i16,
+    button: u8,
+) -> Result<()> {
+    let root = ctx.root_window();
+    ctx.conn
+        .xtest_fake_input(MOTION_NOTIFY, 0, 0, root, x, y, 0)?;
+    ctx.conn
+        .xtest_fake_input(BUTTON_PRESS, button, 0, root, x, y, 0)?;
+    ctx.conn.sync()?;
+    Ok(())
+}
+
+/// Release mouse `button` at `(x, y)` on `ctx`.
+pub fn xtest_mouse_button_up(
+    ctx: &X11ScreenContext,
+    x: i16,
+    y: i16,
+    button: u8,
+) -> Result<()> {
+    let root = ctx.root_window();
+    ctx.conn
+        .xtest_fake_input(MOTION_NOTIFY, 0, 0, root, x, y, 0)?;
+    ctx.conn
+        .xtest_fake_input(BUTTON_RELEASE, button, 0, root, x, y, 0)?;
+    ctx.conn.sync()?;
+    Ok(())
+}
+
 /// Drag mouse `button` from `(x1, y1)` to `(x2, y2)`.
 pub fn xtest_drag(
     ctx: &X11ScreenContext,

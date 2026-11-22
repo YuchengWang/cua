@@ -38,6 +38,13 @@ impl Tool for TypeTextCharsTool {
 
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
+        match super::mcp_virtual_screen::resolve_virtual_target_from_args(&args) {
+            Ok(Some(target)) => {
+                return super::mcp_virtual_screen::virtual_type_text_chars(target, &args).await;
+            }
+            Err(err) => return err,
+            Ok(None) => {}
+        }
         #[allow(unused_assignments)]
         let pid = args.u64_or("pid", 0) as u32;
         let text_raw = match args.require_str("text") {

@@ -33,7 +33,14 @@ impl Tool for GetAccessibilityTreeTool {
             open_world: false,
         })
     }
-    async fn invoke(&self, _args: Value) -> ToolResult {
+    async fn invoke(&self, args: Value) -> ToolResult {
+        match super::mcp_virtual_screen::resolve_virtual_target_from_args(&args) {
+            Ok(Some(target)) => {
+                return super::mcp_virtual_screen::virtual_get_accessibility_tree(target).await;
+            }
+            Err(err) => return err,
+            Ok(None) => {}
+        }
         let (procs, windows) = tokio::task::spawn_blocking(|| {
             (
                 crate::proc_fs::list_processes(),

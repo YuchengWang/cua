@@ -134,6 +134,18 @@ impl Tool for MouseButtonUpTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        match super::mcp_virtual_screen::resolve_virtual_target_from_args(&args) {
+            Ok(Some(target)) => {
+                return super::mcp_virtual_screen::virtual_mouse_button_up(
+                    self.state.clone(),
+                    target,
+                    &args,
+                )
+                .await;
+            }
+            Err(err) => return err,
+            Ok(None) => {}
+        }
         let cursor_id = resolve_cursor_key(&args);
         let Some(hold) = self
             .state
