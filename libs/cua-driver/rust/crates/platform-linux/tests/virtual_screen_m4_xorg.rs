@@ -84,14 +84,12 @@ fn m4_xtest_click_and_cjk_clipboard_roundtrip() {
     let mut got_button = false;
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
-        if let Ok(Some(ev)) = ctx.conn.poll_for_event() {
-            if let Event::ButtonPress(bp) = ev {
-                assert_eq!(bp.detail, 1);
-                assert_eq!(bp.root_x, 120);
-                assert_eq!(bp.root_y, 120);
-                got_button = true;
-                break;
-            }
+        if let Ok(Some(Event::ButtonPress(bp))) = ctx.conn.poll_for_event() {
+            assert_eq!(bp.detail, 1);
+            assert_eq!(bp.root_x, 120);
+            assert_eq!(bp.root_y, 120);
+            got_button = true;
+            break;
         }
         thread::sleep(Duration::from_millis(20));
     }

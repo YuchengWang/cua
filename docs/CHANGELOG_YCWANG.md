@@ -7,6 +7,11 @@
 
 ## [Unreleased] — `feat/x11-virtual-desktop`
 
+### Post-M5 Hotfix: Virtual `get_window_state` Contract & `xtest_type_text` Focus/Clipboard Hardening (`2026-11-22`, Landed)
+- **Fixed / 修复**：
+  - `platform-linux/src/tools/mcp_virtual_screen.rs`: Replaced ad-hoc JSON in `virtual_get_window_state` with `cua_driver_contract::WindowStateOutput` serialization (`build_virtual_window_state_output`), guaranteeing non-null `pid: u32` (falling back to caller `pid` or `0` when `_NET_WM_PID` is absent) and aligned `window_title`, `screenshot_width`/`screenshot_height`, `screenshot_mime_type`, `screenshot_frame_valid`, and `window_bounds` fields to eliminate `typed_output_mismatch`. Added contract unit tests.
+  - `platform-linux/src/x11/virtual_input.rs` & `mcp_virtual_screen.rs`: Added `xtest_focus_window` (`_NET_ACTIVE_WINDOW` + `ConfigureWindow(Above)` + `SetInputFocus`) invoked by `virtual_type_text` when `window_id` or `pid` is provided, and hardened `xtest_type_text` non-ASCII clipboard paste timings (`45ms` selection-ownership settle before `Ctrl+V`, `80ms` paste-read settle before restoring previous clipboard).
+
 ### Milestone 5: Release Build, Isolated Installation & Full E2E Gate (`2026-11-22`, Landed)
 - **Built & Installed / 编译与隔离安装**：
   - `cargo build --release -p cua-driver -p cursor-theme-cli` passed (exit 0).

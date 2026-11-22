@@ -18,7 +18,8 @@ use cua_driver_core::{
 use serde_json::{json, Value};
 
 use crate::x11::virtual_input::{
-    xtest_click, xtest_drag, xtest_hotkey, xtest_press_key, xtest_scroll, xtest_type_text,
+    xtest_click, xtest_drag, xtest_focus_window, xtest_hotkey, xtest_press_key, xtest_scroll,
+    xtest_type_text,
 };
 use crate::x11::virtual_screen::{global_virtual_screen_manager, CreateVirtualScreenRequest};
 
@@ -80,8 +81,21 @@ pub(crate) async fn virtual_type_text(display_id: String, args: &Value) -> ToolR
     let Some(text) = args.opt_str("text") else {
         return ToolResult::error("text is required");
     };
+    let window_id = args.opt_u64("window_id");
+    let pid = args.opt_u64("pid").map(|v| v as u32);
     match tokio::task::spawn_blocking(move || -> anyhow::Result<ToolResult> {
         let ctx = global_virtual_screen_manager().connect_context(&display_id)?;
+        let focus_wid = window_id.or_else(|| {
+            pid.and_then(|p| {
+                crate::x11::list_windows_with_context(&ctx, Some(p))
+                    .into_iter()
+                    .next()
+                    .map(|w| w.xid)
+            })
+        });
+        if let Some(wid) = focus_wid {
+            xtest_focus_window(&ctx, wid)?;
+        }
         xtest_type_text(&ctx, &text)?;
         Ok(ToolResult::text(format!("Typed {} chars on {display_id}", text.chars().count()))
             .with_structured(json!({ "display_id": display_id, "ok": true })))
@@ -204,6 +218,58 @@ pub(crate) async fn virtual_drag(display_id: String, args: &Value) -> ToolResult
     }
 }
 
+fn build_virtual_window_state_output(
+    info: &crate::x11::WindowInfo,
+    fallback_pid: Option<u32>,
+    png_bytes: &[u8],
+) -> cua_driver_contract::WindowStateOutput {
+    let (shot_w, shot_h) = cua_driver_core::image_utils::png_dimensions(png_bytes)
+        .unwrap_or((info.width, info.height));
+    let (screenshot_width, screenshot_height) = if shot_w > 0 && shot_h > 0 {
+        (Some(shot_w), Some(shot_h))
+    } else {
+        (None, None)
+    };
+    cua_driver_contract::WindowStateOutput {
+        pid: info.pid.or(fallback_pid).unwrap_or(0),
+        window_id: info.xid,
+        snapshot_id: None,
+        app_name: (!info.app_name.is_empty()).then(|| info.app_name.clone()),
+        window_title: (!info.title.is_empty()).then(|| info.title.clone()),
+        tree_markdown: None,
+        elements: None,
+        observations: None,
+        observations_truncated: None,
+        element_count: None,
+        total_element_count: None,
+        returned_element_count: None,
+        filtered_element_count: None,
+        elements_complete: None,
+        degraded: None,
+        degraded_reason: None,
+        truncated: None,
+        truncation_reason: None,
+        truncation_hint: None,
+        tree_format: None,
+        since: None,
+        since_status: None,
+        tree_diff: None,
+        screenshot_width,
+        screenshot_height,
+        screenshot_scale: None,
+        screenshot_mime_type: Some("image/png".to_owned()),
+        screenshot_file_path: None,
+        screenshot_frame_valid: Some(true),
+        window_bounds: Some(cua_driver_contract::WindowBounds {
+            x: f64::from(info.x),
+            y: f64::from(info.y),
+            width: f64::from(info.width),
+            height: f64::from(info.height),
+        }),
+        images: Vec::new(),
+    }
+}
+
 pub(crate) async fn virtual_get_window_state(display_id: String, args: &Value) -> ToolResult {
     let args = args.clone();
     match tokio::task::spawn_blocking(move || -> anyhow::Result<ToolResult> {
@@ -222,17 +288,8 @@ pub(crate) async fn virtual_get_window_state(display_id: String, args: &Value) -
             .ok_or_else(|| anyhow::anyhow!("window {xid} not found on {display_id}"))?;
         let png = crate::capture::screenshot_window_bytes_with_context(&ctx, xid)?;
         let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png);
-        let structured = json!({
-            "display_id": ctx.display_id,
-            "window_id": info.xid,
-            "pid": info.pid,
-            "title": info.title,
-            "app_name": info.app_name,
-            "x": info.x,
-            "y": info.y,
-            "width": info.width,
-            "height": info.height,
-        });
+        let output = build_virtual_window_state_output(&info, pid, &png);
+        let structured = serde_json::to_value(&output)?;
         let mut res = ToolResult::text(format!(
             "Window {} (\"{}\") on {} ({}x{})",
             info.xid, info.title, ctx.display_id, info.width, info.height
@@ -458,5 +515,44 @@ impl Tool for LaunchInVirtualScreenTool {
             Ok(Err(e)) => ToolResult::error(format!("launch_in_virtual_screen failed: {e:#}")),
             Err(e) => ToolResult::error(format!("launch_in_virtual_screen panicked: {e}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_virtual_window_state_output;
+
+    #[test]
+    fn virtual_window_state_output_matches_contract_even_without_wm_pid() {
+        let info_no_pid = crate::x11::WindowInfo {
+            xid: 0x0040_0007,
+            pid: None,
+            app_name: "XTerm".to_owned(),
+            title: "xterm".to_owned(),
+            is_on_screen: true,
+            z_index: None,
+            x: 10,
+            y: 20,
+            width: 640,
+            height: 480,
+        };
+        let out_no_pid = build_virtual_window_state_output(&info_no_pid, None, &[]);
+        let val_no_pid = serde_json::to_value(&out_no_pid).expect("serialize WindowStateOutput");
+        assert_eq!(val_no_pid["pid"], 0);
+        assert_eq!(val_no_pid["window_id"], 0x0040_0007_u64);
+        assert_eq!(val_no_pid["screenshot_width"], 640);
+        assert_eq!(val_no_pid["screenshot_height"], 480);
+        cua_driver_contract::validate_success_output("get_window_state", val_no_pid)
+            .expect("missing _NET_WM_PID must not cause typed_output_mismatch");
+
+        let info_with_pid = crate::x11::WindowInfo {
+            pid: Some(4242),
+            ..info_no_pid
+        };
+        let out_with_pid = build_virtual_window_state_output(&info_with_pid, Some(9999), &[]);
+        let val_with_pid = serde_json::to_value(&out_with_pid).expect("serialize WindowStateOutput");
+        assert_eq!(val_with_pid["pid"], 4242);
+        cua_driver_contract::validate_success_output("get_window_state", val_with_pid)
+            .expect("WindowStateOutput with pid must pass contract validation");
     }
 }

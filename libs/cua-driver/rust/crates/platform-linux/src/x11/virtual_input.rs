@@ -14,7 +14,9 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use x11rb::connection::Connection as _;
-use x11rb::protocol::xproto::ConnectionExt as _;
+use x11rb::protocol::xproto::{
+    ClientMessageEvent, ConfigureWindowAux, ConnectionExt as _, EventMask, InputFocus, StackMode,
+};
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::wrapper::ConnectionExt as _;
 
@@ -156,10 +158,47 @@ pub fn xtest_hotkey(ctx: &X11ScreenContext, keys: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Focus and raise `window_id` on `ctx` via EWMH `_NET_ACTIVE_WINDOW` + `SetInputFocus`.
+pub fn xtest_focus_window(ctx: &X11ScreenContext, window_id: u64) -> Result<()> {
+    let window = u32::try_from(window_id)
+        .map_err(|_| anyhow!("window_id {window_id} out of X11 u32 range"))?;
+    let root = ctx.root_window();
+    let _ = ctx.conn.map_window(window);
+    if let Ok(cookie) = ctx.conn.intern_atom(false, b"_NET_ACTIVE_WINDOW") {
+        if let Ok(reply) = cookie.reply() {
+            let event = ClientMessageEvent::new(
+                32,
+                window,
+                reply.atom,
+                [1, x11rb::CURRENT_TIME, 0, 0, 0],
+            );
+            let _ = ctx.conn.send_event(
+                false,
+                root,
+                EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+                event,
+            );
+        }
+    }
+    let _ = ctx.conn.configure_window(
+        window,
+        &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+    );
+    ctx.conn
+        .set_input_focus(InputFocus::PARENT, window, x11rb::CURRENT_TIME)?
+        .check()?;
+    ctx.conn.sync()?;
+    std::thread::sleep(Duration::from_millis(30));
+    Ok(())
+}
+
 /// Type UTF-8 text on `ctx`.
 /// Pure ASCII uses XTest keystrokes; non-ASCII uses isolated clipboard
 /// save -> write -> Ctrl+V -> restore so CJK/Unicode text works reliably.
 pub fn xtest_type_text(ctx: &X11ScreenContext, text: &str) -> Result<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
     if text.is_ascii() {
         for ch in text.chars() {
             let key_str = match ch {
@@ -173,13 +212,14 @@ pub fn xtest_type_text(ctx: &X11ScreenContext, text: &str) -> Result<()> {
         return Ok(());
     }
 
-    // Non-ASCII: save CLIPBOARD -> write target text -> Ctrl+V -> restore.
+    // Non-ASCII: save CLIPBOARD -> write target text -> wait for selection ownership ->
+    // Ctrl+V -> wait for target app paste read -> restore.
     let saved = clipboard_get_for_context(ctx).ok();
     clipboard_set_for_context(ctx, text)
         .context("failed to write non-ASCII text to virtual display clipboard")?;
-    std::thread::sleep(Duration::from_millis(30));
+    std::thread::sleep(Duration::from_millis(45));
     let paste_res = xtest_hotkey(ctx, &["ctrl".to_owned(), "v".to_owned()]);
-    std::thread::sleep(Duration::from_millis(50));
+    std::thread::sleep(Duration::from_millis(80));
     if let Some(prev) = saved {
         let _ = clipboard_set_for_context(ctx, &prev);
     }
