@@ -9,13 +9,7 @@
 /// back to `%USERPROFILE%` (Windows, where `HOME` is usually unset). Returns
 /// `None` when neither is set (sandboxed CI).
 pub fn default_config_path() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(|h| {
-            std::path::PathBuf::from(h)
-                .join(".cua-driver")
-                .join("config.json")
-        })
+    crate::ycwang_env::resolve_config_file()
 }
 
 /// Read a single key from `~/.cua-driver/config.json` as a raw JSON value,

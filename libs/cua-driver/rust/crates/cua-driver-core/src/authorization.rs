@@ -917,6 +917,7 @@ pub fn advertised_risk_for(tool: &str) -> RiskAssessment {
         | "check_for_update"
         | "get_guide"
         | "health_report"
+        | "list_virtual_screens"
         | "probe" => RiskClass::R0,
 
         // Local reversible control and lifecycle operations.
@@ -947,13 +948,17 @@ pub fn advertised_risk_for(tool: &str) -> RiskAssessment {
         | "set_agent_cursor_motion"
         | "set_agent_cursor_theme" => RiskClass::R1,
 
-        "clipboard_write" => RiskClass::R1,
+        "clipboard_write" | "set_clipboard" => RiskClass::R1,
 
         // Surfaces that can reveal or control sensitive local/authenticated
         // state. Active adapters still decide their exact resource scope at
         // the canonical registry boundary before platform dispatch.
         "zoom"
         | "clipboard_read"
+        | "get_clipboard"
+        | "sync_clipboard"
+        | "type_secret_from_env"
+        | "inspect_app_flow"
         | "list_apps"
         | "list_windows"
         | "debug_window_info"
@@ -993,7 +998,13 @@ pub fn advertised_risk_for(tool: &str) -> RiskAssessment {
         | "page"
         | "browser_dialog"
         | "browser_set_input_files"
-        | "browser_download" => RiskClass::R3,
+        | "browser_download"
+        | "create_virtual_screen"
+        | "destroy_virtual_screen"
+        | "launch_in_virtual_screen"
+        | "generate_app_recipe"
+        | "run_app_recipe"
+        | "acquire_app_data" => RiskClass::R3,
 
         _ => RiskClass::Unclassified,
     };
@@ -1085,7 +1096,11 @@ pub fn classify_tool_call(tool: &str, args: &Value) -> RiskAssessment {
         | "debug_window_info"
         | "get_browser_state"
         | "zoom"
-        | "clipboard_read" => RiskAssessment {
+        | "clipboard_read"
+        | "get_clipboard"
+        | "sync_clipboard"
+        | "type_secret_from_env"
+        | "inspect_app_flow" => RiskAssessment {
             class: RiskClass::R2,
             enforcement: RiskEnforcement::Active,
             operation_sensitive: true,
@@ -1104,6 +1119,23 @@ pub fn classify_tool_call(tool: &str, args: &Value) -> RiskAssessment {
             enforcement: RiskEnforcement::MetadataOnly,
             operation_sensitive: args.get("prompt").and_then(Value::as_bool).unwrap_or(false),
         },
+        "list_virtual_screens" => RiskAssessment {
+            class: RiskClass::R0,
+            enforcement: RiskEnforcement::MetadataOnly,
+            operation_sensitive: false,
+        },
+        "create_virtual_screen"
+        | "destroy_virtual_screen"
+        | "launch_in_virtual_screen"
+        | "generate_app_recipe"
+        | "run_app_recipe"
+        | "acquire_app_data" => {
+            RiskAssessment {
+                class: RiskClass::R3,
+                enforcement: RiskEnforcement::Active,
+                operation_sensitive: true,
+            }
+        }
         "browser_set_input_files"
         | "browser_download"
         | "start_recording"

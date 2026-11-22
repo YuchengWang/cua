@@ -50,7 +50,92 @@ impl Tool for GetDesktopStateTool {
         };
         let out_file = input.screenshot_out_file;
         let max_image_dimension = input.max_image_dimension;
+        let virtual_display = crate::x11::virtual_screen::global_virtual_screen_manager()
+            .resolve_display_for_session(input.session.as_deref(), None);
         let capture_service = self.state.capture_service.clone();
+
+        if let Some(display_id) = virtual_display {
+            let capture_service_v = capture_service.clone();
+            let capture_args_v = capture_args.clone();
+            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<ToolResult> {
+                let ctx = crate::x11::virtual_screen::global_virtual_screen_manager()
+                    .connect_context(&display_id)?;
+                let native_png = crate::capture::screenshot_display_bytes_with_context(&ctx)?;
+                let (screen_w, screen_h) = crate::capture::png_dimensions_pub(&native_png)?;
+                let (png, shot_w, shot_h, scale_factor) =
+                    normalize_desktop_capture_for_action_frame(native_png, screen_w, screen_h)?;
+                let (png, shot_w, shot_h) = match max_image_dimension.filter(|cap| *cap > 0) {
+                    Some(cap) if shot_w.max(shot_h) > cap => {
+                        let png = crate::capture::resize_png_if_needed(&png, cap)?;
+                        let (w, h) = crate::capture::png_dimensions_pub(&png)?;
+                        (png, w, h)
+                    }
+                    _ => (png, shot_w, shot_h),
+                };
+                let capture_id = crate::capture_action_frame::publish_desktop(
+                    &capture_service_v,
+                    &capture_args_v,
+                    &png,
+                    (shot_w, shot_h),
+                    (screen_w, screen_h),
+                )?;
+                let frame_scale = if shot_w > 0 {
+                    f64::from(screen_w) / f64::from(shot_w)
+                } else {
+                    1.0
+                };
+                let windows = crate::x11::list_windows_with_context(&ctx, None);
+                let window_records: Vec<Value> = windows.iter().map(window_record_json).collect();
+                let mut structured = json!({
+                    "platform": "linux",
+                    "display": ctx.display_id,
+                    "screenshot_width": shot_w,
+                    "screenshot_height": shot_h,
+                    "screen_width": screen_w,
+                    "screen_height": screen_h,
+                    "scale_factor": scale_factor,
+                    "frame_scale": frame_scale,
+                    "screenshot_mime_type": "image/png",
+                    "windows": window_records,
+                    "capture_id": capture_id,
+                });
+                if (frame_scale - 1.0).abs() > 0.001 {
+                    structured["screenshot_original_width"] = json!(screen_w);
+                    structured["screenshot_original_height"] = json!(screen_h);
+                }
+                let base_text = format!(
+                    "Desktop {} ({}x{}, {} windows)",
+                    ctx.display_id,
+                    screen_w,
+                    screen_h,
+                    windows.len()
+                );
+                if let Some(ref out_path) = out_file {
+                    std::fs::write(out_path, &png)?;
+                    structured["screenshot_out_file"] = Value::String(out_path.clone());
+                    return Ok(ToolResult::text(format!("{base_text} -> {out_path}"))
+                        .with_structured(structured));
+                }
+                let b64 =
+                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png);
+                let mut res = ToolResult::text(base_text).with_structured(structured);
+                res.content
+                    .push(cua_driver_core::protocol::Content::image_png(b64));
+                Ok(res)
+            })
+            .await;
+            return match result {
+                Ok(Ok(res)) => res,
+                Ok(Err(e)) => ToolResult::error(format!("get_desktop_state failed: {e:#}")),
+                Err(e) => ToolResult::error(format!("get_desktop_state panicked: {e}")),
+            };
+        }
+
+        if !crate::wayland::is_wayland() {
+            if let Err(locked_result) = crate::x11::screen_guard::ensure_primary_unlocked_and_awake() {
+                return locked_result;
+            }
+        }
 
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             // Capture the full display at native size first. When the

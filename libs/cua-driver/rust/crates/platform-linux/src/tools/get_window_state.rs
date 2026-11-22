@@ -409,6 +409,9 @@ impl Tool for GetWindowStateTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        if let Some(display_id) = super::mcp_virtual_screen::resolve_virtual_display_from_args(&args) {
+            return super::mcp_virtual_screen::virtual_get_window_state(display_id, &args).await;
+        }
         let display_only = match cua_driver_core::window_state_view::display_only(&args) {
             Ok(display_only) => display_only,
             Err(refusal) => return refusal,

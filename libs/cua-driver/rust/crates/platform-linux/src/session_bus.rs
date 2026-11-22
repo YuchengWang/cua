@@ -88,6 +88,43 @@ pub fn ensure_session_bus_discovered() -> bool {
     }
 }
 
+/// Resolve `DBUS_SESSION_BUS_ADDRESS` for a specific X11 `display_id` (e.g. `":99"`)
+/// without mutating process-global environment variables.
+pub fn resolve_for_display(display_id: &str) -> Option<String> {
+    if let Some(addr) = discover_session_bus_for_display(display_id) {
+        return Some(addr);
+    }
+    if let Ok(existing) = std::env::var("DBUS_SESSION_BUS_ADDRESS") {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_owned());
+        }
+    }
+    discover_session_bus_address()
+}
+
+fn discover_session_bus_for_display(display_id: &str) -> Option<String> {
+    let proc_dir = std::fs::read_dir("/proc").ok()?;
+    let target_display = format!("DISPLAY={display_id}");
+    for entry in proc_dir.flatten() {
+        let pid_dir = entry.path();
+        let environ = match std::fs::read(pid_dir.join("environ")) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let matches_display = environ
+            .split(|&b| b == 0)
+            .any(|kv| kv == target_display.as_bytes());
+        if !matches_display {
+            continue;
+        }
+        if let Some(addr) = dbus_address_from_environ(&environ) {
+            return Some(addr);
+        }
+    }
+    None
+}
+
 /// Prefer the standard systemd user-bus socket; fall back to reading the
 /// address from a running desktop-session process's environment.
 fn discover_session_bus_address() -> Option<String> {

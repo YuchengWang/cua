@@ -1,0 +1,17 @@
+[Unit]
+Description=CUA Isolated Driver Daemon (cua-ycwang)
+After=graphical-session.target
+Wants=graphical-session.target
+
+[Service]
+Type=simple
+Environment=CUA_DRIVER_STATE_NAMESPACE=cua-ycwang
+Environment=CUA_YCWANG_CONFIG_DIR=%h/.config/cua-ycwang
+Environment=CUA_YCWANG_HOME=%h/.cua-ycwang
+EnvironmentFile=-%h/.config/cua-ycwang/env/virtual-screen.env
+ExecStart=%h/.local/bin/cua-ycwang serve
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

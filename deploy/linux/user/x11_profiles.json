@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "default_profile": "desktop-1080p",
+  "profiles": {
+    "desktop-1080p": {
+      "display": ":99",
+      "screen": 0,
+      "width": 1920,
+      "height": 1080,
+      "depth": 24,
+      "dpi": 96,
+      "xvfb_args": [
+        "-screen",
+        "0",
+        "1920x1080x24",
+        "-ac",
+        "-nolisten",
+        "tcp",
+        "+extension",
+        "RANDR",
+        "+extension",
+        "GLX"
+      ],
+      "window_manager": "openbox",
+      "clipboard_sync": "autocutsel",
+      "vnc_port": 5999
+    },
+    "desktop-800p": {
+      "display": ":98",
+      "screen": 0,
+      "width": 1280,
+      "height": 800,
+      "depth": 24,
+      "dpi": 96,
+      "xvfb_args": [
+        "-screen",
+        "0",
+        "1280x800x24",
+        "-ac",
+        "-nolisten",
+        "tcp",
+        "+extension",
+        "RANDR"
+      ],
+      "window_manager": "openbox",
+      "clipboard_sync": "autocutsel",
+      "vnc_port": 5998
+    }
+  }
+}

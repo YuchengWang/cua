@@ -47,6 +47,14 @@ mod list_apps;
 #[cfg(target_os = "linux")]
 mod list_windows;
 #[cfg(target_os = "linux")]
+mod mcp_app_recipe;
+#[cfg(target_os = "linux")]
+mod mcp_clipboard;
+#[cfg(target_os = "linux")]
+mod mcp_type_secret;
+#[cfg(target_os = "linux")]
+mod mcp_virtual_screen;
+#[cfg(target_os = "linux")]
 mod mouse_button_down;
 #[cfg(target_os = "linux")]
 mod mouse_button_up;

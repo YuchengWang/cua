@@ -996,6 +996,7 @@ pub fn default_capabilities_for(tool_name: &str) -> Vec<String> {
         // contract is intentionally narrower than `type_text`'s. It
         // still accepts `element_token`, hence the tokens claim.
         "type_text_chars" => &["input.keyboard.type", "accessibility.element_tokens"],
+        "type_secret_from_env" => &["input.keyboard.type"],
         "set_value" => &[
             // Bulk-set an editable field's value — semantically a
             // typing surface, even though the implementation skips
@@ -1035,8 +1036,16 @@ pub fn default_capabilities_for(tool_name: &str) -> Vec<String> {
         // ── apps / windows ───────────────────────────────────────────
         "launch_app" => &["app.launch"],
         "list_apps" => &["app.list"],
+        "inspect_app_flow" => &["app.inspect"],
+        "generate_app_recipe" => &["app.recipe.write"],
+        "run_app_recipe" => &["app.recipe.run"],
+        "acquire_app_data" => &["app.data.acquire"],
         "kill_app" => &["app.kill"],
-        "agent_display" => &["display.virtual"],
+        "agent_display"
+        | "create_virtual_screen"
+        | "list_virtual_screens"
+        | "destroy_virtual_screen"
+        | "launch_in_virtual_screen" => &["display.virtual"],
         "list_windows" => &["window.list"],
         "bring_to_front" => &["window.activate"],
         "set_window_frame" => &["window.frame.set"],
@@ -1055,6 +1064,8 @@ pub fn default_capabilities_for(tool_name: &str) -> Vec<String> {
         ],
         "get_config" => &["system.config.read"],
         "set_config" => &["system.config.write"],
+        "get_clipboard" => &["clipboard.read"],
+        "set_clipboard" | "sync_clipboard" => &["clipboard.write"],
 
         // ── agent cursor ─────────────────────────────────────────────
         "set_agent_cursor_enabled" => &["agent_cursor.set_enabled"],

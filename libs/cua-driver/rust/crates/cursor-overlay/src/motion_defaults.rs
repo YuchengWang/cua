@@ -76,11 +76,10 @@ impl SavedMotionDefaults {
     }
 }
 
-/// `~/.cua-driver/config.json`, the file `set_config` writes everywhere.
+/// Canonical config.json path, delegated to `cua_driver_core::ycwang_env::resolve_config_file()`
+/// so `cua-ycwang` stays isolated from `~/.cua-driver/config.json`.
 pub fn default_config_path() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(|home| PathBuf::from(home).join(".cua-driver").join("config.json"))
+    cua_driver_core::ycwang_env::resolve_config_file()
 }
 
 fn allowed_styles() -> String {

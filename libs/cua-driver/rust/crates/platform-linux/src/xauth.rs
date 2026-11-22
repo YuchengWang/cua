@@ -52,6 +52,54 @@ pub fn ensure_xauthority_discovered() {
     });
 }
 
+/// Resolve `XAUTHORITY` for a specific X11 `display_id` (e.g. `":99"`) without
+/// mutating process-global environment variables.
+pub fn resolve_for_display(display_id: &str) -> Option<String> {
+    if let Some(auth) = discover_xauth_for_display_from_proc(display_id) {
+        return Some(auth);
+    }
+    if let Ok(existing) = std::env::var("XAUTHORITY") {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() && std::path::Path::new(trimmed).exists() {
+            return Some(trimmed.to_owned());
+        }
+    }
+    discover_xauth_from_proc()
+}
+
+fn discover_xauth_for_display_from_proc(display_id: &str) -> Option<String> {
+    let proc_dir = std::fs::read_dir("/proc").ok()?;
+    for entry in proc_dir.flatten() {
+        let pid_dir = entry.path();
+        let comm = std::fs::read_to_string(pid_dir.join("comm")).unwrap_or_default();
+        match comm.trim() {
+            "Xvfb" | "Xwayland" | "Xorg" | "X" => {}
+            _ => continue,
+        }
+        let cmdline = match std::fs::read(pid_dir.join("cmdline")) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let args: Vec<&[u8]> = cmdline.split(|&b| b == 0).collect();
+        let has_display = args
+            .iter()
+            .any(|arg| std::str::from_utf8(arg).ok() == Some(display_id));
+        if !has_display {
+            continue;
+        }
+        for pair in args.windows(2) {
+            if pair[0] == b"-auth" {
+                if let Ok(path) = std::str::from_utf8(pair[1]) {
+                    if !path.is_empty() && std::path::Path::new(path).exists() {
+                        return Some(path.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Scan `/proc` for an X server process (`Xwayland`, `Xorg`, or `X`) and return
 /// the existing file named by its `-auth <file>` argument, if any.
 fn discover_xauth_from_proc() -> Option<String> {

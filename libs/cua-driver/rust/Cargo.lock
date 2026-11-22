@@ -3515,6 +3515,7 @@ dependencies = [
  "memmap2",
  "meval",
  "pipewire-sys",
+ "regex",
  "reis",
  "serde",
  "serde_json",
@@ -3537,6 +3538,8 @@ dependencies = [
  "x11rb",
  "xkbcommon",
  "zbus",
+ "zeroize",
+ "zip",
 ]
 
 [[package]]

@@ -1,0 +1,33 @@
+#!/bin/sh
+# Minimal-scope elevated helper for cua-ycwang (invoked via pkexec).
+# Only explicitly allowlisted subcommands are permitted.
+set -eu
+
+subcommand="${1:-}"
+case "$subcommand" in
+  probe-uinput)
+    if [ -e /dev/uinput ]; then
+      ls -l /dev/uinput
+    else
+      echo "/dev/uinput does not exist" >&2
+      exit 1
+    fi
+    ;;
+  ensure-uinput-module)
+    modprobe uinput
+    ;;
+  reload-udev)
+    udevadm control --reload-rules
+    udevadm trigger --subsystem-match=misc --sysname-match=uinput
+    ;;
+  verify-rules)
+    test -f /etc/udev/rules.d/99-cua-uinput.rules
+    test -f /usr/share/polkit-1/actions/io.github.yuchengwang.cua.policy
+    test -f /etc/polkit-1/rules.d/50-cua-ycwang-l1.rules
+    echo "ok"
+    ;;
+  *)
+    echo "Disallowed or missing subcommand: $subcommand" >&2
+    exit 2
+    ;;
+esac

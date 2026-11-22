@@ -36,10 +36,20 @@ impl Tool for GetScreenSizeTool {
         })
     }
     async fn invoke(&self, args: Value) -> ToolResult {
-        if let Err(result) = parse_typed_input::<GetScreenSizeInput>("get_screen_size", args) {
-            return result;
-        }
-        let result = tokio::task::spawn_blocking(|| {
+        let input = match parse_typed_input::<GetScreenSizeInput>("get_screen_size", args) {
+            Ok(input) => input,
+            Err(result) => return result,
+        };
+        let virtual_display = crate::x11::virtual_screen::global_virtual_screen_manager()
+            .resolve_display_for_session(input.session.as_deref(), None);
+        let result = tokio::task::spawn_blocking(move || {
+            if let Some(ref display_id) = virtual_display {
+                let ctx = crate::x11::virtual_screen::global_virtual_screen_manager()
+                    .connect_context(display_id)?;
+                use x11rb::protocol::xproto::ConnectionExt as _;
+                let geom = ctx.conn.get_geometry(ctx.root_window())?.reply()?;
+                return Ok((u32::from(geom.width), u32::from(geom.height), 1.0, None));
+            }
             if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
                 // Shared manifest admission needs content-free display
                 // metadata even when this native desktop has no X11 DISPLAY.

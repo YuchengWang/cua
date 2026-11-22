@@ -849,6 +849,9 @@ fn main() {
             }
             cli::run_doctor_cmd(json, fix);
         }
+        cli::Command::Elevate { action_id, json } => {
+            cli::run_elevate_cmd(&action_id, json);
+        }
         cli::Command::Diagnose => {
             cli::run_diagnose_cmd();
         }
@@ -1172,6 +1175,10 @@ fn main() -> anyhow::Result<()> {
                 version_check::maybe_announce_update();
             }
             cli::run_doctor_cmd(json, fix);
+            Ok(())
+        }
+        cli::Command::Elevate { action_id, json } => {
+            cli::run_elevate_cmd(&action_id, json);
             Ok(())
         }
         cli::Command::Diagnose => {

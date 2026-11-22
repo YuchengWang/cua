@@ -94,6 +94,7 @@ impl Probe {
 #[derive(Debug, Clone, Default)]
 pub struct Report {
     pub probes: Vec<Probe>,
+    pub elevation_required: Option<cua_driver_core::elevation::ElevationRequired>,
 }
 
 impl Report {
@@ -152,13 +153,17 @@ impl Report {
                 serde_json::Value::Object(obj)
             })
             .collect();
-        serde_json::json!({
+        let mut root = serde_json::json!({
             "ok": !self.has_errors(),
             "probes": probes,
             // The running binary's identity (source revision, sha256 of the
             // executable): what `cua doctor --expect cua-driver=...` checks.
             "build": cua_driver_core::build_info::current(),
-        })
+        });
+        if let Some(ref eq) = self.elevation_required {
+            root["elevation_required"] = eq.to_json();
+        }
+        root
     }
 }
 
@@ -550,6 +555,75 @@ fn append_platform_probes(report: &mut Report) {
                 );
             }
         }
+    }
+
+    append_linux_virtual_screen_and_elevation_probes(report);
+}
+
+#[cfg(target_os = "linux")]
+fn sha256_hex(path: &Path) -> Option<String> {
+    use sha2::Digest as _;
+    let bytes = std::fs::read(path).ok()?;
+    let digest = sha2::Sha256::digest(&bytes);
+    Some(digest.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+#[cfg(target_os = "linux")]
+fn append_linux_virtual_screen_and_elevation_probes(report: &mut Report) {
+    let mut missing_reasons: Vec<String> = Vec::new();
+    for bin in ["Xvfb", "openbox", "x11vnc", "autocutsel"] {
+        let found = std::env::var_os("PATH")
+            .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file()))
+            .unwrap_or(false);
+        if found {
+            report.push(Probe::ok(format!("dep:{bin}"), format!("{bin} available")));
+        } else {
+            report.push(Probe::warn(format!("dep:{bin}"), format!("{bin} not found in PATH")));
+        }
+    }
+
+    let uinput = Path::new("/dev/uinput");
+    if !uinput.exists() {
+        missing_reasons.push("/dev/uinput does not exist".to_owned());
+        report.push(Probe::warn("uinput", "/dev/uinput not present"));
+    } else if std::fs::OpenOptions::new().read(true).write(true).open(uinput).is_ok() {
+        report.push(Probe::ok("uinput", "/dev/uinput is readable/writable"));
+    } else {
+        missing_reasons.push("/dev/uinput is not writable by current user".to_owned());
+        report.push(Probe::warn("uinput", "/dev/uinput exists but is not rw"));
+    }
+
+    for sys_path in [
+        "/etc/udev/rules.d/99-cua-uinput.rules",
+        "/usr/share/polkit-1/actions/io.github.yuchengwang.cua.policy",
+        "/etc/polkit-1/rules.d/50-cua-ycwang-l1.rules",
+        cua_driver_core::elevation::DEFAULT_ELEVATED_HELPER_PATH,
+    ] {
+        let p = Path::new(sys_path);
+        if let Some(hash) = sha256_hex(p) {
+            report.push(Probe::ok(
+                format!("rule:{}", p.file_name().and_then(|n| n.to_str()).unwrap_or(sys_path)),
+                format!("{sys_path} (sha256={hash})"),
+            ));
+        } else {
+            missing_reasons.push(format!("missing system file: {sys_path}"));
+            report.push(Probe::warn(
+                format!("rule:{}", p.file_name().and_then(|n| n.to_str()).unwrap_or(sys_path)),
+                format!("not installed: {sys_path}"),
+            ));
+        }
+    }
+
+    if !missing_reasons.is_empty() {
+        report.elevation_required = Some(cua_driver_core::elevation::ElevationRequired::new(
+            "io.github.yuchengwang.cua.uinput.setup",
+            cua_driver_core::elevation::ElevationMode::OutOfBandSudo,
+            vec!["./deploy/linux/scripts/install-system-rules.sh".to_owned()],
+            missing_reasons,
+            true,
+            "cua-ycwang doctor --json",
+            "Run the commands printed by install-system-rules.sh out-of-band, then re-run doctor.",
+        ));
     }
 }
 

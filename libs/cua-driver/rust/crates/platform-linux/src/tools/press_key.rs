@@ -81,6 +81,9 @@ impl Tool for PressKeyTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        if let Some(display_id) = super::mcp_virtual_screen::resolve_virtual_display_from_args(&args) {
+            return super::mcp_virtual_screen::virtual_press_key(display_id, &args).await;
+        }
         use cua_driver_core::tool_args::ArgsExt;
         if (args.opt_str("scope").as_deref() == Some("desktop")
             || coordinate_frame_is_desktop(&args))

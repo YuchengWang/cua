@@ -1,0 +1,321 @@
+{
+  "schema_version": 1,
+  "app_id": "tws",
+  "app_version": "seeded",
+  "version_source": "install4j",
+  "fingerprint_sha256": "seeded",
+  "tech_stack": "java_install4j",
+  "atspi_blind": true,
+  "recommended_interaction": "visual_grounding_plus_hotkeys",
+  "launch_isolation_hints": [
+    "-J-DjtsConfigDir=${CUA_YCWANG_HOME:-$HOME/.cua-ycwang}/jts"
+  ],
+  "verified_shortcuts": [
+    {
+      "id": "tws.dismiss_modal",
+      "keys": ["Escape"],
+      "description": "Dismiss startup warning or pending tasks modal",
+      "source": "java_install4j_default"
+    },
+    {
+      "id": "tws.new_window",
+      "keys": ["ctrl", "n"],
+      "description": "Open New Window menu (read-only navigation)",
+      "source": "seeded_tws_recipe"
+    }
+  ],
+  "menu_topology": [
+    {
+      "path": ["New Window"],
+      "label": "New Window",
+      "shortcut": "Ctrl+N",
+      "role": "menu"
+    },
+    {
+      "path": ["New Window", "Watchlist"],
+      "label": "Watchlist",
+      "role": "menu_item"
+    }
+  ],
+  "relative_anchors": [
+    {
+      "name": "warning_dismiss",
+      "role": "push_button",
+      "title_pattern": "^Warning$",
+      "rel_x": 0.5,
+      "rel_y": 0.92
+    },
+    {
+      "name": "new_window_button",
+      "role": "push_button",
+      "title_pattern": ".*(Interactive Brokers|Trader Workstation|Simulated Trading).*",
+      "rel_x": 0.04,
+      "rel_y": 0.06
+    },
+    {
+      "name": "watchlist_panel",
+      "role": "panel",
+      "title_pattern": ".*(Interactive Brokers|Trader Workstation|Simulated Trading).*",
+      "rel_x": 0.15,
+      "rel_y": 0.35
+    },
+    {
+      "name": "trades_panel",
+      "role": "panel",
+      "title_pattern": ".*(Interactive Brokers|Trader Workstation|Simulated Trading).*",
+      "rel_x": 0.18,
+      "rel_y": 0.12
+    }
+  ],
+  "modal_handlers": [
+    {
+      "pattern": ".*(Pending Tasks|Login Messages).*",
+      "action": "press_key",
+      "key": "Escape"
+    },
+    {
+      "pattern": ".*Daily Lineup.*",
+      "action": "hotkey",
+      "key": "alt+F4"
+    }
+  ],
+  "flows": {
+    "dismiss_startup_modals": [
+      {
+        "action": "click_anchor",
+        "args": { "anchor": "warning_dismiss" },
+        "description": "Click 'I understand and accept' on the Paper Trading Warning dialog"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 350 },
+        "description": "Allow post-Warning transition to settle"
+      },
+      {
+        "action": "dismiss_modals",
+        "args": {},
+        "description": "Dismiss Daily Lineup / Pending Tasks / Login Messages via targeted modal_handlers"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 300 },
+        "description": "Allow main workspace to settle"
+      },
+      {
+        "action": "verify_window_count_min",
+        "args": { "min": 1, "title_regex": ".*(Interactive Brokers|Trader Workstation|Simulated Trading).*" },
+        "description": "Verify main TWS window remains open after modal cleanup"
+      }
+    ],
+    "open_new_window_menu": [
+      {
+        "action": "click_anchor",
+        "args": { "anchor": "new_window_button" },
+        "description": "Click New Window button in Mosaic top-left toolbar"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 300 },
+        "description": "Wait for New Window menu popup"
+      },
+      {
+        "action": "verify_window_count_min",
+        "args": { "min": 1 },
+        "description": "Verify TWS window/menu is active"
+      }
+    ],
+    "open_watchlist": [
+      {
+        "action": "click_anchor",
+        "args": { "anchor": "watchlist_panel" },
+        "description": "Focus Watchlist panel in Mosaic layout (read-only)"
+      },
+      {
+        "action": "verify_window_title_regex",
+        "args": { "pattern": ".*(Interactive Brokers|Trader Workstation|Simulated Trading).*" },
+        "description": "Verify TWS main window title without screenshot"
+      }
+    ],
+    "login_from_env": [
+      {
+        "action": "verify_window_count_min",
+        "args": { "min": 1 },
+        "safety_level": "auth_only",
+        "description": "Verify TWS login window is mapped on display"
+      },
+      {
+        "action": "hotkey",
+        "args": { "keys": ["ctrl", "a"] },
+        "safety_level": "auth_only",
+        "description": "Select any existing text in TWS username field"
+      },
+      {
+        "action": "press_key",
+        "args": { "key": "BackSpace", "scope": "desktop" },
+        "safety_level": "auth_only",
+        "description": "Clear existing text in TWS username field"
+      },
+      {
+        "action": "type_secret_from_env",
+        "args": { "env_key": "CUA_YCWANG_TWS_PAPER_USERNAME", "press_enter": false },
+        "safety_level": "auth_only",
+        "description": "Type TWS paper username from .env without exposing plaintext (or CUA_YCWANG_TWS_LIVE_USERNAME)"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 150 },
+        "safety_level": "auth_only",
+        "description": "Allow Swing EDT to settle before Tab focus traversal"
+      },
+      {
+        "action": "press_key",
+        "args": { "key": "Tab", "scope": "desktop" },
+        "safety_level": "auth_only",
+        "description": "Move focus from username field to password field"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 150 },
+        "safety_level": "auth_only",
+        "description": "Allow password field focus to settle"
+      },
+      {
+        "action": "hotkey",
+        "args": { "keys": ["ctrl", "a"] },
+        "safety_level": "auth_only",
+        "description": "Select any existing text in TWS password field"
+      },
+      {
+        "action": "press_key",
+        "args": { "key": "BackSpace", "scope": "desktop" },
+        "safety_level": "auth_only",
+        "description": "Clear existing text in TWS password field"
+      },
+      {
+        "action": "type_secret_from_env",
+        "args": { "env_key": "CUA_YCWANG_TWS_PAPER_PASSWORD", "press_enter": true },
+        "safety_level": "auth_only",
+        "description": "Type TWS paper password from .env and submit login (login-only; no order actions)"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 1000 },
+        "safety_level": "auth_only",
+        "description": "Allow post-login transition to settle"
+      }
+    ],
+    "verify_workspace_ready": [
+      {
+        "action": "verify_window_count_min",
+        "args": { "min": 1 },
+        "description": "Verify TWS main window is mapped on display"
+      },
+      {
+        "action": "verify_window_title_regex",
+        "args": { "pattern": ".*(Interactive Brokers|Trader Workstation|Simulated Trading).*" },
+        "description": "Verify TWS main window title without screenshot"
+      }
+    ],
+    "copy_watchlist_snapshot": [
+      {
+        "action": "click_anchor",
+        "args": { "anchor": "watchlist_panel" },
+        "description": "Focus Watchlist panel in Mosaic layout"
+      },
+      {
+        "action": "hotkey",
+        "args": { "keys": ["ctrl", "a"] },
+        "description": "Select watchlist rows"
+      },
+      {
+        "action": "hotkey",
+        "args": { "keys": ["ctrl", "c"] },
+        "description": "Copy watchlist rows to clipboard"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 200 }
+      },
+      {
+        "action": "read_clipboard",
+        "args": { "min_len": 2, "max_bytes": 65536, "clear_before": false },
+        "method": "clipboard",
+        "safety_level": "read_only",
+        "latency_ms_est": 150,
+        "description": "Read copied watchlist snapshot from clipboard"
+      }
+    ]
+  },
+  "capabilities": {
+    "workspace_health": {
+      "data_channel": "window_meta",
+      "flow": "verify_workspace_ready",
+      "safety_level": "read_only",
+      "latency_ms_est": 50,
+      "fallback_method": "screenshot_full",
+      "output_schema": {
+        "format": "json",
+        "fields": ["window_title", "pid"]
+      }
+    },
+    "watchlist_snapshot": {
+      "data_channel": "clipboard",
+      "flow": "copy_watchlist_snapshot",
+      "safety_level": "read_only",
+      "latency_ms_est": 800,
+      "fallback_method": "screenshot_roi",
+      "output_schema": {
+        "format": "tsv",
+        "delimiter": "\t",
+        "roi_norm": [0.02, 0.08, 0.40, 0.70]
+      }
+    },
+    "portfolio_export": {
+      "data_channel": "file_export",
+      "flow": "open_watchlist",
+      "safety_level": "read_only",
+      "latency_ms_est": 1500,
+      "artifact_path": "${HOME}/.cua-ycwang/exports/tws_portfolio.csv",
+      "fallback_method": "screenshot_roi",
+      "output_schema": {
+        "format": "csv",
+        "delimiter": ",",
+        "roi_norm": [0.02, 0.08, 0.96, 0.85]
+      }
+    }
+  },
+  "safety_policy": {
+    "default_max_level": "read_only",
+    "blocked_shortcuts": ["ctrl+enter", "alt+t"],
+    "blocked_flows": ["submit_order", "transmit_order", "place_trade"],
+    "notes": "Read-only Mosaic workspace & watchlist inspection + auth-only login; order transmission is strictly blocked."
+  },
+  "state_machine": {
+    "initial_state": "ready",
+    "states": [
+      {
+        "id": "ready",
+        "description": "Initial state for IBKR Trader Workstation",
+        "title_regex": ".*(Interactive Brokers|Trader Workstation|Simulated Trading).*",
+        "expected_roles": ["window"],
+        "captcha_patterns": ["Verify you are human", "CAPTCHA", "Turnstile"]
+      },
+      {
+        "id": "workspace",
+        "description": "Main Mosaic workspace after initial settle",
+        "expected_roles": [],
+        "captcha_patterns": []
+      }
+    ],
+    "transitions": [
+      {
+        "from_state": "ready",
+        "to_state": "workspace",
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 500 },
+        "wait_for_stable_frame_ms": 500,
+        "on_error": "dismiss_modal_and_retry"
+      }
+    ]
+  }
+}
