@@ -87,6 +87,7 @@ pub mod video_wayland;
 pub mod wayland;
 
 pub mod desktop;
+pub mod ime;
 
 // Pure AT-SPI role / X cursor name tables for presence cursor shapes; tested
 // on every host.

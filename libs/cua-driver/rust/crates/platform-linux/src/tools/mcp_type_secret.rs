@@ -286,6 +286,7 @@ impl Tool for TypeSecretFromEnvTool {
         match tokio::task::spawn_blocking(move || -> anyhow::Result<(String, usize)> {
             let secret = resolve_secret_from_env(&env_key, env_file.as_deref())?;
             let ctx = global_screen_pool().get_or_connect(&target)?;
+            let _ime_guard = crate::ime::ImeGuard::acquire();
             let char_len = type_secret_into_context(&ctx, &env_key, &secret, press_enter)?;
             drop(secret);
             Ok((ctx.display_id.clone(), char_len))
@@ -375,6 +376,7 @@ impl Tool for TypeTotpFromEnvTool {
                 min_remaining_secs,
             )?;
             let ctx = global_screen_pool().get_or_connect(&target)?;
+            let _ime_guard = crate::ime::ImeGuard::acquire();
             let char_len = type_secret_into_context(&ctx, &env_key, &outcome.code, press_enter)?;
             let digits = outcome.digits;
             let period = outcome.period;
