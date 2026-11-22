@@ -7,6 +7,15 @@
 
 ## [Unreleased] — `feat/x11-virtual-desktop`
 
+### Hotfix: TWS Full-Spectrum Audit Fixes (`acquire_app_data` `pid`/`window_id`/`app_path`, `login_from_env` `Tab` & `dismiss_startup_modals`) (`2026-11-22`, Landed)
+- **Fixed / 修复**：
+  - `platform-linux/src/tools/mcp_app_recipe.rs`: Added optional `pid`, `window_id`, and `app_path` parameters to `AcquireAppDataTool` schema and `invoke()` handler (matching `RunAppRecipeTool` so `acquire_app_data` resolves versioned recipes + curated overlays without requiring `recipe_path`); added `scope` (`"desktop"` vs `"window"`) support to recipe `press_key` steps and added targeted `dismiss_modals` step action executing `modal_handlers` only on matching window titles.
+  - `platform-linux/src/x11/virtual_input.rs`: Hardened `xtest_press_key()` with `release_stuck_modifiers()` and `10ms` press/release separation for Java Swing `EventQueue` reliability; made `xtest_focus_window()` a no-op when `get_input_focus()` is already on the target window so Swing dialogs do not receive redundant `FocusIn` resets during `login_from_env`.
+  - `deploy/linux/user/app_recipes/tws.json`: Updated `login_from_env` with `Ctrl+a` + `BackSpace` clearing before `CUA_YCWANG_TWS_PAPER_USERNAME` and `CUA_YCWANG_TWS_PAPER_PASSWORD` plus `scope: "desktop"` `Tab` (all steps `safety_level: "auth_only"`); added targeted `.*Daily Lineup.*` (`alt+F4`) handler to `modal_handlers` and updated `dismiss_startup_modals` to use `dismiss_modals` + `Escape` + `Return` + `verify_window_count_min` without blind `Alt+F4`.
+- **Verified / 已核验**：
+  - Added `acquire_app_data_schema_includes_pid_window_id_and_app_path` and `tws_curated_recipe_parses_with_auth_only_login_and_safe_modals` regression tests in `mcp_app_recipe::tests`.
+  - `cargo clippy -p cua-driver-core -p platform-linux -p cua-driver --all-targets -- -D warnings`, `cargo test -p cua-driver-core --lib`, `cargo test -p platform-linux --lib`, `cargo test -p cua-driver --test schema_consistency_test`, `cargo build --release -p cua-driver`, isolated install to `~/.cua-ycwang/packages/current/cua-ycwang`, and `deploy-user-config.sh` all passed.
+
 ### P0–P2 4-Tier Interaction & Capability Routing (`acquire_app_data`, Curated Overlay, `SafetyLevel` Gate & `Artifact` Actions) (`2026-11-22`, Landed)
 - **Added / Changed**：
   - `cua-driver-core/src/app_recipe.rs`: Added `DataChannel`, `SafetyLevel`, `OutputSchema`, `CapabilitySpec`, `SafetyPolicy`, and optional `RecipeStep` metadata (`method`, `safety_level`, `latency_ms_est`, `fallback_method`) with full `#[serde(default)]` backward compatibility; upgraded `AppRecipeCache` to track `(source_path, modified_ns, file_len)` (and overlay stamp) for automatic disk invalidation/reload; added `merge_curated_overlay()` and updated `find_best_recipe_for_app()` / `find_best_recipe_with_path()` to merge `<app_id>.json` curated overlays onto version-pinned `<app_id>_v<ver>_<fp8>.json` base recipes while preserving base identity fields.

@@ -72,14 +72,44 @@
       "pattern": ".*(Pending Tasks|Login Messages|Warning).*",
       "action": "press_key",
       "key": "Escape"
+    },
+    {
+      "pattern": ".*Daily Lineup.*",
+      "action": "hotkey",
+      "key": "alt+F4"
     }
   ],
   "flows": {
     "dismiss_startup_modals": [
       {
+        "action": "dismiss_modals",
+        "args": {},
+        "description": "Dismiss any matched TWS startup modals (Warning/Pending Tasks via Escape, Daily Lineup via targeted Alt+F4)"
+      },
+      {
         "action": "press_key",
-        "args": { "key": "Escape" },
-        "description": "Dismiss any startup warning or pending tasks modal"
+        "args": { "key": "Escape", "scope": "desktop" },
+        "description": "Dismiss any generic startup popup"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 250 },
+        "description": "Allow modal state to settle"
+      },
+      {
+        "action": "press_key",
+        "args": { "key": "Return", "scope": "desktop" },
+        "description": "Confirm Warning ('I understand and accept') if focused"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 300 },
+        "description": "Allow post-Warning transition to settle"
+      },
+      {
+        "action": "dismiss_modals",
+        "args": {},
+        "description": "Second-pass targeted dismissal for Daily Lineup or secondary startup modals"
       },
       {
         "action": "wait_for_stable_frame",
@@ -129,16 +159,52 @@
         "description": "Verify TWS login window is mapped on display"
       },
       {
+        "action": "hotkey",
+        "args": { "keys": ["ctrl", "a"] },
+        "safety_level": "auth_only",
+        "description": "Select any existing text in TWS username field"
+      },
+      {
+        "action": "press_key",
+        "args": { "key": "BackSpace", "scope": "desktop" },
+        "safety_level": "auth_only",
+        "description": "Clear existing text in TWS username field"
+      },
+      {
         "action": "type_secret_from_env",
         "args": { "env_key": "CUA_YCWANG_TWS_PAPER_USERNAME", "press_enter": false },
         "safety_level": "auth_only",
         "description": "Type TWS paper username from .env without exposing plaintext (or CUA_YCWANG_TWS_LIVE_USERNAME)"
       },
       {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 150 },
+        "safety_level": "auth_only",
+        "description": "Allow Swing EDT to settle before Tab focus traversal"
+      },
+      {
         "action": "press_key",
-        "args": { "key": "Tab" },
+        "args": { "key": "Tab", "scope": "desktop" },
         "safety_level": "auth_only",
         "description": "Move focus from username field to password field"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 150 },
+        "safety_level": "auth_only",
+        "description": "Allow password field focus to settle"
+      },
+      {
+        "action": "hotkey",
+        "args": { "keys": ["ctrl", "a"] },
+        "safety_level": "auth_only",
+        "description": "Select any existing text in TWS password field"
+      },
+      {
+        "action": "press_key",
+        "args": { "key": "BackSpace", "scope": "desktop" },
+        "safety_level": "auth_only",
+        "description": "Clear existing text in TWS password field"
       },
       {
         "action": "type_secret_from_env",

@@ -622,9 +622,12 @@ impl Tool for AcquireAppDataTool {
                 "properties": {
                     "app_id": { "type": "string" },
                     "capability": { "type": "string", "description": "Named capability in recipe.capabilities." },
+                    "recipe_path": { "type": "string" },
+                    "pid": { "type": "integer" },
+                    "window_id": { "type": "integer" },
+                    "app_path": { "type": "string" },
                     "display_id": { "type": "string" },
                     "session": cua_driver_core::tool_schema::session_schema(),
-                    "recipe_path": { "type": "string" },
                     "fallback": { "type": "boolean", "default": true },
                     "allow_safety_level": {
                         "type": "string",
@@ -660,18 +663,21 @@ impl Tool for AcquireAppDataTool {
         };
         let display_id = resolve_display_id(&args);
         let mut req = InspectAppFlowRequest {
-            pid: None,
-            window_id: None,
-            app_path: None,
+            pid: args.opt_u64("pid").map(|v| v as u32),
+            window_id: args.opt_u64("window_id"),
+            app_path: args.opt_str("app_path"),
             display_id: display_id.clone(),
         };
 
         match tokio::task::spawn_blocking(move || -> anyhow::Result<ToolResult> {
-            if let Ok(target) = DisplayTarget::from_display_id(display_id.as_deref()) {
-                if let Ok(ctx) = global_screen_pool().get_or_connect(&target) {
-                    if let Some(win) = find_window_for_app(&ctx, &app_id) {
-                        req.window_id = Some(win.xid);
-                        req.pid = win.pid;
+            // Auto-resolve target window on display_id when pid/window_id/app_path are omitted.
+            if req.pid.is_none() && req.window_id.is_none() && req.app_path.is_none() {
+                if let Ok(target) = DisplayTarget::from_display_id(display_id.as_deref()) {
+                    if let Ok(ctx) = global_screen_pool().get_or_connect(&target) {
+                        if let Some(win) = find_window_for_app(&ctx, &app_id) {
+                            req.window_id = Some(win.xid);
+                            req.pid = win.pid;
+                        }
                     }
                 }
             }
@@ -1412,8 +1418,51 @@ fn execute_recipe_step(
                 .get("key")
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("press_key requires 'key'"))?;
+            let scope = args.get("scope").and_then(Value::as_str);
+            if scope != Some("desktop") {
+                if let Some(wid) = target_window_id {
+                    let _ = xtest_focus_window(xctx, wid);
+                }
+            }
             xtest_press_key(xctx, key)?;
-            Ok(json!({ "key": key }))
+            Ok(json!({ "key": key, "scope": scope.unwrap_or("window") }))
+        }
+        "dismiss_modals" => {
+            let xctx = ctx.ok_or_else(|| anyhow::anyhow!("X11 display context unavailable"))?;
+            let wins = crate::x11::list_windows_with_context(xctx, None);
+            let mut dismissed = Vec::new();
+            for win in &wins {
+                if let Some(handler) = recipe.modal_handlers.iter().find(|h| {
+                    regex::Regex::new(&h.pattern)
+                        .map(|re| re.is_match(&win.title))
+                        .unwrap_or(false)
+                }) {
+                    let _ = xtest_focus_window(xctx, win.xid);
+                    match handler.action.as_str() {
+                        "hotkey" | "shortcut" => {
+                            let keys = handler
+                                .key
+                                .as_deref()
+                                .map(|k| parse_shortcut_keys(&json!({ "key": k })))
+                                .unwrap_or_default();
+                            if !keys.is_empty() {
+                                xtest_hotkey(xctx, &keys)?;
+                            }
+                        }
+                        _ => {
+                            let key = handler.key.as_deref().unwrap_or("Escape");
+                            xtest_press_key(xctx, key)?;
+                        }
+                    }
+                    dismissed.push(json!({
+                        "window_id": win.xid,
+                        "title": win.title,
+                        "action": handler.action,
+                        "key": handler.key,
+                    }));
+                }
+            }
+            Ok(json!({ "dismissed": dismissed, "count": dismissed.len() }))
         }
         "hotkey" | "shortcut" => {
             let xctx = ctx.ok_or_else(|| anyhow::anyhow!("X11 display context unavailable"))?;
@@ -1988,5 +2037,115 @@ mod tests {
         assert!(summary.contains("bytes=18 line_count=2"));
         assert!(summary.contains("Date\tProb"));
         assert!(summary.contains("800x600 bytes=12345"));
+    }
+
+    #[test]
+    fn acquire_app_data_schema_includes_pid_window_id_and_app_path() {
+        let def = AcquireAppDataTool.def();
+        let props = def.input_schema["properties"]
+            .as_object()
+            .expect("properties must be an object");
+        for key in [
+            "app_id",
+            "capability",
+            "recipe_path",
+            "pid",
+            "window_id",
+            "app_path",
+            "display_id",
+            "session",
+            "fallback",
+            "allow_safety_level",
+        ] {
+            assert!(props.contains_key(key), "acquire_app_data missing '{key}'");
+        }
+        assert_eq!(props["pid"]["type"], "integer");
+        assert_eq!(props["window_id"]["type"], "integer");
+        assert_eq!(props["app_path"]["type"], "string");
+    }
+
+    #[test]
+    fn tws_curated_recipe_parses_with_auth_only_login_and_safe_modals() {
+        let raw = include_str!("../../../../../../../deploy/linux/user/app_recipes/tws.json");
+        let recipe: AppRecipe = serde_json::from_str(raw).expect("tws.json must parse as AppRecipe");
+        assert_eq!(recipe.app_id, "tws");
+
+        // Verify login_from_env steps are all auth_only, clear existing fields, and use desktop Tab.
+        let login = recipe
+            .flows
+            .get("login_from_env")
+            .expect("tws.json must define login_from_env");
+        assert!(
+            login
+                .iter()
+                .all(|s| s.safety_level == Some(SafetyLevel::AuthOnly)),
+            "every step in login_from_env must be marked auth_only"
+        );
+        let has_ctrl_a = login
+            .iter()
+            .filter(|s| s.action == "hotkey" && s.args["keys"] == json!(["ctrl", "a"]))
+            .count();
+        let has_backspace = login
+            .iter()
+            .filter(|s| s.action == "press_key" && s.args["key"] == "BackSpace")
+            .count();
+        assert_eq!(has_ctrl_a, 2, "expected Ctrl+a before both username and password");
+        assert_eq!(
+            has_backspace, 2,
+            "expected BackSpace before both username and password"
+        );
+        assert!(
+            login.iter().any(|s| s.action == "press_key"
+                && s.args["key"] == "Tab"
+                && s.args["scope"] == "desktop"),
+            "login_from_env Tab must use scope=desktop"
+        );
+
+        // Verify dismiss_startup_modals never sends a blind Alt+F4 hotkey; Daily Lineup is targeted via modal_handlers.
+        let dismiss = recipe
+            .flows
+            .get("dismiss_startup_modals")
+            .expect("tws.json must define dismiss_startup_modals");
+        assert!(
+            !dismiss
+                .iter()
+                .any(|s| s.action == "hotkey" || s.action == "shortcut"),
+            "dismiss_startup_modals must not send blind Alt+F4 hotkey"
+        );
+        assert!(dismiss.iter().any(|s| s.action == "dismiss_modals"));
+        assert!(dismiss
+            .iter()
+            .any(|s| s.action == "press_key" && s.args["key"] == "Return"));
+        assert!(dismiss
+            .iter()
+            .any(|s| s.action == "verify_window_count_min"));
+
+        assert!(recipe
+            .modal_handlers
+            .iter()
+            .any(|h| h.pattern.contains("Daily Lineup")
+                && h.action == "hotkey"
+                && h.key.as_deref() == Some("alt+F4")));
+        assert!(recipe.capabilities.contains_key("workspace_health"));
+        assert!(recipe.capabilities.contains_key("watchlist_snapshot"));
+        assert!(recipe.capabilities.contains_key("portfolio_export"));
+
+        // Verify SafetyLevel gate blocks login_from_env under ReadOnly and allows under AuthOnly.
+        assert!(check_safety_gate(
+            &recipe,
+            Some("login_from_env"),
+            login,
+            SafetyLevel::ReadOnly,
+            SafetyLevel::ReadOnly,
+        )
+        .is_err());
+        assert!(check_safety_gate(
+            &recipe,
+            Some("login_from_env"),
+            login,
+            SafetyLevel::ReadOnly,
+            SafetyLevel::AuthOnly,
+        )
+        .is_ok());
     }
 }

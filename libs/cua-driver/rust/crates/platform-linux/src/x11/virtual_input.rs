@@ -115,6 +115,7 @@ pub fn xtest_scroll(ctx: &X11ScreenContext, x: i16, y: i16, dx: i32, dy: i32) ->
 pub fn xtest_press_key(ctx: &X11ScreenContext, key: &str) -> Result<()> {
     let (keycode, shift) = resolve_key_to_keycode(ctx, key)?;
     let root = ctx.root_window();
+    let _ = release_stuck_modifiers(ctx);
     let shift_kc = if shift {
         find_keycode_for_keysym(ctx, 0xFFE1).map(|(kc, _)| kc)
     } else {
@@ -126,6 +127,8 @@ pub fn xtest_press_key(ctx: &X11ScreenContext, key: &str) -> Result<()> {
     }
     ctx.conn
         .xtest_fake_input(KEY_PRESS, keycode, 0, root, 0, 0, 0)?;
+    ctx.conn.flush()?;
+    std::thread::sleep(Duration::from_millis(10));
     ctx.conn
         .xtest_fake_input(KEY_RELEASE, keycode, 0, root, 0, 0, 0)?;
     if let Some(sk) = shift_kc {
@@ -164,6 +167,13 @@ pub fn xtest_hotkey(ctx: &X11ScreenContext, keys: &[String]) -> Result<()> {
 pub fn xtest_focus_window(ctx: &X11ScreenContext, window_id: u64) -> Result<()> {
     let window = u32::try_from(window_id)
         .map_err(|_| anyhow!("window_id {window_id} out of X11 u32 range"))?;
+    if let Ok(cookie) = ctx.conn.get_input_focus() {
+        if let Ok(reply) = cookie.reply() {
+            if reply.focus == window {
+                return Ok(());
+            }
+        }
+    }
     let root = ctx.root_window();
     let _ = ctx.conn.map_window(window);
     if let Ok(cookie) = ctx.conn.intern_atom(false, b"_NET_ACTIVE_WINDOW") {
