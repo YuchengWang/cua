@@ -150,6 +150,8 @@ pub fn xtest_hotkey(ctx: &X11ScreenContext, keys: &[String]) -> Result<()> {
     for &kc in &keycodes {
         ctx.conn.xtest_fake_input(KEY_PRESS, kc, 0, root, 0, 0, 0)?;
     }
+    ctx.conn.flush()?;
+    std::thread::sleep(Duration::from_millis(10));
     for &kc in keycodes.iter().rev() {
         ctx.conn
             .xtest_fake_input(KEY_RELEASE, kc, 0, root, 0, 0, 0)?;
@@ -199,6 +201,7 @@ pub fn xtest_type_text(ctx: &X11ScreenContext, text: &str) -> Result<()> {
     if text.is_empty() {
         return Ok(());
     }
+    let _ = release_stuck_modifiers(ctx);
     if text.is_ascii() {
         for ch in text.chars() {
             let key_str = match ch {
@@ -212,18 +215,63 @@ pub fn xtest_type_text(ctx: &X11ScreenContext, text: &str) -> Result<()> {
         return Ok(());
     }
 
-    // Non-ASCII: save CLIPBOARD -> write target text -> wait for selection ownership ->
-    // Ctrl+V -> wait for target app paste read -> restore.
+    // Non-ASCII (including mixed ASCII+CJK such as "AUDIT_测试_123"):
+    // save CLIPBOARD -> write full UTF-8 text -> wait for xclip/xsel Selection
+    // ownership registration -> Ctrl+V -> wait for Java Swing / Electron EDT
+    // async SelectionRequest read -> restore prior clipboard.
     let saved = clipboard_get_for_context(ctx).ok();
     clipboard_set_for_context(ctx, text)
         .context("failed to write non-ASCII text to virtual display clipboard")?;
-    std::thread::sleep(Duration::from_millis(45));
+    std::thread::sleep(Duration::from_millis(75));
+    let _ = release_stuck_modifiers(ctx);
     let paste_res = xtest_hotkey(ctx, &["ctrl".to_owned(), "v".to_owned()]);
-    std::thread::sleep(Duration::from_millis(80));
+    std::thread::sleep(Duration::from_millis(150));
     if let Some(prev) = saved {
         let _ = clipboard_set_for_context(ctx, &prev);
     }
     paste_res
+}
+
+/// Release any modifier keys currently reported as held in X11 `QueryKeymap`
+/// so residual XTest modifier state cannot corrupt `Ctrl+V` or keystrokes.
+fn release_stuck_modifiers(ctx: &X11ScreenContext) -> Result<()> {
+    const MODIFIER_KEYSYMS: [u32; 8] = [
+        0xFFE1, // Shift_L
+        0xFFE2, // Shift_R
+        0xFFE3, // Control_L
+        0xFFE4, // Control_R
+        0xFFE9, // Alt_L
+        0xFFEA, // Alt_R
+        0xFFEB, // Super_L
+        0xFFEC, // Super_R
+    ];
+    let Ok(cookie) = ctx.conn.query_keymap() else {
+        return Ok(());
+    };
+    let Ok(reply) = cookie.reply() else {
+        return Ok(());
+    };
+    let root = ctx.root_window();
+    let mut released = false;
+    for sym in MODIFIER_KEYSYMS {
+        if let Some((kc, _)) = find_keycode_for_keysym(ctx, sym) {
+            let byte_idx = usize::from(kc / 8);
+            let bit_mask = 1u8 << (kc % 8);
+            if reply
+                .keys
+                .get(byte_idx)
+                .is_some_and(|b| (b & bit_mask) != 0)
+            {
+                ctx.conn
+                    .xtest_fake_input(KEY_RELEASE, kc, 0, root, 0, 0, 0)?;
+                released = true;
+            }
+        }
+    }
+    if released {
+        ctx.conn.sync()?;
+    }
+    Ok(())
 }
 
 /// Read `CLIPBOARD` text on `ctx` using `xclip` / `xsel` scoped to `ctx.display_id`

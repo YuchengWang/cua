@@ -19,16 +19,25 @@ use crate::x11::virtual_input::{clipboard_get_for_context, clipboard_set_for_con
 use crate::x11::virtual_screen::global_virtual_screen_manager;
 
 fn resolve_target_display(args: &Value) -> Result<DisplayTarget, ToolResult> {
-    let explicit = args.opt_str("display_id");
+    resolve_target_display_with(global_virtual_screen_manager(), args)
+}
+
+/// Priority: explicit `display_id` (including `"primary"` / `":0.0"`) >
+/// `session`-bound virtual display > default `Primary`.
+fn resolve_target_display_with(
+    mgr: &crate::x11::virtual_screen::VirtualScreenManager,
+    args: &Value,
+) -> Result<DisplayTarget, ToolResult> {
+    if let Some(explicit) = args.opt_str("display_id").filter(|s| !s.trim().is_empty()) {
+        return DisplayTarget::from_display_id(Some(&explicit))
+            .map_err(|e| ToolResult::error(format!("invalid display_id: {e:#}")));
+    }
     let session = args.opt_str("session");
-    if let Some(id) =
-        global_virtual_screen_manager().resolve_display_for_session(session.as_deref(), explicit.as_deref())
-    {
+    if let Some(id) = mgr.resolve_display_for_session(session.as_deref(), None) {
         return DisplayTarget::from_display_id(Some(&id))
             .map_err(|e| ToolResult::error(format!("invalid display_id: {e:#}")));
     }
-    DisplayTarget::from_display_id(explicit.as_deref())
-        .map_err(|e| ToolResult::error(format!("invalid display_id: {e:#}")))
+    Ok(DisplayTarget::Primary)
 }
 
 pub struct GetClipboardTool;
@@ -186,5 +195,49 @@ impl Tool for SyncClipboardTool {
             Ok(Err(e)) => ToolResult::error(format!("sync_clipboard failed: {e:#}")),
             Err(e) => ToolResult::error(format!("sync_clipboard panicked: {e}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::x11::virtual_screen::VirtualScreenManager;
+
+    #[test]
+    fn explicit_display_id_takes_priority_over_bound_session() {
+        let mgr = VirtualScreenManager::new();
+        mgr.insert_test_screen_for_routing(":132", "tws-full-audit");
+
+        let primary_override = resolve_target_display_with(
+            &mgr,
+            &json!({
+                "session": "tws-full-audit",
+                "display_id": "primary"
+            }),
+        )
+        .unwrap();
+        assert_eq!(primary_override, DisplayTarget::Primary);
+
+        let x11_override = resolve_target_display_with(
+            &mgr,
+            &json!({
+                "session": "tws-full-audit",
+                "display_id": ":0.0"
+            }),
+        )
+        .unwrap();
+        assert_eq!(x11_override, DisplayTarget::Virtual(":0.0".to_owned()));
+
+        let session_routed = resolve_target_display_with(
+            &mgr,
+            &json!({
+                "session": "tws-full-audit"
+            }),
+        )
+        .unwrap();
+        assert_eq!(session_routed, DisplayTarget::Virtual(":132".to_owned()));
+
+        let default_primary = resolve_target_display_with(&mgr, &json!({})).unwrap();
+        assert_eq!(default_primary, DisplayTarget::Primary);
     }
 }

@@ -95,9 +95,30 @@ fn m4_xtest_click_and_cjk_clipboard_roundtrip() {
     }
     assert!(got_button, "virtual screen window did not receive XTest ButtonPress");
 
-    // 2. Non-ASCII CJK text typing preserves prior CLIPBOARD content.
+    // 2. Non-ASCII & mixed ASCII+CJK text typing delivers Ctrl+V and preserves prior CLIPBOARD content.
+    platform_linux::x11::virtual_input::xtest_focus_window(&ctx, u64::from(win))
+        .expect("focus test window");
     clipboard_set_for_context(&ctx, "prev-clip-99").expect("seed prior clipboard");
-    xtest_type_text(&ctx, "中文测试A1").expect("xtest_type_text CJK");
+    while let Ok(Some(_)) = ctx.conn.poll_for_event() {}
+    xtest_type_text(&ctx, "AUDIT_测试_123").expect("xtest_type_text mixed ASCII+CJK");
+    let mut key_presses = 0usize;
+    let key_deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < key_deadline {
+        match ctx.conn.poll_for_event() {
+            Ok(Some(Event::KeyPress(_))) => key_presses += 1,
+            Ok(Some(_)) => {}
+            _ => {
+                if key_presses >= 2 {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(15));
+            }
+        }
+    }
+    assert!(
+        key_presses >= 2,
+        "expected Ctrl+V KeyPress events for mixed ASCII+CJK paste, got {key_presses}"
+    );
     let restored = clipboard_get_for_context(&ctx).expect("read restored clipboard");
     assert_eq!(
         restored, "prev-clip-99",

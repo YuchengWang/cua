@@ -89,10 +89,12 @@ struct ManagedScreen {
     runtime_dir: PathBuf,
     vnc_passwd_path: Option<PathBuf>,
     children: Vec<Child>,
+    launched_children: Vec<Child>,
 }
 
 impl Drop for ManagedScreen {
     fn drop(&mut self) {
+        terminate_children(&mut self.launched_children);
         terminate_children(&mut self.children);
         let _ = fs::remove_dir_all(&self.runtime_dir);
         global_screen_pool().invalidate(&self.info.display_id);
@@ -364,6 +366,7 @@ impl VirtualScreenManager {
                 runtime_dir,
                 vnc_passwd_path,
                 children,
+                launched_children: Vec::new(),
             },
         );
         Ok(info)
@@ -415,7 +418,10 @@ impl VirtualScreenManager {
         session_id: Option<&str>,
         explicit_display_id: Option<&str>,
     ) -> Option<String> {
-        if let Some(id) = explicit_display_id.filter(|s| !s.is_empty() && *s != "primary") {
+        if let Some(id) = explicit_display_id.filter(|s| !s.trim().is_empty()) {
+            if id == "primary" {
+                return None;
+            }
             return Some(id.to_owned());
         }
         let sid = session_id?;
@@ -476,12 +482,58 @@ impl VirtualScreenManager {
         let child = cmd
             .spawn()
             .with_context(|| format!("failed to launch '{command}' on {display_id}"))?;
+        let pid = child.id();
+
+        {
+            let mut guard = self.screens.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(screen) = guard.get_mut(&info.display_id) {
+                screen
+                    .launched_children
+                    .retain_mut(|c| matches!(c.try_wait(), Ok(None)));
+                screen.launched_children.push(child);
+            }
+        }
 
         Ok(LaunchedAppInfo {
             display_id: info.display_id,
-            pid: child.id(),
+            pid,
             command: command.to_owned(),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_test_screen_for_routing(&self, display_id: &str, session_id: &str) {
+        let display_num = display_id
+            .trim_start_matches(':')
+            .split('.')
+            .next()
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(132);
+        let mut guard = self.screens.lock().unwrap_or_else(|e| e.into_inner());
+        guard.insert(
+            display_id.to_owned(),
+            ManagedScreen {
+                info: VirtualScreenInfo {
+                    display_id: display_id.to_owned(),
+                    display_num,
+                    width: DEFAULT_WIDTH,
+                    height: DEFAULT_HEIGHT,
+                    xauth_path: PathBuf::from("/tmp/nonexistent-xauth"),
+                    dbus_address: None,
+                    vnc_port: None,
+                    session_id: Some(session_id.to_owned()),
+                    pid_xvfb: 0,
+                    pid_openbox: None,
+                    pid_dbus: None,
+                    pid_autocutsel: None,
+                    pid_x11vnc: None,
+                },
+                runtime_dir: PathBuf::from("/tmp/nonexistent-cua-test-dir"),
+                vnc_passwd_path: None,
+                children: Vec::new(),
+                launched_children: Vec::new(),
+            },
+        );
     }
 }
 
@@ -644,11 +696,67 @@ fn spawn_autocutsel(display_id: &str, xauth_path: &Path) -> (Option<u32>, Option
 }
 
 fn terminate_children(children: &mut Vec<Child>) {
-    for child in children.iter_mut() {
-        let _ = child.kill();
-        let _ = child.wait();
+    // Terminate in reverse spawn order (apps / x11vnc / autocutsel / openbox / at-spi / dbus / Xvfb)
+    // with SIGTERM -> bounded WNOHANG poll -> SIGKILL -> bounded WNOHANG reap so no <defunct> remains.
+    for child in children.iter_mut().rev() {
+        if matches!(child.try_wait(), Ok(None)) {
+            // SAFETY: standard POSIX SIGTERM to a live child PID owned by this process.
+            unsafe {
+                libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+            }
+        }
+    }
+
+    let term_deadline = Instant::now() + Duration::from_millis(150);
+    while Instant::now() < term_deadline {
+        let mut any_alive = false;
+        for child in children.iter_mut() {
+            if matches!(child.try_wait(), Ok(None)) {
+                any_alive = true;
+            }
+        }
+        if !any_alive {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    for child in children.iter_mut().rev() {
+        if matches!(child.try_wait(), Ok(None)) {
+            let pid = child.id();
+            let _ = child.kill();
+            reap_child_with_timeout(child, pid, Duration::from_millis(500));
+        }
     }
     children.clear();
+}
+
+fn reap_child_with_timeout(child: &mut Child, pid: u32, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(_) => break,
+        }
+    }
+    reap_pid_with_timeout(pid, Duration::from_millis(50));
+}
+
+fn reap_pid_with_timeout(pid: u32, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut status: libc::c_int = 0;
+        // SAFETY: non-blocking waitpid on a specific PID.
+        let rc = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+        if rc == pid as libc::pid_t || rc < 0 {
+            break;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn cleanup_x11_socket_and_lock(display_num: u16) {
@@ -688,6 +796,7 @@ fn send_sigterm_then_kill(pid: u32) {
         unsafe {
             libc::kill(pid as libc::pid_t, libc::SIGKILL);
         }
+        reap_pid_with_timeout(pid, Duration::from_millis(300));
     }
 }
 

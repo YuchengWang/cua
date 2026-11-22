@@ -7,6 +7,14 @@
 
 ## [Unreleased] — `feat/x11-virtual-desktop`
 
+### Hotfix: TWS Audit Fixes — Swing CJK `type_text`, Clipboard Routing Priority & Zombie Reaping (`2026-11-22`, Landed)
+- **Fixed / 修复**：
+  - `platform-linux/src/x11/virtual_input.rs`: Hardened `xtest_type_text()` and `xtest_hotkey()` for Java Swing / TWS mixed ASCII+CJK input (e.g. `"AUDIT_测试_123"`): added `release_stuck_modifiers()` via `QueryKeymap` before typing/pasting, `10ms` press/release separation in `xtest_hotkey()`, `75ms` `CLIPBOARD` Selection ownership settle before `Ctrl+V`, and `150ms` async Swing `SelectionRequest` settle before restoring prior clipboard.
+  - `platform-linux/src/tools/mcp_clipboard.rs` & `platform-linux/src/x11/virtual_screen.rs`: Fixed `get_clipboard` / `set_clipboard` display routing priority to `explicit display_id (including "primary" / ":0.0") > session-bound virtual display > Primary`, and updated `resolve_display_for_session` so explicit `"primary"` does not fall back to a session virtual display. Added unit test `explicit_display_id_takes_priority_over_bound_session`.
+  - `platform-linux/src/x11/virtual_screen.rs`: Tracked `launch_app()` spawned processes in `ManagedScreen::launched_children` (reaping exited processes on new launches), upgraded `terminate_children()` to reverse-order `SIGTERM` -> bounded `try_wait` -> `SIGKILL` -> bounded `waitpid(WNOHANG)` reaping, and added `reap_pid_with_timeout()` in `send_sigterm_then_kill()` to eliminate `<defunct>` zombie processes on `destroy_virtual_screen`.
+- **Verified / 已核验**：
+  - `cargo clippy -p platform-linux -p cua-driver --all-targets -- -D warnings`, `virtual_screen_m3_e2e_xorg` (with `/proc/<pid>` zero-zombie assertions), `virtual_screen_m4_xorg` (mixed `"AUDIT_测试_123"`), `platform-linux --lib`, release build & isolated install to `~/.cua-ycwang/packages/current/cua-ycwang`, and `check-docs-sync.sh` all passed.
+
 ### R1–R3: Versioned `AppRecipe`, Layered `inspect_app_flow` & Deterministic FSM Replay (`2026-11-22`, Landed)
 - **Added / 新增**：
   - `libs/cua-driver/rust/crates/cua-driver-core/src/app_recipe.rs` (exported via `lib.rs`): `AppRecipe`, `VersionGate::verify()`, `RecipeState`, `RecipeTransition`, `AuthGate`, `ModalHandler`, `VerifyResult`, `AppRecipeCache` (`RwLock<HashMap<...>>`), and `sanitize_component()` enforcing `<app_id>_v<version>_<fp8>.json` immutability under `$CUA_YCWANG_CONFIG_DIR/app_recipes/`.

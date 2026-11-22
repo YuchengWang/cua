@@ -36,6 +36,14 @@ fn pid_alive(pid: u32) -> bool {
     !stat.contains(") Z ")
 }
 
+fn assert_no_proc_or_zombie(pid: u32, label: &str) {
+    let proc_dir = PathBuf::from(format!("/proc/{pid}"));
+    if proc_dir.exists() {
+        let stat = fs::read_to_string(proc_dir.join("stat")).unwrap_or_default();
+        panic!("{label} (pid {pid}) still exists in /proc (possible <defunct> zombie): {stat}");
+    }
+}
+
 fn read_proc_cmdline(pid: u32) -> String {
     let bytes = fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
     bytes
@@ -152,26 +160,36 @@ fn m3_dual_virtual_screen_concurrency_security_and_isolation() {
     let _ = fs::remove_file(&env_dump_a);
     let _ = fs::remove_file(&env_dump_b);
 
-    mgr.launch_app(
-        &s1.display_id,
-        "sh",
-        &[
-            "-c".to_owned(),
-            format!("env > {}", env_dump_a.display()),
-        ],
-        &HashMap::new(),
-    )
-    .expect("launch_app on screen A");
-    mgr.launch_app(
-        &s2.display_id,
-        "sh",
-        &[
-            "-c".to_owned(),
-            format!("env > {}", env_dump_b.display()),
-        ],
-        &HashMap::new(),
-    )
-    .expect("launch_app on screen B");
+    let app_a = mgr
+        .launch_app(
+            &s1.display_id,
+            "sh",
+            &[
+                "-c".to_owned(),
+                format!("env > {}", env_dump_a.display()),
+            ],
+            &HashMap::new(),
+        )
+        .expect("launch_app on screen A");
+    let app_b = mgr
+        .launch_app(
+            &s2.display_id,
+            "sh",
+            &[
+                "-c".to_owned(),
+                format!("env > {}", env_dump_b.display()),
+            ],
+            &HashMap::new(),
+        )
+        .expect("launch_app on screen B");
+    let app_sleep = mgr
+        .launch_app(
+            &s1.display_id,
+            "sleep",
+            &["30".to_owned()],
+            &HashMap::new(),
+        )
+        .expect("launch long-lived sleep app on screen A");
 
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline && (!env_dump_a.exists() || !env_dump_b.exists()) {
@@ -237,11 +255,26 @@ fn m3_dual_virtual_screen_concurrency_security_and_isolation() {
 
     thread::sleep(Duration::from_millis(100));
     for s in [&s1, &s2] {
-        assert!(!pid_alive(s.pid_xvfb), "Xvfb still alive after destroy");
+        assert_no_proc_or_zombie(s.pid_xvfb, "Xvfb");
+        if let Some(pid) = s.pid_openbox {
+            assert_no_proc_or_zombie(pid, "openbox");
+        }
+        if let Some(pid) = s.pid_dbus {
+            assert_no_proc_or_zombie(pid, "dbus-daemon");
+        }
+        if let Some(pid) = s.pid_autocutsel {
+            assert_no_proc_or_zombie(pid, "autocutsel");
+        }
+        if let Some(pid) = s.pid_x11vnc {
+            assert_no_proc_or_zombie(pid, "x11vnc");
+        }
         assert!(!PathBuf::from(format!("/tmp/.X11-unix/X{}", s.display_num)).exists());
         assert!(!PathBuf::from(format!("/tmp/.X{}-lock", s.display_num)).exists());
         assert!(!s.xauth_path.exists());
     }
+    assert_no_proc_or_zombie(app_a.pid, "launched app A");
+    assert_no_proc_or_zombie(app_b.pid, "launched app B");
+    assert_no_proc_or_zombie(app_sleep.pid, "launched sleep app");
 }
 
 #[test]
