@@ -120,7 +120,26 @@ pub fn inspect_app_flow(req: InspectAppFlowRequest) -> Result<AppFlowInspection>
         &cmdline,
         req.app_path.as_deref(),
     ) {
-        let fp = exe_path
+        let resolved_exe = exe_path.clone().or_else(|| {
+            let candidate = PathBuf::from("/opt/google/chrome/chrome");
+            candidate.is_file().then_some(candidate)
+        });
+        let mut notes = vec!["Routed to browser_exempt channel (hybrid CDP + OS recipe)".to_owned()];
+        let (app_version, version_source) =
+            if let Some(exe) = resolved_exe.as_deref().filter(|p| p.is_file()) {
+                if let Some(dpkg_ver) = query_dpkg_version(exe) {
+                    notes.push("Chrome version resolved via dpkg-query".to_owned());
+                    (dpkg_ver, VersionSource::Dpkg)
+                } else if let Some(cli_ver) = query_chrome_cli_version(exe) {
+                    notes.push("Chrome version resolved via --version".to_owned());
+                    (cli_ver, VersionSource::PeOrElf)
+                } else {
+                    ("unknown".to_owned(), VersionSource::Unknown)
+                }
+            } else {
+                ("unknown".to_owned(), VersionSource::Unknown)
+            };
+        let fp = resolved_exe
             .as_deref()
             .and_then(|p| sha256_file(p).ok())
             .unwrap_or_else(|| sha256_bytes(b"chrome-browser-exempt"));
@@ -128,29 +147,35 @@ pub fn inspect_app_flow(req: InspectAppFlowRequest) -> Result<AppFlowInspection>
         return Ok(AppFlowInspection {
             channel: "browser_exempt".to_owned(),
             exempt_reason: Some(
-                "Chrome/Chromium is exempt from GUI reverse-engineering; use chrome_devtools MCP or browser_* tools."
+                "Chrome/Chromium is exempt from GUI reverse-engineering; use chrome_devtools MCP for DOM/network or run_app_recipe/acquire_app_data with google-chrome.json for OS-layer flows."
                     .to_owned(),
             ),
             app_id: "google-chrome".to_owned(),
-            app_version: "exempt".to_owned(),
-            version_source: VersionSource::Unknown,
+            app_version,
+            version_source,
             tech_stack: "chromium_browser".to_owned(),
             fingerprint_sha256: fp,
             fp8,
-            executable_path: exe_path.map(|p| p.display().to_string()),
+            executable_path: resolved_exe.map(|p| p.display().to_string()),
             wm_class,
             window_title,
             verified_shortcuts: Vec::new(),
             menu_topology: Vec::new(),
             interactive_elements_count: 0,
             atspi_blind: false,
-            recommended_interaction: "chrome_devtools".to_owned(),
+            recommended_interaction: "hybrid_cdp_and_os_chrome".to_owned(),
             remediation_hints: Vec::new(),
-            launch_isolation_hints: Vec::new(),
+            launch_isolation_hints: vec![
+                "--user-data-dir=${CUA_YCWANG_HOME:-$HOME/.cua-ycwang}/chrome-profile".to_owned(),
+                "--disable-features=UsePortal".to_owned(),
+                "--no-first-run".to_owned(),
+                "--no-default-browser-check".to_owned(),
+                "--remote-debugging-port=9222".to_owned(),
+            ],
             visual_hotspots: Vec::new(),
             discovered_anchors: Vec::new(),
             sample_roles: Vec::new(),
-            notes: vec!["Routed to browser_exempt channel".to_owned()],
+            notes,
         });
     }
 
@@ -1049,6 +1074,22 @@ fn query_dpkg_version(path: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+fn query_chrome_cli_version(path: &Path) -> Option<String> {
+    let out = std::process::Command::new(path)
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout
+        .split_whitespace()
+        .rev()
+        .find(|tok| tok.chars().any(|c| c.is_ascii_digit()) && tok.contains('.'))
+        .map(ToOwned::to_owned)
+}
+
 fn sha256_file(path: &Path) -> Result<String> {
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
@@ -1081,8 +1122,20 @@ mod tests {
         })
         .unwrap();
         assert_eq!(res.channel, "browser_exempt");
+        assert_eq!(res.app_id, "google-chrome");
         assert_eq!(res.tech_stack, "chromium_browser");
+        assert_eq!(res.recommended_interaction, "hybrid_cdp_and_os_chrome");
+        assert!(!res.launch_isolation_hints.is_empty());
         assert!(res.exempt_reason.is_some());
+        if Path::new("/opt/google/chrome/chrome").is_file() {
+            assert_ne!(res.app_version, "unknown");
+            assert_ne!(res.app_version, "exempt");
+            assert!(matches!(
+                res.version_source,
+                VersionSource::Dpkg | VersionSource::PeOrElf
+            ));
+            assert_eq!(res.fp8.len(), 8);
+        }
     }
 
     #[test]

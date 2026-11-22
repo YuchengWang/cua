@@ -1,0 +1,243 @@
+{
+  "schema_version": 1,
+  "app_id": "google-chrome",
+  "app_version": "seeded",
+  "version_source": "dpkg",
+  "fingerprint_sha256": "seeded",
+  "tech_stack": "chromium_browser",
+  "atspi_blind": false,
+  "recommended_interaction": "hybrid_cdp_and_os_chrome",
+  "launch_isolation_hints": [
+    "--user-data-dir=${CUA_YCWANG_HOME:-$HOME/.cua-ycwang}/chrome-profile",
+    "--disable-features=UsePortal",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--remote-debugging-port=9222"
+  ],
+  "verified_shortcuts": [
+    {
+      "id": "chrome.dismiss_modal",
+      "keys": ["Escape"],
+      "description": "Dismiss native Chrome bubbles, dialogs, or omnibox popups",
+      "source": "chromium_default"
+    },
+    {
+      "id": "chrome.focus_omnibox",
+      "keys": ["ctrl", "l"],
+      "description": "Focus and select the address bar (omnibox)",
+      "source": "chromium_default"
+    },
+    {
+      "id": "chrome.new_incognito",
+      "keys": ["ctrl", "shift", "n"],
+      "description": "Open a new Incognito browser window",
+      "source": "chromium_default"
+    },
+    {
+      "id": "chrome.toggle_fullscreen",
+      "keys": ["F11"],
+      "description": "Toggle Chrome fullscreen mode",
+      "source": "chromium_default"
+    },
+    {
+      "id": "chrome.paste",
+      "keys": ["ctrl", "v"],
+      "description": "Paste clipboard contents into focused Chrome input or omnibox",
+      "source": "chromium_default"
+    }
+  ],
+  "menu_topology": [],
+  "relative_anchors": [
+    {
+      "name": "omnibox",
+      "role": "entry",
+      "title_pattern": ".*(Google Chrome|Chrome|Chromium).*",
+      "rel_x": 0.35,
+      "rel_y": 0.055
+    },
+    {
+      "name": "save_password_bubble_close",
+      "role": "push_button",
+      "title_pattern": ".*Save password.*",
+      "rel_x": 0.90,
+      "rel_y": 0.14
+    }
+  ],
+  "modal_handlers": [
+    {
+      "pattern": ".*(Restore pages|Save password|Translate|Chrome didn't shut down correctly).*",
+      "action": "press_key",
+      "key": "Escape"
+    }
+  ],
+  "flows": {
+    "verify_browser_ready": [
+      {
+        "action": "verify_window_count_min",
+        "args": { "min": 1 },
+        "description": "Verify at least one Chrome window is mapped on display"
+      },
+      {
+        "action": "verify_window_title_regex",
+        "args": { "pattern": ".*(Google Chrome|Chrome|Chromium).*" },
+        "description": "Verify Chrome window title without screenshot"
+      }
+    ],
+    "dismiss_native_bubbles": [
+      {
+        "action": "dismiss_modals",
+        "args": {},
+        "description": "Dismiss matching Restore/Save password/Translate native bubbles"
+      },
+      {
+        "action": "press_key",
+        "args": { "key": "Escape" },
+        "description": "Send Escape to clear any remaining native Chrome bubble"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 200 },
+        "description": "Allow native bubble dismissal to settle"
+      }
+    ],
+    "paste_from_clipboard": [
+      {
+        "action": "click_anchor",
+        "args": { "anchor": "omnibox" },
+        "description": "Focus Chrome omnibox"
+      },
+      {
+        "action": "hotkey",
+        "args": { "keys": ["ctrl", "v"] },
+        "description": "Paste clipboard into omnibox"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 150 },
+        "description": "Allow omnibox paste to settle"
+      }
+    ],
+    "open_incognito_window": [
+      {
+        "action": "hotkey",
+        "args": { "keys": ["ctrl", "shift", "n"] },
+        "description": "Open a new Incognito Chrome window"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 400 },
+        "description": "Wait for Incognito window to map"
+      },
+      {
+        "action": "verify_window_count_min",
+        "args": { "min": 2 },
+        "description": "Verify Incognito window increased mapped Chrome window count"
+      }
+    ],
+    "toggle_fullscreen": [
+      {
+        "action": "press_key",
+        "args": { "key": "F11" },
+        "description": "Toggle Chrome fullscreen mode"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 300 },
+        "description": "Allow fullscreen transition to settle"
+      }
+    ],
+    "copy_current_url": [
+      {
+        "action": "hotkey",
+        "args": { "keys": ["ctrl", "l"] },
+        "description": "Focus and select the current URL in Chrome omnibox"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 150 },
+        "description": "Allow omnibox selection to settle"
+      },
+      {
+        "action": "hotkey",
+        "args": { "keys": ["ctrl", "c"] },
+        "description": "Copy selected URL to clipboard"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 150 },
+        "description": "Allow X11 clipboard ownership update"
+      },
+      {
+        "action": "read_clipboard",
+        "args": { "min_len": 4, "max_bytes": 4096, "clear_after": false },
+        "method": "clipboard",
+        "safety_level": "read_only",
+        "latency_ms_est": 200,
+        "description": "Read copied active URL from clipboard"
+      }
+    ]
+  },
+  "capabilities": {
+    "dom_and_network_cdp": {
+      "data_channel": "cdp",
+      "safety_level": "read_only",
+      "latency_ms_est": 50,
+      "fallback_capability": "browser_window_health",
+      "output_schema": {
+        "format": "json",
+        "fields": ["url", "title", "dom", "network"]
+      }
+    },
+    "browser_window_health": {
+      "data_channel": "window_meta",
+      "flow": "verify_browser_ready",
+      "safety_level": "read_only",
+      "latency_ms_est": 50,
+      "fallback_method": "screenshot_full",
+      "output_schema": {
+        "format": "json",
+        "fields": ["window_title", "pid"]
+      }
+    },
+    "active_url_clipboard": {
+      "data_channel": "clipboard",
+      "flow": "copy_current_url",
+      "safety_level": "read_only",
+      "latency_ms_est": 500,
+      "fallback_method": "screenshot_roi",
+      "output_schema": {
+        "format": "text",
+        "roi_norm": [0.10, 0.03, 0.70, 0.05]
+      }
+    },
+    "browser_chrome_roi": {
+      "data_channel": "screenshot_roi",
+      "safety_level": "read_only",
+      "latency_ms_est": 250,
+      "fallback_method": "screenshot_full",
+      "output_schema": {
+        "format": "png",
+        "roi_norm": [0.0, 0.0, 1.0, 0.14]
+      }
+    }
+  },
+  "safety_policy": {
+    "default_max_level": "read_only",
+    "blocked_shortcuts": ["ctrl+shift+delete", "ctrl+q"],
+    "blocked_flows": [],
+    "notes": "Hybrid Chrome recipe: web DOM/network automation routes to chrome_devtools MCP; OS-layer window health, native bubble dismissal, incognito, clipboard URL, and browser-chrome ROI run via CUA."
+  },
+  "state_machine": {
+    "initial_state": "ready",
+    "states": [
+      {
+        "id": "ready",
+        "description": "Chrome browser window mapped",
+        "title_regex": ".*(Google Chrome|Chrome|Chromium).*",
+        "expected_roles": [],
+        "captcha_patterns": ["Verify you are human", "CAPTCHA", "Turnstile"]
+      }
+    ],
+    "transitions": []
+  }
+}

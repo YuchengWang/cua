@@ -381,46 +381,8 @@ impl Tool for RunAppRecipeTool {
             let target_window_id = req.window_id;
             let target_pid = req.pid;
             let inspection = inspect_app_flow(req)?;
-            if inspection.channel == "browser_exempt" {
-                return Ok(ToolResult::error(
-                    inspection
-                        .exempt_reason
-                        .clone()
-                        .unwrap_or_else(|| "browser_exempt".to_owned()),
-                )
-                .with_structured(json!({ "inspection": inspection })));
-            }
 
-            // Resolve recipe: explicit recipe_path -> hot cache -> best recipe in recipes_dir().
-            let recipe = if let Some(ref p) = recipe_path {
-                let loaded = load_recipe(p).map_err(|e| anyhow::anyhow!("{e}"))?;
-                global_recipe_cache().insert_with_path(loaded.clone(), Some(p.clone()));
-                loaded
-            } else if let Some(cached) = global_recipe_cache().get(
-                &app_id,
-                &inspection.app_version,
-                &inspection.fingerprint_sha256,
-            ) {
-                (*cached).clone()
-            } else if let Some(dir) = recipes_dir() {
-                let (found, found_path) = find_best_recipe_with_path(
-                    &dir,
-                    &app_id,
-                    Some(&inspection.app_version),
-                    Some(&inspection.fingerprint_sha256),
-                )
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "no matching recipe for {app_id} v{} ({})",
-                        inspection.app_version,
-                        inspection.fp8
-                    )
-                })?;
-                global_recipe_cache().insert_with_path(found.clone(), Some(found_path));
-                found
-            } else {
-                anyhow::bail!("app_recipes directory unavailable");
-            };
+            let recipe = resolve_recipe_for_invocation(recipe_path.as_deref(), &app_id, &inspection)?;
 
             // Mandatory VersionGate verification (unless explicitly seeded template).
             let is_seeded =
@@ -685,45 +647,8 @@ impl Tool for AcquireAppDataTool {
             let target_window_id = req.window_id;
             let target_pid = req.pid;
             let inspection = inspect_app_flow(req)?;
-            if inspection.channel == "browser_exempt" {
-                return Ok(ToolResult::error(
-                    inspection
-                        .exempt_reason
-                        .clone()
-                        .unwrap_or_else(|| "browser_exempt".to_owned()),
-                )
-                .with_structured(json!({ "inspection": inspection })));
-            }
 
-            let recipe = if let Some(ref p) = recipe_path {
-                let loaded = load_recipe(p).map_err(|e| anyhow::anyhow!("{e}"))?;
-                global_recipe_cache().insert_with_path(loaded.clone(), Some(p.clone()));
-                loaded
-            } else if let Some(cached) = global_recipe_cache().get(
-                &app_id,
-                &inspection.app_version,
-                &inspection.fingerprint_sha256,
-            ) {
-                (*cached).clone()
-            } else if let Some(dir) = recipes_dir() {
-                let (found, found_path) = find_best_recipe_with_path(
-                    &dir,
-                    &app_id,
-                    Some(&inspection.app_version),
-                    Some(&inspection.fingerprint_sha256),
-                )
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "no matching recipe for {app_id} v{} ({})",
-                        inspection.app_version,
-                        inspection.fp8
-                    )
-                })?;
-                global_recipe_cache().insert_with_path(found.clone(), Some(found_path));
-                found
-            } else {
-                anyhow::bail!("app_recipes directory unavailable");
-            };
+            let recipe = resolve_recipe_for_invocation(recipe_path.as_deref(), &app_id, &inspection)?;
 
             let is_seeded =
                 recipe.app_version == "seeded" || recipe.fingerprint_sha256 == "seeded";
@@ -1273,6 +1198,49 @@ fn resolve_auth_gate_secret(gate: &AuthGate) -> anyhow::Result<Zeroizing<String>
     Ok(Zeroizing::new(secret))
 }
 
+fn resolve_recipe_for_invocation(
+    recipe_path: Option<&Path>,
+    app_id: &str,
+    inspection: &crate::app_inspector::AppFlowInspection,
+) -> anyhow::Result<AppRecipe> {
+    if let Some(p) = recipe_path {
+        let loaded = load_recipe(p).map_err(|e| anyhow::anyhow!("{e}"))?;
+        global_recipe_cache().insert_with_path(loaded.clone(), Some(p.to_path_buf()));
+        return Ok(loaded);
+    }
+    if let Some(cached) = global_recipe_cache().get(
+        app_id,
+        &inspection.app_version,
+        &inspection.fingerprint_sha256,
+    ) {
+        return Ok((*cached).clone());
+    }
+    let dir = recipes_dir().ok_or_else(|| anyhow::anyhow!("app_recipes directory unavailable"))?;
+    let (found, found_path) = find_best_recipe_with_path(
+        &dir,
+        app_id,
+        Some(&inspection.app_version),
+        Some(&inspection.fingerprint_sha256),
+    )
+    .ok_or_else(|| {
+        if inspection.channel == "browser_exempt" {
+            anyhow::anyhow!(
+                "no matching recipe for {app_id} v{} ({}); for web DOM/network automation use chrome_devtools MCP, or deploy google-chrome.json for OS-layer flows",
+                inspection.app_version,
+                inspection.fp8
+            )
+        } else {
+            anyhow::anyhow!(
+                "no matching recipe for {app_id} v{} ({})",
+                inspection.app_version,
+                inspection.fp8
+            )
+        }
+    })?;
+    global_recipe_cache().insert_with_path(found.clone(), Some(found_path));
+    Ok(found)
+}
+
 fn find_window_for_app(
     ctx: &X11ScreenContext,
     app_id: &str,
@@ -1286,6 +1254,10 @@ fn find_window_for_app(
             || app.contains(&needle)
             || (needle == "tws" && title.contains("trader workstation"))
             || (needle == "thinkorswim" && title.contains("thinkorswim"))
+            || (needle == "google-chrome"
+                && (title.contains("google chrome")
+                    || app.contains("google-chrome")
+                    || app.contains("chrome")))
     })
 }
 
@@ -2153,5 +2125,160 @@ mod tests {
             SafetyLevel::AuthOnly,
         )
         .is_ok());
+    }
+
+    #[test]
+    fn google_chrome_curated_recipe_parses_with_hybrid_capabilities_and_safety_policy() {
+        let raw =
+            include_str!("../../../../../../../deploy/linux/user/app_recipes/google-chrome.json");
+        let recipe: AppRecipe =
+            serde_json::from_str(raw).expect("google-chrome.json must parse as AppRecipe");
+        assert_eq!(recipe.app_id, "google-chrome");
+        assert_eq!(recipe.app_version, "seeded");
+        assert_eq!(recipe.version_source, cua_driver_core::app_recipe::VersionSource::Dpkg);
+        assert_eq!(recipe.fingerprint_sha256, "seeded");
+        assert_eq!(recipe.tech_stack.as_deref(), Some("chromium_browser"));
+        assert!(!recipe.atspi_blind);
+        assert_eq!(
+            recipe.recommended_interaction.as_deref(),
+            Some("hybrid_cdp_and_os_chrome")
+        );
+        assert!(!recipe.launch_isolation_hints.is_empty());
+
+        for flow in [
+            "verify_browser_ready",
+            "dismiss_native_bubbles",
+            "paste_from_clipboard",
+            "open_incognito_window",
+            "toggle_fullscreen",
+            "copy_current_url",
+        ] {
+            assert!(
+                recipe.flows.contains_key(flow),
+                "google-chrome.json missing flow '{flow}'"
+            );
+        }
+        let copy_url = &recipe.flows["copy_current_url"];
+        assert_eq!(
+            copy_url.last().map(|s| s.action.as_str()),
+            Some("read_clipboard"),
+            "copy_current_url must end with read_clipboard"
+        );
+
+        for cap in [
+            "dom_and_network_cdp",
+            "browser_window_health",
+            "active_url_clipboard",
+            "browser_chrome_roi",
+        ] {
+            assert!(
+                lookup_capability(&recipe, cap).is_ok(),
+                "google-chrome.json missing capability '{cap}'"
+            );
+        }
+        assert_eq!(
+            lookup_capability(&recipe, "dom_and_network_cdp")
+                .unwrap()
+                .data_channel,
+            DataChannel::Cdp
+        );
+        assert_eq!(
+            lookup_capability(&recipe, "browser_window_health")
+                .unwrap()
+                .data_channel,
+            DataChannel::WindowMeta
+        );
+        assert_eq!(
+            lookup_capability(&recipe, "active_url_clipboard")
+                .unwrap()
+                .data_channel,
+            DataChannel::Clipboard
+        );
+        assert_eq!(
+            lookup_capability(&recipe, "browser_chrome_roi")
+                .unwrap()
+                .data_channel,
+            DataChannel::ScreenshotRoi
+        );
+
+        let policy = recipe
+            .safety_policy
+            .as_ref()
+            .expect("google-chrome.json must define safety_policy");
+        assert_eq!(policy.default_max_level, SafetyLevel::ReadOnly);
+        assert!(policy.blocked_shortcuts.contains(&"ctrl+shift+delete".to_owned()));
+        assert!(policy.blocked_shortcuts.contains(&"ctrl+q".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn google_chrome_run_and_acquire_resolve_recipe_while_generate_remains_exempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let recipe_path = dir.path().join("google-chrome.json");
+        let raw =
+            include_str!("../../../../../../../deploy/linux/user/app_recipes/google-chrome.json");
+        std::fs::write(&recipe_path, raw).unwrap();
+
+        // GenerateAppRecipeTool must continue blocking browser_exempt targets.
+        let gen_res = GenerateAppRecipeTool
+            .invoke(json!({
+                "app_path": "/opt/google/chrome/chrome",
+                "save": false
+            }))
+            .await;
+        assert_eq!(
+            gen_res.is_error,
+            Some(true),
+            "generate_app_recipe must block browser_exempt"
+        );
+
+        // RunAppRecipeTool and AcquireAppDataTool proceed past browser_exempt and resolve the recipe.
+        let inspection = inspect_app_flow(InspectAppFlowRequest {
+            app_path: Some("/opt/google/chrome/chrome".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(inspection.channel, "browser_exempt");
+        let resolved = resolve_recipe_for_invocation(
+            Some(&recipe_path),
+            "google-chrome",
+            &inspection,
+        )
+        .expect("run/acquire recipe resolution must succeed for browser_exempt");
+        assert_eq!(resolved.app_id, "google-chrome");
+        assert!(lookup_capability(&resolved, "browser_window_health").is_ok());
+
+        // Invoking AcquireAppDataTool with explicit recipe_path and unknown capability proves it
+        // bypassed browser_exempt and reached capability lookup.
+        let acq_res = AcquireAppDataTool
+            .invoke(json!({
+                "app_id": "google-chrome",
+                "capability": "nonexistent_cap",
+                "recipe_path": recipe_path.display().to_string(),
+                "app_path": "/opt/google/chrome/chrome"
+            }))
+            .await;
+        assert_eq!(acq_res.is_error, Some(true));
+        let err_text = serde_json::to_string(&acq_res.content).unwrap();
+        assert!(
+            err_text.contains("nonexistent_cap"),
+            "expected capability lookup error after bypassing browser_exempt, got: {err_text}"
+        );
+
+        // Invoking RunAppRecipeTool with explicit recipe_path and unknown flow proves it
+        // bypassed browser_exempt and reached flow lookup.
+        let run_res = RunAppRecipeTool
+            .invoke(json!({
+                "app_id": "google-chrome",
+                "flow": "nonexistent_flow",
+                "recipe_path": recipe_path.display().to_string(),
+                "app_path": "/opt/google/chrome/chrome"
+            }))
+            .await;
+        assert_eq!(run_res.is_error, Some(true));
+        let run_err = serde_json::to_string(&run_res.content).unwrap();
+        assert!(
+            run_err.contains("nonexistent_flow"),
+            "expected flow lookup error after bypassing browser_exempt, got: {run_err}"
+        );
     }
 }
