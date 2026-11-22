@@ -2113,9 +2113,15 @@ mod tests {
             "dismiss_startup_modals must not send blind Alt+F4 hotkey"
         );
         assert!(dismiss.iter().any(|s| s.action == "dismiss_modals"));
+        assert!(
+            !dismiss
+                .iter()
+                .any(|s| s.action == "press_key" && s.args["key"] == "Escape"),
+            "dismiss_startup_modals must not send blind Escape (would reject Paper Warning)"
+        );
         assert!(dismiss
             .iter()
-            .any(|s| s.action == "press_key" && s.args["key"] == "Return"));
+            .any(|s| s.action == "click_anchor" && s.args["anchor"] == "warning_dismiss"));
         assert!(dismiss
             .iter()
             .any(|s| s.action == "verify_window_count_min"));

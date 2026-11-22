@@ -41,9 +41,9 @@
     {
       "name": "warning_dismiss",
       "role": "push_button",
-      "title_pattern": ".*(Pending Tasks|Login Messages|Warning).*",
+      "title_pattern": "^Warning$",
       "rel_x": 0.5,
-      "rel_y": 0.85
+      "rel_y": 0.92
     },
     {
       "name": "new_window_button",
@@ -69,7 +69,7 @@
   ],
   "modal_handlers": [
     {
-      "pattern": ".*(Pending Tasks|Login Messages|Warning).*",
+      "pattern": ".*(Pending Tasks|Login Messages).*",
       "action": "press_key",
       "key": "Escape"
     },
@@ -82,34 +82,19 @@
   "flows": {
     "dismiss_startup_modals": [
       {
-        "action": "dismiss_modals",
-        "args": {},
-        "description": "Dismiss any matched TWS startup modals (Warning/Pending Tasks via Escape, Daily Lineup via targeted Alt+F4)"
-      },
-      {
-        "action": "press_key",
-        "args": { "key": "Escape", "scope": "desktop" },
-        "description": "Dismiss any generic startup popup"
+        "action": "click_anchor",
+        "args": { "anchor": "warning_dismiss" },
+        "description": "Click 'I understand and accept' on the Paper Trading Warning dialog"
       },
       {
         "action": "wait_for_stable_frame",
-        "args": { "ms": 250 },
-        "description": "Allow modal state to settle"
-      },
-      {
-        "action": "press_key",
-        "args": { "key": "Return", "scope": "desktop" },
-        "description": "Confirm Warning ('I understand and accept') if focused"
-      },
-      {
-        "action": "wait_for_stable_frame",
-        "args": { "ms": 300 },
+        "args": { "ms": 350 },
         "description": "Allow post-Warning transition to settle"
       },
       {
         "action": "dismiss_modals",
         "args": {},
-        "description": "Second-pass targeted dismissal for Daily Lineup or secondary startup modals"
+        "description": "Dismiss Daily Lineup / Pending Tasks / Login Messages via targeted modal_handlers"
       },
       {
         "action": "wait_for_stable_frame",
@@ -118,8 +103,8 @@
       },
       {
         "action": "verify_window_count_min",
-        "args": { "min": 1 },
-        "description": "Verify at least one TWS window remains open"
+        "args": { "min": 1, "title_regex": ".*(Interactive Brokers|Trader Workstation|Simulated Trading).*" },
+        "description": "Verify main TWS window remains open after modal cleanup"
       }
     ],
     "open_new_window_menu": [
