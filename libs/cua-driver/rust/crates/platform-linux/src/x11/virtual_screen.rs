@@ -432,7 +432,7 @@ impl VirtualScreenManager {
 
     /// Launch an application inside `display_id` with isolated `DISPLAY`,
     /// `XAUTHORITY`, `DBUS_SESSION_BUS_ADDRESS`, `_JAVA_AWT_WM_NONREPARENTING=1`,
-    /// and `GTK_IM_MODULE=xim`.
+    /// and isolated pass-through IME environment variables (no host IME).
     pub fn launch_app(
         &self,
         display_id: &str,
@@ -453,10 +453,10 @@ impl VirtualScreenManager {
             .env("DISPLAY", &info.display_id)
             .env("XAUTHORITY", &info.xauth_path)
             .env("_JAVA_AWT_WM_NONREPARENTING", "1")
-            .env("GTK_IM_MODULE", "xim")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        apply_isolated_ime_env(&mut cmd);
 
         if should_unset_dbus_for_launch(command, args, extra_env) {
             cmd.env_remove("DBUS_SESSION_BUS_ADDRESS");
@@ -643,6 +643,19 @@ fn spawn_dbus_session() -> (Option<String>, Option<u32>, Option<u32>, Vec<Child>
     (address, Some(pid), pid_atspi, spawned)
 }
 
+/// 强制隔离虚拟屏子进程的输入法环境变量，避免宿主 IME 干扰并启用无 IME 直通。
+pub(crate) fn apply_isolated_ime_env(cmd: &mut Command) {
+    cmd.env("GTK_IM_MODULE", "gtk-im-context-simple")
+        .env("QT_IM_MODULE", "none")
+        .env("XMODIFIERS", "@im=none")
+        .env("CLUTTER_IM_MODULE", "none")
+        .env("SDL_IM_MODULE", "none")
+        .env_remove("GLFW_IM_MODULE")
+        .env_remove("IBUS_ADDRESS")
+        .env_remove("IBUS_DAEMON_ARGS")
+        .env_remove("FCITX_ADDON");
+}
+
 fn spawn_openbox(
     display_id: &str,
     xauth_path: &Path,
@@ -654,6 +667,7 @@ fn spawn_openbox(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    apply_isolated_ime_env(&mut cmd);
     if let Some(dbus) = dbus_address {
         cmd.env("DBUS_SESSION_BUS_ADDRESS", dbus);
     }
@@ -968,5 +982,47 @@ mod tests {
         let mut hinted = HashMap::new();
         hinted.insert("CUA_UNSET_DBUS".to_owned(), "1".to_owned());
         assert!(should_unset_dbus_for_launch("/usr/bin/java", &[], &hinted));
+    }
+
+    #[test]
+    fn apply_isolated_ime_env_sets_passthrough_and_removes_host_ime_vars() {
+        use std::ffi::OsStr;
+
+        let mut cmd = Command::new("/usr/bin/true");
+        apply_isolated_ime_env(&mut cmd);
+
+        let envs: HashMap<&OsStr, Option<&OsStr>> = cmd.get_envs().collect();
+        assert_eq!(
+            envs.get(OsStr::new("GTK_IM_MODULE")).copied().flatten(),
+            Some(OsStr::new("gtk-im-context-simple"))
+        );
+        assert_eq!(
+            envs.get(OsStr::new("QT_IM_MODULE")).copied().flatten(),
+            Some(OsStr::new("none"))
+        );
+        assert_eq!(
+            envs.get(OsStr::new("XMODIFIERS")).copied().flatten(),
+            Some(OsStr::new("@im=none"))
+        );
+        assert_eq!(
+            envs.get(OsStr::new("CLUTTER_IM_MODULE")).copied().flatten(),
+            Some(OsStr::new("none"))
+        );
+        assert_eq!(
+            envs.get(OsStr::new("SDL_IM_MODULE")).copied().flatten(),
+            Some(OsStr::new("none"))
+        );
+        for removed in [
+            "GLFW_IM_MODULE",
+            "IBUS_ADDRESS",
+            "IBUS_DAEMON_ARGS",
+            "FCITX_ADDON",
+        ] {
+            assert_eq!(
+                envs.get(OsStr::new(removed)).copied(),
+                Some(None),
+                "{removed} should be explicitly removed"
+            );
+        }
     }
 }

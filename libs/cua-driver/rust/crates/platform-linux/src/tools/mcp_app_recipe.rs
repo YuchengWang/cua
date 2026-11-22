@@ -981,7 +981,10 @@ fn execute_flow_steps(
     target_pid: Option<u32>,
     steps: &[RecipeStep],
 ) -> FlowExecutionResult {
-    let _ime_guard = crate::ime::ImeGuard::acquire();
+    let _ime_guard = match ctx {
+        Some(c) => crate::ime::ImeGuard::acquire_for_target(&c.target),
+        None => crate::ime::ImeGuard::acquire(),
+    };
     let mut executed_steps = Vec::with_capacity(steps.len());
     let mut artifacts = Vec::new();
     for (idx, step) in steps.iter().enumerate() {

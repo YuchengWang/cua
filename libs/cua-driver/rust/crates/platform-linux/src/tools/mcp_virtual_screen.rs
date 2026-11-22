@@ -457,7 +457,7 @@ impl Tool for LaunchInVirtualScreenTool {
     fn def(&self) -> &ToolDef {
         LAUNCH_DEF.get_or_init(|| ToolDef {
             name: "launch_in_virtual_screen".into(),
-            description: "Launch an application inside an isolated virtual X11 screen with DISPLAY, XAUTHORITY, DBUS_SESSION_BUS_ADDRESS, _JAVA_AWT_WM_NONREPARENTING=1, and GTK_IM_MODULE=xim injected.".into(),
+            description: "Launch an application inside an isolated virtual X11 screen with DISPLAY, XAUTHORITY, DBUS_SESSION_BUS_ADDRESS, _JAVA_AWT_WM_NONREPARENTING=1, and isolated pass-through IME environment variables (no host IME) injected.".into(),
             input_schema: json!({
                 "type": "object",
                 "required": ["display_id", "command"],

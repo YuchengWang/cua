@@ -33,12 +33,17 @@ pub(crate) enum RestoreAction {
 
 /// 抽象外部命令执行结果，便于单元测试注入 mock。
 pub(crate) trait ImeCommandRunner {
+    fn is_process_running(&self, name: &str) -> bool;
     fn run(&self, program: &str, args: &[&str]) -> Option<String>;
 }
 
 struct SystemImeRunner;
 
 impl ImeCommandRunner for SystemImeRunner {
+    fn is_process_running(&self, name: &str) -> bool {
+        run_command_with_timeout("pgrep", &["-x", name], IME_CMD_TIMEOUT).is_some()
+    }
+
     fn run(&self, program: &str, args: &[&str]) -> Option<String> {
         run_command_with_timeout(program, args, IME_CMD_TIMEOUT)
     }
@@ -134,6 +139,21 @@ impl ImeGuard {
         }
     }
 
+    /// 按目标屏幕获取输入法守卫：
+    /// - `DisplayTarget::Virtual(_)`：虚拟屏已通过环境变量隔离 IME，直接返回空守卫
+    ///   （不执行任何子进程、不修改 `IME_GUARD_DEPTH`、不触碰宿主 IBus/Fcitx5）；
+    /// - `DisplayTarget::Primary`：调用 [`Self::acquire()`]。
+    pub fn acquire_for_target(target: &crate::x11::context::DisplayTarget) -> Self {
+        match target {
+            crate::x11::context::DisplayTarget::Virtual(_) => Self {
+                restore: RestoreAction::None,
+                counted_in_tls: false,
+                restore_fn: apply_system_restore,
+            },
+            crate::x11::context::DisplayTarget::Primary => Self::acquire(),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn acquire_with<R: ImeCommandRunner>(
         runner: &R,
@@ -163,21 +183,26 @@ impl Drop for ImeGuard {
 }
 
 fn probe_and_switch_to_english<R: ImeCommandRunner>(runner: &R) -> RestoreAction {
-    if let Some(fcitx_out) = runner.run("fcitx5-remote", &[]) {
-        if parse_fcitx5_is_active(&fcitx_out) {
-            let _ = runner.run("fcitx5-remote", &["-c"]);
-            return RestoreAction::Fcitx5Activate;
-        }
-        // fcitx5 返回 "1" 表示本身已是英文非激活状态，无需再探测 IBus
-        if fcitx_out.trim() == "1" {
-            return RestoreAction::None;
+    // 严格前置进程守卫：禁止在 daemon 未启动时调用 fcitx5-remote / ibus，防止触发 D-Bus auto-activation。
+    if runner.is_process_running("fcitx5") {
+        if let Some(fcitx_out) = runner.run("fcitx5-remote", &[]) {
+            if parse_fcitx5_is_active(&fcitx_out) {
+                let _ = runner.run("fcitx5-remote", &["-c"]);
+                return RestoreAction::Fcitx5Activate;
+            }
+            // fcitx5 返回 "1" 表示本身已是英文非激活状态，无需再探测 IBus
+            if fcitx_out.trim() == "1" {
+                return RestoreAction::None;
+            }
         }
     }
 
-    if let Some(ibus_out) = runner.run("ibus", &["engine"]) {
-        if let Some(prev_engine) = parse_ibus_engine_to_restore(&ibus_out) {
-            let _ = runner.run("ibus", &["engine", IBUS_ENGLISH_ENGINE]);
-            return RestoreAction::IbusEngine(prev_engine);
+    if runner.is_process_running("ibus-daemon") {
+        if let Some(ibus_out) = runner.run("ibus", &["engine"]) {
+            if let Some(prev_engine) = parse_ibus_engine_to_restore(&ibus_out) {
+                let _ = runner.run("ibus", &["engine", IBUS_ENGLISH_ENGINE]);
+                return RestoreAction::IbusEngine(prev_engine);
+            }
         }
     }
 
@@ -207,13 +232,22 @@ mod tests {
     use std::cell::RefCell;
 
     struct MockRunner {
+        running_processes: Vec<&'static str>,
         responses: Vec<(&'static str, Vec<&'static str>, Option<String>)>,
         calls: RefCell<Vec<(String, Vec<String>)>>,
     }
 
     impl MockRunner {
         fn new(responses: Vec<(&'static str, Vec<&'static str>, Option<String>)>) -> Self {
+            Self::with_running(vec![], responses)
+        }
+
+        fn with_running(
+            running_processes: Vec<&'static str>,
+            responses: Vec<(&'static str, Vec<&'static str>, Option<String>)>,
+        ) -> Self {
             Self {
+                running_processes,
                 responses,
                 calls: RefCell::new(Vec::new()),
             }
@@ -225,6 +259,10 @@ mod tests {
     }
 
     impl ImeCommandRunner for MockRunner {
+        fn is_process_running(&self, name: &str) -> bool {
+            self.running_processes.contains(&name)
+        }
+
         fn run(&self, program: &str, args: &[&str]) -> Option<String> {
             self.calls.borrow_mut().push((
                 program.to_owned(),
@@ -273,10 +311,13 @@ mod tests {
             RESTORED.with(|r| r.borrow_mut().push(action.clone()));
         }
 
-        let runner = MockRunner::new(vec![
-            ("fcitx5-remote", vec![], Some("2\n".to_owned())),
-            ("fcitx5-remote", vec!["-c"], Some(String::new())),
-        ]);
+        let runner = MockRunner::with_running(
+            vec!["fcitx5"],
+            vec![
+                ("fcitx5-remote", vec![], Some("2\n".to_owned())),
+                ("fcitx5-remote", vec!["-c"], Some(String::new())),
+            ],
+        );
 
         {
             let guard = ImeGuard::acquire_with(&runner, record_restore);
@@ -313,11 +354,14 @@ mod tests {
             RESTORED.with(|r| r.borrow_mut().push(action.clone()));
         }
 
-        let runner = MockRunner::new(vec![
-            ("fcitx5-remote", vec![], None),
-            ("ibus", vec!["engine"], Some("table:wubi-haifeng86\n".to_owned())),
-            ("ibus", vec!["engine", "xkb:us::eng"], Some(String::new())),
-        ]);
+        let runner = MockRunner::with_running(
+            vec!["ibus-daemon"],
+            vec![
+                ("fcitx5-remote", vec![], Some("2\n".to_owned())),
+                ("ibus", vec!["engine"], Some("table:wubi-haifeng86\n".to_owned())),
+                ("ibus", vec!["engine", "xkb:us::eng"], Some(String::new())),
+            ],
+        );
 
         {
             let guard = ImeGuard::acquire_with(&runner, record_restore);
@@ -328,7 +372,6 @@ mod tests {
             assert_eq!(
                 runner.recorded_calls(),
                 vec![
-                    ("fcitx5-remote".to_owned(), vec![]),
                     ("ibus".to_owned(), vec!["engine".to_owned()]),
                     (
                         "ibus".to_owned(),
@@ -370,23 +413,75 @@ mod tests {
             panic!("noop guard should never invoke restore");
         }
 
-        let fcitx_inactive = MockRunner::new(vec![("fcitx5-remote", vec![], Some("1\n".to_owned()))]);
+        let fcitx_inactive = MockRunner::with_running(
+            vec!["fcitx5"],
+            vec![("fcitx5-remote", vec![], Some("1\n".to_owned()))],
+        );
         let g1 = ImeGuard::acquire_with(&fcitx_inactive, noop_restore);
         assert_eq!(g1.restore, RestoreAction::None);
         drop(g1);
 
-        let ibus_xkb = MockRunner::new(vec![
-            ("fcitx5-remote", vec![], None),
-            ("ibus", vec!["engine"], Some("xkb:us::eng\n".to_owned())),
-        ]);
+        let ibus_xkb = MockRunner::with_running(
+            vec!["ibus-daemon"],
+            vec![("ibus", vec!["engine"], Some("xkb:us::eng\n".to_owned()))],
+        );
         let g2 = ImeGuard::acquire_with(&ibus_xkb, noop_restore);
         assert_eq!(g2.restore, RestoreAction::None);
         drop(g2);
 
-        let no_ime = MockRunner::new(vec![]);
+        let no_ime = MockRunner::with_running(
+            vec![],
+            vec![
+                ("fcitx5-remote", vec![], Some("2\n".to_owned())),
+                ("ibus", vec!["engine"], Some("libpinyin\n".to_owned())),
+            ],
+        );
         let g3 = ImeGuard::acquire_with(&no_ime, noop_restore);
         assert_eq!(g3.restore, RestoreAction::None);
+        assert!(no_ime.recorded_calls().is_empty());
         drop(g3);
+    }
+
+    #[test]
+    fn fcitx5_not_running_with_ibus_running_never_calls_fcitx5_remote() {
+        let runner = MockRunner::with_running(
+            vec!["ibus-daemon"],
+            vec![
+                ("fcitx5-remote", vec![], Some("2\n".to_owned())),
+                ("ibus", vec!["engine"], Some("libpinyin\n".to_owned())),
+                ("ibus", vec!["engine", "xkb:us::eng"], Some(String::new())),
+            ],
+        );
+
+        let action = probe_and_switch_to_english(&runner);
+        assert_eq!(action, RestoreAction::IbusEngine("libpinyin".to_owned()));
+        let calls = runner.recorded_calls();
+        assert!(!calls.iter().any(|(prog, _)| prog == "fcitx5-remote"));
+        assert_eq!(
+            calls,
+            vec![
+                ("ibus".to_owned(), vec!["engine".to_owned()]),
+                (
+                    "ibus".to_owned(),
+                    vec!["engine".to_owned(), "xkb:us::eng".to_owned()]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn no_ime_daemon_running_returns_none_without_calling_ime_commands() {
+        let runner = MockRunner::with_running(
+            vec![],
+            vec![
+                ("fcitx5-remote", vec![], Some("2\n".to_owned())),
+                ("ibus", vec!["engine"], Some("libpinyin\n".to_owned())),
+            ],
+        );
+
+        let action = probe_and_switch_to_english(&runner);
+        assert_eq!(action, RestoreAction::None);
+        assert!(runner.recorded_calls().is_empty());
     }
 
     #[test]
@@ -403,6 +498,19 @@ mod tests {
             let _inner = ImeGuard::acquire();
             assert_eq!(IME_GUARD_DEPTH.with(Cell::get), d0 + 2);
             assert_eq!(_inner.restore, RestoreAction::None);
+        }
+        assert_eq!(IME_GUARD_DEPTH.with(Cell::get), d0);
+    }
+
+    #[test]
+    fn acquire_for_target_virtual_returns_noop_guard_without_touching_tls_or_ime() {
+        let d0 = IME_GUARD_DEPTH.with(Cell::get);
+        let target = crate::x11::context::DisplayTarget::Virtual(":132".to_owned());
+        {
+            let guard = ImeGuard::acquire_for_target(&target);
+            assert_eq!(guard.restore, RestoreAction::None);
+            assert!(!guard.counted_in_tls);
+            assert_eq!(IME_GUARD_DEPTH.with(Cell::get), d0);
         }
         assert_eq!(IME_GUARD_DEPTH.with(Cell::get), d0);
     }

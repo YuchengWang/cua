@@ -211,7 +211,7 @@ pub fn xtest_type_text(ctx: &X11ScreenContext, text: &str) -> Result<()> {
     if text.is_empty() {
         return Ok(());
     }
-    let _ime_guard = crate::ime::ImeGuard::acquire();
+    let _ime_guard = crate::ime::ImeGuard::acquire_for_target(&ctx.target);
     let _ = release_stuck_modifiers(ctx);
     if text.is_ascii() {
         for ch in text.chars() {
