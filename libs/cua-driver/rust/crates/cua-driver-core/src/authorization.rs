@@ -959,6 +959,7 @@ pub fn advertised_risk_for(tool: &str) -> RiskAssessment {
         | "sync_clipboard"
         | "type_secret_from_env"
         | "type_totp_from_env"
+        | "sudo_in_terminal"
         | "inspect_app_flow"
         | "list_apps"
         | "list_windows"
@@ -1102,6 +1103,7 @@ pub fn classify_tool_call(tool: &str, args: &Value) -> RiskAssessment {
         | "sync_clipboard"
         | "type_secret_from_env"
         | "type_totp_from_env"
+        | "sudo_in_terminal"
         | "inspect_app_flow" => RiskAssessment {
             class: RiskClass::R2,
             enforcement: RiskEnforcement::Active,

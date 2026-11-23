@@ -45,7 +45,7 @@ use super::{
         AcquireAppDataTool, GenerateAppRecipeTool, InspectAppFlowTool, RunAppRecipeTool,
     },
     mcp_clipboard::{GetClipboardTool, SetClipboardTool, SyncClipboardTool},
-    mcp_type_secret::{TypeSecretFromEnvTool, TypeTotpFromEnvTool},
+    mcp_type_secret::{SudoInTerminalTool, TypeSecretFromEnvTool, TypeTotpFromEnvTool},
     mcp_virtual_screen::{
         CreateVirtualScreenTool, DestroyVirtualScreenTool, LaunchInVirtualScreenTool,
         ListVirtualScreensTool,
@@ -5299,6 +5299,7 @@ pub fn build_registry_with_provider(
     r.register(Box::new(AcquireAppDataTool));
     r.register(Box::new(TypeSecretFromEnvTool));
     r.register(Box::new(TypeTotpFromEnvTool));
+    r.register(Box::new(SudoInTerminalTool));
     r.register(Box::new(ListAppsTool));
     r.register(Box::new(ListWindowsTool));
     r.register(Box::new(GetWindowStateTool {
