@@ -1617,6 +1617,19 @@ async fn collect_visited_bounded_opts<'a>(
             let scoped = ordered.remove(position);
             ordered.insert(0, scoped);
         }
+    } else if ordered.len() > 1 && ordered.len() <= 32 {
+        let flags: Vec<bool> = futures_util::future::join_all(ordered.iter().map(|(c, ..)| async move {
+            let acc = call(accessible_for(conn, c)).await?.ok()?;
+            let role = call(acc.get_role_name()).await?.ok()?;
+            Some(is_transient_dialog_role(&role))
+        }))
+        .await
+        .into_iter()
+        .map(|r| r.unwrap_or(false))
+        .collect();
+        if flags.iter().any(|&flag| flag) {
+            ordered = prioritize_transient_children(ordered, &flags);
+        }
     }
     let mut stack: Vec<(RawObjectRef, usize, bool, usize)> = ordered.into_iter().rev().collect();
     // Direct children of a `menu bar`: a top-level menu whose popup is not
@@ -2049,6 +2062,30 @@ async fn collect_visited_bounded_opts<'a>(
                             menubar_children.insert((c.name.clone(), c.path.clone()));
                         }
                     }
+                    let children = if !in_web_doc
+                        && !child_in_web_doc
+                        && depth <= 1
+                        && children.len() > 1
+                        && children.len() <= 32
+                    {
+                        let flags: Vec<bool> =
+                            futures_util::future::join_all(children.iter().map(|c| async move {
+                                let acc = call(accessible_for(conn, c)).await?.ok()?;
+                                let role = call(acc.get_role_name()).await?.ok()?;
+                                Some(is_transient_dialog_role(&role))
+                            }))
+                            .await
+                            .into_iter()
+                            .map(|r| r.unwrap_or(false))
+                            .collect();
+                        if flags.iter().any(|&flag| flag) {
+                            prioritize_transient_children(children, &flags)
+                        } else {
+                            children
+                        }
+                    } else {
+                        children
+                    };
                     for c in children.into_iter().rev() {
                         stack.push((c, depth + 1, child_in_web_doc, frame_ordinal));
                     }
@@ -2135,6 +2172,29 @@ async fn collect_visited_bounded_opts<'a>(
         scoped_frame,
         truncation,
     }))
+}
+
+/// Roles representing transient native dialogs/alerts (e.g. Chromium's
+/// remote-debugging consent prompt) that are appended at the end of a frame's
+/// child list and must be walked before large toolbar/document subtrees.
+fn is_transient_dialog_role(role: &str) -> bool {
+    matches!(role.trim().to_ascii_lowercase().as_str(), "alert" | "dialog")
+}
+
+/// Stable partition that moves priority children (`is_priority[i] == true`)
+/// ahead of remaining siblings while preserving relative order in both groups.
+fn prioritize_transient_children<T>(items: Vec<T>, is_priority: &[bool]) -> Vec<T> {
+    let mut priority = Vec::new();
+    let mut rest = Vec::with_capacity(items.len());
+    for (idx, item) in items.into_iter().enumerate() {
+        if is_priority.get(idx).copied().unwrap_or(false) {
+            priority.push(item);
+        } else {
+            rest.push(item);
+        }
+    }
+    priority.extend(rest);
+    priority
 }
 
 /// Roles whose Description / LABELLED_BY are worth a round-trip even when
@@ -9287,6 +9347,107 @@ mod budget_tests {
         assert_eq!(result.unwrap(), "partial");
         // deadline + 500 ms backstop, well under the old 25 s.
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn transient_alert_is_not_truncated_by_preceding_elements() {
+        assert!(is_transient_dialog_role("alert"));
+        assert!(is_transient_dialog_role("Dialog"));
+        assert!(!is_transient_dialog_role("document web"));
+
+        #[derive(Clone)]
+        struct SimNode {
+            role: &'static str,
+            name: &'static str,
+            children: Vec<usize>,
+        }
+
+        // Build: frame -> [toolbar (50 buttons), document web (500 buttons), alert (heading + 3 buttons)]
+        let mut tree = vec![
+            SimNode {
+                role: "frame",
+                name: "Chromium",
+                children: vec![1, 2, 3],
+            },
+            SimNode {
+                role: "tool bar",
+                name: "Toolbar",
+                children: Vec::new(),
+            },
+            SimNode {
+                role: "document web",
+                name: "Page",
+                children: Vec::new(),
+            },
+            SimNode {
+                role: "alert",
+                name: "Allow remote debugging?",
+                children: Vec::new(),
+            },
+        ];
+        for _ in 0..50 {
+            let id = tree.len();
+            tree.push(SimNode {
+                role: "push button",
+                name: "ToolbarBtn",
+                children: Vec::new(),
+            });
+            tree[1].children.push(id);
+        }
+        for _ in 0..500 {
+            let id = tree.len();
+            tree.push(SimNode {
+                role: "push button",
+                name: "WebBtn",
+                children: Vec::new(),
+            });
+            tree[2].children.push(id);
+        }
+        for (role, name) in [
+            ("heading", "Allow remote debugging?"),
+            ("push button", "Turn off"),
+            ("push button", "Cancel"),
+            ("push button", "Allow"),
+        ] {
+            let id = tree.len();
+            tree.push(SimNode {
+                role,
+                name,
+                children: Vec::new(),
+            });
+            tree[3].children.push(id);
+        }
+
+        // Simulate bounded pre-order DFS with max_elements = 250.
+        let mut budget = 250usize;
+        let mut stack = vec![0usize];
+        let mut visited_names = Vec::new();
+        while let Some(id) = stack.pop() {
+            if budget == 0 {
+                break;
+            }
+            let node = &tree[id];
+            visited_names.push(node.name);
+            budget -= 1;
+            let flags: Vec<bool> = node
+                .children
+                .iter()
+                .map(|&cid| is_transient_dialog_role(tree[cid].role))
+                .collect();
+            let ordered = if flags.iter().any(|&f| f) {
+                prioritize_transient_children(node.children.clone(), &flags)
+            } else {
+                node.children.clone()
+            };
+            for cid in ordered.into_iter().rev() {
+                stack.push(cid);
+            }
+        }
+
+        assert!(visited_names.contains(&"Allow remote debugging?"));
+        assert!(visited_names.contains(&"Turn off"));
+        assert!(visited_names.contains(&"Cancel"));
+        assert!(visited_names.contains(&"Allow"));
     }
 }
 

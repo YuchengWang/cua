@@ -108,6 +108,25 @@ fn match_installed_app<'a>(
         })
 }
 
+/// Spawn `xdg-open` (or a test double program) with stdio isolated to
+/// `/dev/null` so browser handoff chatter such as
+/// `Opening in existing browser session.` never contaminates the driver's
+/// JSON-RPC `stdout`.
+fn spawn_xdg_open_program(program: &str, target: &str) -> std::io::Result<std::process::Child> {
+    std::process::Command::new(program)
+        .arg(target)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+}
+
+/// Spawn `xdg-open <target>` with stdin, stdout, and stderr redirected to
+/// `/dev/null`.
+fn spawn_xdg_open(target: &str) -> std::io::Result<std::process::Child> {
+    spawn_xdg_open_program("xdg-open", target)
+}
+
 /// Watch a just-spawned `xdg-open` long enough to catch a fast failure.
 /// xdg-open's generic fallback can `exec` the target app and stay alive for
 /// its whole lifetime, so a child still running after the grace period counts
@@ -253,6 +272,27 @@ mod launch_app_tests {
         assert!(match_installed_app(&apps, "gnome-calculator").is_none());
         assert!(match_installed_app(&apps, "").is_none());
     }
+
+    #[test]
+    fn xdg_open_isolates_stdio_from_driver_stdout() {
+        let script = std::env::temp_dir().join(format!(
+            "cua-xdg-open-stdio-test-{}.sh",
+            std::process::id()
+        ));
+        std::fs::write(
+            &script,
+            "if read -r _line; then exit 2; fi\n\
+             echo 'Opening in existing browser session.'\n\
+             echo 'Opening in existing browser session.' >&2\n\
+             exit 0\n",
+        )
+        .expect("write test script");
+        let child = spawn_xdg_open_program("/bin/sh", script.to_str().expect("utf-8 temp path"))
+            .expect("/bin/sh should spawn");
+        let failure = xdg_open_failure(child);
+        let _ = std::fs::remove_file(&script);
+        assert_eq!(failure, None);
+    }
 }
 
 #[async_trait]
@@ -319,10 +359,7 @@ impl Tool for LaunchAppTool {
                 if !urls.is_empty() {
                     let mut children = Vec::new();
                     for url in &urls {
-                        children.push((
-                            url.clone(),
-                            std::process::Command::new("xdg-open").arg(url).spawn()?,
-                        ));
+                        children.push((url.clone(), spawn_xdg_open(url)?));
                     }
                     for (url, child) in children {
                         if let Some(reason) = xdg_open_failure(child) {
@@ -386,7 +423,7 @@ impl Tool for LaunchAppTool {
                                      round-trip its launch_path."
                                 );
                             }
-                            let child = std::process::Command::new("xdg-open").arg(cmd).spawn()?;
+                            let child = spawn_xdg_open(cmd)?;
                             if let Some(reason) = xdg_open_failure(child) {
                                 anyhow::bail!("could not open '{cmd}': {reason}");
                             }
