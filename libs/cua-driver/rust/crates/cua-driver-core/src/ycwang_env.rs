@@ -153,6 +153,11 @@ pub fn resolve_ycwang_config_dir() -> Option<PathBuf> {
         })
 }
 
+/// Alias for [`resolve_ycwang_config_dir`].
+pub fn config_dir() -> Option<PathBuf> {
+    resolve_ycwang_config_dir()
+}
+
 /// Resolve the `cua-ycwang` runtime home directory (`$CUA_YCWANG_HOME` or `~/.cua-ycwang`).
 pub fn resolve_ycwang_home() -> Option<PathBuf> {
     let get_env = |k: &str| std::env::var_os(k);

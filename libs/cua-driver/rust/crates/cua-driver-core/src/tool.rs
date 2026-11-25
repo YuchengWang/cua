@@ -1042,6 +1042,7 @@ pub fn default_capabilities_for(tool_name: &str) -> Vec<String> {
         "generate_app_recipe" => &["app.recipe.write"],
         "run_app_recipe" => &["app.recipe.run"],
         "acquire_app_data" => &["app.data.acquire"],
+        "resolve_auth_site" => &["auth.site.resolve"],
         "kill_app" => &["app.kill"],
         "agent_display"
         | "create_virtual_screen"
@@ -1725,6 +1726,7 @@ impl ToolRegistry {
         self.register(Box::new(ListSessionsTool));
         self.register(Box::new(EndSessionTool));
         self.register(Box::new(crate::guide::GetGuideTool));
+        self.register(Box::new(crate::auth_site::ResolveAuthSiteTool));
         self.register_batch_tools();
     }
 
@@ -3850,6 +3852,7 @@ fn session_requiring_tool(tool_name: &str) -> bool {
         "check_permissions"
             | "health_report"
             | "get_guide"
+            | "resolve_auth_site"
             | "get_session"
             | "list_sessions"
             | "end_session"
@@ -7979,6 +7982,7 @@ mod capability_tests {
         "history_query",
         "parse_visual_regions",
         "agent_display",
+        "resolve_auth_site",
     ];
 
     /// All capability tokens in the canonical vocabulary. Any token
@@ -8077,6 +8081,8 @@ mod capability_tests {
         // encrypted local history
         "history.status",
         "history.query",
+        // auth site metadata discovery
+        "auth.site.resolve",
     ];
 
     #[test]

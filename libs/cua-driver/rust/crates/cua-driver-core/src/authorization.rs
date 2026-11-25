@@ -961,6 +961,7 @@ pub fn advertised_risk_for(tool: &str) -> RiskAssessment {
         | "type_totp_from_env"
         | "sudo_in_terminal"
         | "inspect_app_flow"
+        | "resolve_auth_site"
         | "list_apps"
         | "list_windows"
         | "debug_window_info"
@@ -1105,7 +1106,8 @@ pub fn classify_tool_call(tool: &str, args: &Value) -> RiskAssessment {
         | "type_secret_from_env"
         | "type_totp_from_env"
         | "sudo_in_terminal"
-        | "inspect_app_flow" => RiskAssessment {
+        | "inspect_app_flow"
+        | "resolve_auth_site" => RiskAssessment {
             class: RiskClass::R2,
             enforcement: RiskEnforcement::Active,
             operation_sensitive: true,
@@ -2267,5 +2269,17 @@ mod tests {
             &serde_json::json!({ "pid": 1234, "window_id": 56 }),
         );
         assert_eq!(call_risk.class, super::RiskClass::R2);
+    }
+
+    #[test]
+    fn resolve_auth_site_has_r2_risk_classification() {
+        let risk = super::advertised_risk_for("resolve_auth_site");
+        assert_eq!(risk.class, super::RiskClass::R2);
+        let call_risk = super::classify_tool_call(
+            "resolve_auth_site",
+            &serde_json::json!({ "url": "https://github.com/login" }),
+        );
+        assert_eq!(call_risk.class, super::RiskClass::R2);
+        assert_eq!(call_risk.enforcement, super::RiskEnforcement::Active);
     }
 }

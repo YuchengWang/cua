@@ -62,6 +62,7 @@ pub mod action_target;
 pub mod agent_cursor;
 pub mod app_names;
 pub mod app_recipe;
+pub mod auth_site;
 pub mod authorization;
 pub mod background_input;
 pub mod batch_nudge;
