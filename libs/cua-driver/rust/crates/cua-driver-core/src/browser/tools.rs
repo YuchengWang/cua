@@ -29,8 +29,8 @@ use super::engine::{BrowserEngine, BrowserTabScreenshot, DIALOG_SUBSCRIPTION_TIM
 use super::input::{confirm_ref_point, ref_point, refuse_in_focus_emulation, trusted_ref_point};
 use super::motion_policy::BrowserMotionPolicy;
 use super::platform::{
-    BrowserVisualActionKind, PrepareAction, PrepareProfile, PrepareProfileMode, PrepareRequest,
-    PrepareStrategy,
+    BrowserConsentAction, BrowserConsentOutcome, BrowserConsentRequest, BrowserVisualActionKind,
+    PrepareAction, PrepareProfile, PrepareProfileMode, PrepareRequest, PrepareStrategy,
 };
 use super::pointer::BrowserPointerTool;
 use super::refusal::{BrowserRefusal, BrowserRefusalCode};
@@ -53,6 +53,7 @@ pub fn register_browser_tools(engine: &Arc<BrowserEngine>, registry: &mut ToolRe
     registry.register(Box::new(BrowserSetInputFilesTool::new(engine.clone())));
     registry.register(Box::new(BrowserDownloadTool::new(engine.clone())));
     registry.register(Box::new(BrowserPointerTool::new(engine.clone())));
+    registry.register(Box::new(ApproveBrowserConsentTool::new(engine.clone())));
 }
 
 // ── Shared helpers ───────────────────────────────────────────────────────────
@@ -742,10 +743,15 @@ impl Tool for GetBrowserStateTool {
                 } else {
                     "embedded_single_page"
                 };
-                ToolResult::text(format!(
+                let mut summary = format!(
                     "bound target {target_id} ({quality}) with {} tab(s)",
                     tabs.len()
-                ))
+                );
+                for t in record.tabs.values() {
+                    summary.push('\n');
+                    summary.push_str(&format_bind_tab_line(t));
+                }
+                ToolResult::text(summary)
                 .with_structured(json!({
                     "status": "ok",
                     "mode": "bind",
@@ -764,7 +770,161 @@ impl Tool for GetBrowserStateTool {
     }
 }
 
+// ── approve_browser_consent ──────────────────────────────────────────────────
+
+/// Lightweight standalone tool to approve a native browser remote-debugging
+/// consent prompt (e.g. `"Allow remote debugging?"`) via the platform's
+/// semantic accessibility handler without running `browser_prepare` or
+/// acquiring CDP socket ownership.
+pub struct ApproveBrowserConsentTool {
+    def: ToolDef,
+    engine: Arc<BrowserEngine>,
+}
+
+impl ApproveBrowserConsentTool {
+    pub fn new(engine: Arc<BrowserEngine>) -> Self {
+        let def = ToolDef {
+            name: "approve_browser_consent".into(),
+            description: "Approve a native browser remote-debugging consent prompt (such as \
+                'Allow remote debugging?') for a target (pid, window_id) via semantic \
+                accessibility click, without running browser_prepare or taking CDP socket \
+                ownership. Useful when an external CDP client (such as chrome_devtools) \
+                triggers the prompt."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "pid": { "type": "integer", "description": "Browser process id owning the consent prompt." },
+                    "window_id": { "type": "integer", "description": "Exact native window id owning the consent prompt." },
+                    "wait_ms": {
+                        "type": "integer",
+                        "minimum": 500,
+                        "maximum": 30000,
+                        "description": "Optional timeout in milliseconds to wait for the consent prompt to appear and settle (default: 10000, range: 500..=30000)."
+                    },
+                    "session": schema_session()
+                },
+                "required": ["pid", "window_id"],
+                "additionalProperties": false
+            }),
+            read_only: false,
+            destructive: false,
+            idempotent: true,
+            open_world: false,
+        };
+        Self { def, engine }
+    }
+}
+
+const MIN_CONSENT_WAIT_MS: u64 = 500;
+const MAX_CONSENT_WAIT_MS: u64 = 30_000;
+
+fn parse_consent_wait_ms(args: &Value) -> Result<Option<u64>, ToolResult> {
+    match args.get("wait_ms") {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => {
+            let Some(ms) = value.as_u64() else {
+                return Err(ToolResult::error(
+                    "invalid 'wait_ms': expected an integer in range 500..=30000",
+                ));
+            };
+            if !(MIN_CONSENT_WAIT_MS..=MAX_CONSENT_WAIT_MS).contains(&ms) {
+                return Err(ToolResult::error(format!(
+                    "invalid 'wait_ms': {ms} is outside the allowed range {MIN_CONSENT_WAIT_MS}..={MAX_CONSENT_WAIT_MS}"
+                )));
+            }
+            Ok(Some(ms))
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for ApproveBrowserConsentTool {
+    fn def(&self) -> &ToolDef {
+        &self.def
+    }
+
+    async fn invoke(&self, args: Value) -> ToolResult {
+        let pid = match args.require_i64("pid") {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let window_id = match args.require_u64("window_id") {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let wait_ms = match parse_consent_wait_ms(&args) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let session = args.opt_str("session");
+        let request = BrowserConsentRequest {
+            action: BrowserConsentAction::default(),
+            pid,
+            window_id,
+            attempt: 0,
+            wait_ms,
+        };
+        match self
+            .engine
+            .platform
+            .handle_existing_profile_consent(request)
+            .await
+        {
+            Ok(outcome) => {
+                let outcome_str = match outcome {
+                    BrowserConsentOutcome::Accepted => "accepted",
+                    BrowserConsentOutcome::NotPresent => "not_present",
+                };
+                ToolResult::text(format!(
+                    "approve_browser_consent: {outcome_str} (pid={pid}, window_id={window_id})"
+                ))
+                .with_structured(json!({
+                    "status": "ok",
+                    "pid": pid,
+                    "window_id": window_id,
+                    "session": session,
+                    "outcome": outcome_str,
+                }))
+            }
+            Err(refusal) => ToolResult::error(format!(
+                "approve_browser_consent refused: {}",
+                refusal.message
+            ))
+            .with_structured(json!({
+                "status": "refused",
+                "pid": pid,
+                "window_id": window_id,
+                "session": session,
+                "refusal": refusal,
+            })),
+        }
+    }
+}
+
 // ── browser_prepare ──────────────────────────────────────────────────────────
+
+fn format_bind_tab_line(t: &crate::browser::store::TabRecord) -> String {
+    let active_marker = if t.active == Some(true) {
+        " [active]"
+    } else {
+        ""
+    };
+    let title = if t.title.is_empty() {
+        "(untitled)"
+    } else {
+        t.title.as_str()
+    };
+    let url = if t.url.is_empty() {
+        "(no url)"
+    } else {
+        t.url.as_str()
+    };
+    format!(
+        "- tab_id={}{active_marker} | {title} | {url}",
+        t.tab_id
+    )
+}
 
 pub struct BrowserPrepareTool {
     def: ToolDef,
@@ -3940,7 +4100,8 @@ mod tests {
                 "browser_dialog",
                 "browser_set_input_files",
                 "browser_download",
-                "browser_pointer"
+                "browser_pointer",
+                "approve_browser_consent"
             ]
         );
     }
@@ -4761,5 +4922,191 @@ mod tests {
             0,
             "session end must clean the store"
         );
+    }
+
+    #[test]
+    fn bind_tab_summary_line_includes_tab_id_active_marker_title_and_url() {
+        let active_tab = crate::browser::store::TabRecord {
+            tab_id: "tab-1".into(),
+            cdp_target_id: "CDP-1".into(),
+            title: "Inbox".into(),
+            url: "https://mail.example.test/".into(),
+            active: Some(true),
+            generation: 1,
+            snapshots: std::collections::HashMap::new(),
+        };
+        let bg_tab = crate::browser::store::TabRecord {
+            tab_id: "tab-2".into(),
+            cdp_target_id: "CDP-2".into(),
+            title: String::new(),
+            url: String::new(),
+            active: Some(false),
+            generation: 1,
+            snapshots: std::collections::HashMap::new(),
+        };
+        assert_eq!(
+            super::format_bind_tab_line(&active_tab),
+            "- tab_id=tab-1 [active] | Inbox | https://mail.example.test/"
+        );
+        assert_eq!(
+            super::format_bind_tab_line(&bg_tab),
+            "- tab_id=tab-2 | (untitled) | (no url)"
+        );
+    }
+
+    #[tokio::test]
+    async fn approve_browser_consent_tool_delegates_without_cdp_ownership() {
+        struct ConsentAcceptPlatform(MockPlatform);
+        #[async_trait]
+        impl BrowserPlatform for ConsentAcceptPlatform {
+            async fn classify_browser(&self, pid: i64) -> Result<BrowserClassification, BrowserRefusal> {
+                self.0.classify_browser(pid).await
+            }
+            async fn native_window(
+                &self,
+                pid: i64,
+                window_id: u64,
+            ) -> Result<NativeWindowInfo, BrowserRefusal> {
+                self.0.native_window(pid, window_id).await
+            }
+            async fn is_only_exact_native_window(
+                &self,
+                pid: i64,
+                window_id: u64,
+            ) -> Result<Option<bool>, BrowserRefusal> {
+                self.0.is_only_exact_native_window(pid, window_id).await
+            }
+            async fn discover_owned_endpoint(
+                &self,
+                pid: i64,
+            ) -> Result<Option<crate::browser::types::OwnedEndpoint>, BrowserRefusal> {
+                self.0.discover_owned_endpoint(pid).await
+            }
+            async fn prepare_endpoint(
+                &self,
+                request: PrepareRequest,
+            ) -> Result<PrepareOutcome, BrowserRefusal> {
+                self.0.prepare_endpoint(request).await
+            }
+            async fn process_fingerprint(
+                &self,
+                pid: i64,
+            ) -> Result<crate::browser::types::ProcessFingerprint, BrowserRefusal> {
+                self.0.process_fingerprint(pid).await
+            }
+            async fn handle_existing_profile_consent(
+                &self,
+                request: BrowserConsentRequest,
+            ) -> Result<BrowserConsentOutcome, BrowserRefusal> {
+                assert_eq!(request.pid, 4242);
+                assert_eq!(request.window_id, 77);
+                Ok(BrowserConsentOutcome::Accepted)
+            }
+        }
+
+        let platform = Arc::new(ConsentAcceptPlatform(MockPlatform::default()));
+        let engine = BrowserEngine::new(platform);
+        let tool = super::ApproveBrowserConsentTool::new(engine);
+        assert_eq!(tool.def().name, "approve_browser_consent");
+        let res = tool
+            .invoke(json!({
+                "pid": 4242,
+                "window_id": 77,
+                "session": "ext-cdp"
+            }))
+            .await;
+        assert_ne!(res.is_error, Some(true));
+        let structured = res.structured_content.expect("structured output");
+        assert_eq!(structured["status"], "ok");
+        assert_eq!(structured["pid"], 4242);
+        assert_eq!(structured["window_id"], 77);
+        assert_eq!(structured["session"], "ext-cdp");
+        assert_eq!(structured["outcome"], "accepted");
+
+        let missing_pid = tool.invoke(json!({ "window_id": 77 })).await;
+        assert_eq!(missing_pid.is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn approve_browser_consent_validates_and_forwards_wait_ms() {
+        use std::sync::Mutex;
+
+        struct RecordingConsentPlatform {
+            inner: MockPlatform,
+            seen_wait_ms: Mutex<Vec<Option<u64>>>,
+        }
+
+        #[async_trait]
+        impl BrowserPlatform for RecordingConsentPlatform {
+            async fn classify_browser(&self, pid: i64) -> Result<BrowserClassification, BrowserRefusal> {
+                self.inner.classify_browser(pid).await
+            }
+            async fn native_window(
+                &self,
+                pid: i64,
+                window_id: u64,
+            ) -> Result<NativeWindowInfo, BrowserRefusal> {
+                self.inner.native_window(pid, window_id).await
+            }
+            async fn is_only_exact_native_window(
+                &self,
+                pid: i64,
+                window_id: u64,
+            ) -> Result<Option<bool>, BrowserRefusal> {
+                self.inner.is_only_exact_native_window(pid, window_id).await
+            }
+            async fn discover_owned_endpoint(
+                &self,
+                pid: i64,
+            ) -> Result<Option<crate::browser::types::OwnedEndpoint>, BrowserRefusal> {
+                self.inner.discover_owned_endpoint(pid).await
+            }
+            async fn prepare_endpoint(
+                &self,
+                request: PrepareRequest,
+            ) -> Result<PrepareOutcome, BrowserRefusal> {
+                self.inner.prepare_endpoint(request).await
+            }
+            async fn process_fingerprint(
+                &self,
+                pid: i64,
+            ) -> Result<crate::browser::types::ProcessFingerprint, BrowserRefusal> {
+                self.inner.process_fingerprint(pid).await
+            }
+            async fn handle_existing_profile_consent(
+                &self,
+                request: BrowserConsentRequest,
+            ) -> Result<BrowserConsentOutcome, BrowserRefusal> {
+                self.seen_wait_ms.lock().unwrap().push(request.wait_ms);
+                Ok(BrowserConsentOutcome::Accepted)
+            }
+        }
+
+        let platform = Arc::new(RecordingConsentPlatform {
+            inner: MockPlatform::default(),
+            seen_wait_ms: Mutex::new(Vec::new()),
+        });
+        let engine = BrowserEngine::new(platform.clone());
+        let tool = super::ApproveBrowserConsentTool::new(engine);
+
+        let default_res = tool.invoke(json!({ "pid": 4242, "window_id": 77 })).await;
+        assert_ne!(default_res.is_error, Some(true));
+
+        let custom_res = tool
+            .invoke(json!({ "pid": 4242, "window_id": 77, "wait_ms": 15_000 }))
+            .await;
+        assert_ne!(custom_res.is_error, Some(true));
+
+        assert_eq!(
+            *platform.seen_wait_ms.lock().unwrap(),
+            vec![None, Some(15_000)]
+        );
+
+        for bad_wait in [json!(499), json!(30_001), json!(-100), json!("fast")] {
+            let err_res = tool
+                .invoke(json!({ "pid": 4242, "window_id": 77, "wait_ms": bad_wait }))
+                .await;
+            assert_eq!(err_res.is_error, Some(true));
+        }
     }
 }

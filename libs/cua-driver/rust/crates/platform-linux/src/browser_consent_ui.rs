@@ -370,7 +370,7 @@ fn exact_button_center(
 
 fn trusted_allow_click(pid: u32, window_id: u64) -> anyhow::Result<()> {
     with_target_foreground(pid, window_id, session_policy().setup, || {
-        let tree = crate::atspi::walk_tree(pid, window_id, None);
+        let tree = crate::atspi::walk_tree_no_web_content(pid, window_id, None);
         let index = exact_allow_button(&tree.nodes, &tree.bounds)
             .map_err(|error| anyhow::anyhow!(error.message))?
             .ok_or_else(|| {
@@ -406,7 +406,7 @@ pub fn dismiss(pid: u32, window_id: u64) -> Result<bool, BrowserRefusal> {
     let mut dismissed = false;
     loop {
         prove_window_owner(pid, window_id)?;
-        let tree = crate::atspi::walk_tree(pid, window_id, None);
+        let tree = crate::atspi::walk_tree_no_web_content(pid, window_id, None);
         let prompt_present = native_prompt_surface_present(&tree.nodes);
         if !prompt_present {
             return Ok(dismissed);
@@ -484,6 +484,103 @@ async fn consent_action<T: Send + 'static>(
     Ok(result)
 }
 
+const DEFAULT_CONSENT_WAIT_MS: u64 = 10_000;
+const MIN_CONSENT_WAIT_MS: u64 = 500;
+const MAX_CONSENT_WAIT_MS: u64 = 30_000;
+
+fn resolve_wait_duration(wait_ms: Option<u64>) -> Duration {
+    let ms = wait_ms
+        .unwrap_or(DEFAULT_CONSENT_WAIT_MS)
+        .clamp(MIN_CONSENT_WAIT_MS, MAX_CONSENT_WAIT_MS);
+    Duration::from_millis(ms)
+}
+
+async fn handle_with_ops<FInspect, FA11y, FTrusted>(
+    request: &BrowserConsentRequest,
+    mut prove_owner: impl FnMut() -> Result<(), BrowserRefusal>,
+    mut inspect_tree: impl FnMut() -> FInspect,
+    mut perform_a11y: impl FnMut(AtspiNode) -> FA11y,
+    mut perform_trusted: impl FnMut() -> FTrusted,
+) -> Result<BrowserConsentOutcome, BrowserRefusal>
+where
+    FInspect: std::future::Future<
+        Output = Result<(Vec<AtspiNode>, Vec<(usize, i32, i32, u32, u32)>), BrowserRefusal>,
+    >,
+    FA11y: std::future::Future<Output = Result<(), BrowserRefusal>>,
+    FTrusted: std::future::Future<Output = Result<(), BrowserRefusal>>,
+{
+    prove_owner()?;
+    let deadline = Instant::now() + resolve_wait_duration(request.wait_ms);
+    let mut saw_prompt = false;
+    let mut accessibility_action_at = None;
+    let mut trusted_click_attempted = false;
+    // Names are withheld: the snapshot shows the topology of the last walk
+    // that failed to settle without leaking page or prompt text.
+    let mut last_snapshot = serde_json::Value::Null;
+    let mut last_transient_refusal: Option<BrowserRefusal> = None;
+    loop {
+        if let Err(refusal) = check_deadline(deadline) {
+            return Err(last_transient_refusal.unwrap_or(refusal).with_detail(
+                serde_json::json!({
+                    "redacted_native_nodes": last_snapshot,
+                }),
+            ));
+        }
+        prove_owner()?;
+        let (nodes, bounds) = inspect_tree().await?;
+        last_snapshot = redacted_native_prompt_snapshot(&nodes, &bounds);
+        if let Err(refusal) = check_deadline(deadline) {
+            return Err(last_transient_refusal.unwrap_or(refusal).with_detail(
+                serde_json::json!({
+                    "redacted_native_nodes": last_snapshot,
+                }),
+            ));
+        }
+        let prompt_present = native_prompt_surface_present(&nodes);
+        saw_prompt |= prompt_present;
+        match exact_allow_button(&nodes, &bounds) {
+            Ok(Some(index)) if accessibility_action_at.is_none() => {
+                last_transient_refusal = None;
+                let node = walked_node(&nodes, index)?;
+                // Like an accepted action, one that failed after it was sent
+                // is read back from the prompt below.
+                perform_a11y(node).await?;
+                accessibility_action_at = Some(Instant::now());
+            }
+            Ok(Some(_))
+                if !trusted_click_attempted
+                    && accessibility_action_at.is_some_and(|attempted| {
+                        attempted.elapsed() >= Duration::from_millis(150)
+                    }) =>
+            {
+                last_transient_refusal = None;
+                perform_trusted().await?;
+                trusted_click_attempted = true;
+            }
+            Ok(Some(_)) => {
+                last_transient_refusal = None;
+            }
+            Ok(None) if saw_prompt && !prompt_present => {
+                if accessibility_action_at.is_some() {
+                    return Ok(BrowserConsentOutcome::Accepted);
+                }
+                return Err(BrowserRefusal::new(
+                    BrowserRefusalCode::BrowserConsentRevoked,
+                    "the person dismissed the browser consent prompt",
+                ));
+            }
+            Ok(None) => {}
+            Err(refusal) if refusal.code == BrowserRefusalCode::BrowserWrongTargetRefused => {
+                // Transient layout state (e.g. alert rendered before all 3 buttons
+                // finish laying out): keep polling until the deadline expires.
+                last_transient_refusal = Some(refusal);
+            }
+            Err(refusal) => return Err(refusal),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 pub async fn handle(
     request: BrowserConsentRequest,
 ) -> Result<BrowserConsentOutcome, BrowserRefusal> {
@@ -493,78 +590,48 @@ pub async fn handle(
             "the approved browser pid is outside the Linux process-id range",
         )
     })?;
-    prove_window_owner(pid, request.window_id)?;
-    let deadline = Instant::now() + Duration::from_secs(4);
-    let mut saw_prompt = false;
-    let mut accessibility_action_at = None;
-    let mut trusted_click_attempted = false;
-    // Names are withheld: the snapshot shows the topology of the last walk
-    // that failed to settle without leaking page or prompt text.
-    let mut last_snapshot = serde_json::Value::Null;
-    loop {
-        if let Err(refusal) = check_deadline(deadline) {
-            return Err(refusal.with_detail(serde_json::json!({
-                "redacted_native_nodes": last_snapshot,
-            })));
-        }
-        prove_window_owner(pid, request.window_id)?;
-        let window_id = request.window_id;
-        let tree =
-            tokio::task::spawn_blocking(move || crate::atspi::walk_tree(pid, window_id, None))
-                .await
-                .map_err(|error| {
-                    BrowserRefusal::new(
-                        BrowserRefusalCode::BrowserRouteUnavailable,
-                        format!("could not inspect the browser consent UI: {error}"),
-                    )
-                })?;
-        last_snapshot = redacted_native_prompt_snapshot(&tree.nodes, &tree.bounds);
-        if let Err(refusal) = check_deadline(deadline) {
-            return Err(refusal.with_detail(serde_json::json!({
-                "redacted_native_nodes": last_snapshot,
-            })));
-        }
-        let prompt_present = native_prompt_surface_present(&tree.nodes);
-        saw_prompt |= prompt_present;
-        match exact_allow_button(&tree.nodes, &tree.bounds)? {
-            Some(index) if accessibility_action_at.is_none() => {
-                let node = walked_node(&tree.nodes, index)?;
-                // Like an accepted action, one that failed after it was sent
-                // is read back from the prompt below.
-                consent_action(&request.action, deadline, move || {
+    let window_id = request.window_id;
+    let action = request.action.clone();
+    handle_with_ops(
+        &request,
+        || prove_window_owner(pid, window_id),
+        || async move {
+            let tree = tokio::task::spawn_blocking(move || {
+                crate::atspi::walk_tree_no_web_content(pid, window_id, None)
+            })
+            .await
+            .map_err(|error| {
+                BrowserRefusal::new(
+                    BrowserRefusalCode::BrowserRouteUnavailable,
+                    format!("could not inspect the browser consent UI: {error}"),
+                )
+            })?;
+            Ok((tree.nodes, tree.bounds))
+        },
+        |node| {
+            let action = action.clone();
+            let deadline = Instant::now() + resolve_wait_duration(request.wait_ms);
+            async move {
+                consent_action(&action, deadline, move || {
                     crate::atspi::action_sent(crate::atspi::perform_action_walked(
                         pid, window_id, &node,
                     ))
                 })
-                .await?;
-                accessibility_action_at = Some(Instant::now());
+                .await
             }
-            Some(_)
-                if !trusted_click_attempted
-                    && accessibility_action_at.is_some_and(|attempted| {
-                        attempted.elapsed() >= Duration::from_millis(150)
-                    }) =>
-            {
-                let window_id = request.window_id;
-                consent_action(&request.action, deadline, move || {
+        },
+        || {
+            let action = action.clone();
+            let deadline = Instant::now() + resolve_wait_duration(request.wait_ms);
+            async move {
+                consent_action(&action, deadline, move || {
                     trusted_allow_click(pid, window_id)
                 })
-                .await?;
-                trusted_click_attempted = true;
+                .await
             }
-            None if saw_prompt && !prompt_present => {
-                if accessibility_action_at.is_some() {
-                    return Ok(BrowserConsentOutcome::Accepted);
-                }
-                return Err(BrowserRefusal::new(
-                    BrowserRefusalCode::BrowserConsentRevoked,
-                    "the person dismissed the browser consent prompt",
-                ));
-            }
-            _ => {}
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -987,5 +1054,100 @@ mod tests {
         );
         assert!(exact_button_center(&[(7, 10, 20, 1, 30)], 7).is_err());
         assert!(exact_button_center(&[(8, 10, 20, 80, 30)], 7).is_err());
+    }
+
+    #[test]
+    fn resolve_wait_duration_defaults_and_clamps() {
+        assert_eq!(resolve_wait_duration(None), Duration::from_millis(10_000));
+        assert_eq!(resolve_wait_duration(Some(100)), Duration::from_millis(500));
+        assert_eq!(
+            resolve_wait_duration(Some(5_000)),
+            Duration::from_millis(5_000)
+        );
+        assert_eq!(
+            resolve_wait_duration(Some(60_000)),
+            Duration::from_millis(30_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_incomplete_buttons_retries_until_ready() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let request = BrowserConsentRequest {
+            action: BrowserConsentAction::default(),
+            pid: 4242,
+            window_id: 77,
+            attempt: 0,
+            wait_ms: Some(1_000),
+        };
+        let pass = Arc::new(AtomicUsize::new(0));
+        let clicked_index = Arc::new(AtomicUsize::new(0));
+
+        let pass_inspect = pass.clone();
+        let clicked_a11y = clicked_index.clone();
+        let outcome = handle_with_ops(
+            &request,
+            || Ok(()),
+            || {
+                let current = pass_inspect.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    match current {
+                        // First pass: alert is present, but only 2 buttons are laid out.
+                        0 => {
+                            let mut incomplete = prompt();
+                            incomplete.retain(|n| n.element_index != Some(ALLOW));
+                            Ok((incomplete, row_bounds(EN_US_ROW)))
+                        }
+                        // Second pass: all 3 buttons are ready.
+                        1 => Ok((prompt(), row_bounds(EN_US_ROW))),
+                        // Third pass: prompt dismissed after Allow click.
+                        _ => Ok((Vec::new(), Vec::new())),
+                    }
+                }
+            },
+            |node| {
+                let clicked = clicked_a11y.clone();
+                async move {
+                    clicked.store(node.element_index.unwrap_or(0), Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+            || async { Ok(()) },
+        )
+        .await;
+
+        assert_eq!(outcome.unwrap(), BrowserConsentOutcome::Accepted);
+        assert_eq!(clicked_index.load(Ordering::SeqCst), ALLOW);
+        assert!(pass.load(Ordering::SeqCst) >= 3);
+    }
+
+    #[tokio::test]
+    async fn persistent_incomplete_buttons_refuses_after_wait_ms_deadline() {
+        let request = BrowserConsentRequest {
+            action: BrowserConsentAction::default(),
+            pid: 4242,
+            window_id: 77,
+            attempt: 0,
+            wait_ms: Some(500),
+        };
+        let result = handle_with_ops(
+            &request,
+            || Ok(()),
+            || async {
+                let mut incomplete = prompt();
+                incomplete.retain(|n| n.element_index != Some(ALLOW));
+                Ok((incomplete, row_bounds(EN_US_ROW)))
+            },
+            |_node| async { Ok(()) },
+            || async { Ok(()) },
+        )
+        .await;
+
+        let refusal = result.unwrap_err();
+        assert_eq!(refusal.code, BrowserRefusalCode::BrowserWrongTargetRefused);
     }
 }

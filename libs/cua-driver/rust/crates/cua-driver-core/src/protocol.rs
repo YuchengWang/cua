@@ -410,7 +410,7 @@ fn agent_instructions() -> String {
 
 Use the narrowest semantic route first: `set_window_frame` plus `list_windows` for geometry, typed browser tools for pages. Stay in the background; `delivery_mode:"foreground"` only if refused/unverifiable.
 
-Chrome/Edge/Brave page: `get_browser_state({{pid, window_id}})`, its `detail.next_call` (`browser_prepare`) if refused, then `browser_click`/`browser_type`/`browser_pointer` (hover, drag); never desktop pointer tools.
+Chrome/Edge/Brave page: probe existing logged-in browser windows (`list_windows` + `get_window_state`) first and never blindly launch `isolated_new`; approve `"Allow remote debugging?"` via `cua-ycwang` semantic click. Then `get_browser_state({{pid, window_id}})`, its `detail.next_call` (`browser_prepare`) if refused, and coordinate with `chrome_devtools` for CDP page ops (`browser_click`/`browser_type`/`browser_pointer` (hover, drag); never desktop pointer tools).
 
 `start_session` is optional; repeat a short `session` label on every call that accepts it.{permission_line}
 
@@ -704,5 +704,16 @@ mod initialize_metadata_tests {
         }))
         .unwrap();
         assert!(req.initialize_metadata().is_none());
+    }
+
+    #[test]
+    fn instructions_include_browser_probe_consent_and_devtools_guidance() {
+        let text = super::agent_instructions();
+        assert!(text.contains("list_windows"));
+        assert!(text.contains("get_window_state"));
+        assert!(text.contains("isolated_new"));
+        assert!(text.contains("Allow remote debugging?"));
+        assert!(text.contains("cua-ycwang"));
+        assert!(text.contains("chrome_devtools"));
     }
 }

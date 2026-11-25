@@ -233,6 +233,7 @@ pub struct BrowserConsentRequest {
     pub pid: i64,
     pub window_id: u64,
     pub attempt: u8,
+    pub wait_ms: Option<u64>,
 }
 
 /// Exact, already-approved browser/window scope for enabling an existing

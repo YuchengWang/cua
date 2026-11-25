@@ -1399,6 +1399,70 @@ pub(crate) fn verify_log_pattern_in_file(
     Ok(re.is_match(&text))
 }
 
+fn resolve_consent_target(
+    ctx: Option<&X11ScreenContext>,
+    recipe: &AppRecipe,
+    target_window_id: Option<u64>,
+    target_pid: Option<u32>,
+    args: &Value,
+) -> anyhow::Result<(i64, u64)> {
+    let mut pid = args
+        .get("pid")
+        .and_then(Value::as_i64)
+        .or_else(|| target_pid.map(i64::from));
+    let mut window_id = args
+        .get("window_id")
+        .and_then(Value::as_u64)
+        .or(target_window_id);
+
+    if (pid.is_none() || window_id.is_none()) && ctx.is_some() {
+        let xctx = ctx.unwrap();
+        let wins = crate::x11::list_windows_with_context(xctx, None);
+        let matched = if let Some(wid) = window_id {
+            wins.into_iter().find(|w| w.xid == wid)
+        } else if let Some(p) = pid {
+            wins.into_iter().find(|w| w.pid.map(i64::from) == Some(p))
+        } else {
+            let app_lower = recipe.app_id.to_ascii_lowercase();
+            wins.into_iter().find(|w| {
+                w.app_name.to_ascii_lowercase().contains(&app_lower)
+                    || w.title.to_ascii_lowercase().contains("chrome")
+            })
+        };
+        if let Some(w) = matched {
+            if pid.is_none() {
+                pid = w.pid.map(i64::from);
+            }
+            if window_id.is_none() {
+                window_id = Some(w.xid);
+            }
+        }
+    }
+
+    let pid = pid.ok_or_else(|| {
+        anyhow::anyhow!("approve_remote_debugging_consent requires target 'pid' (or mapped window)")
+    })?;
+    let window_id = window_id.ok_or_else(|| {
+        anyhow::anyhow!(
+            "approve_remote_debugging_consent requires target 'window_id' (or mapped window)"
+        )
+    })?;
+    Ok((pid, window_id))
+}
+
+fn run_async_consent<F, T>(fut: F) -> T
+where
+    F: std::future::Future<Output = T> + Send,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.block_on(fut)
+    } else {
+        tokio::runtime::Runtime::new()
+            .expect("tokio runtime for browser consent")
+            .block_on(fut)
+    }
+}
+
 fn execute_recipe_step(
     ctx: Option<&X11ScreenContext>,
     recipe: &AppRecipe,
@@ -1480,6 +1544,25 @@ fn execute_recipe_step(
             }
             xtest_press_key(xctx, key)?;
             Ok(json!({ "key": key, "scope": scope.unwrap_or("window") }))
+        }
+        "approve_remote_debugging_consent" => {
+            let (pid, window_id) =
+                resolve_consent_target(ctx, recipe, target_window_id, target_pid, args)?;
+            let attempt = args.get("attempt").and_then(Value::as_u64).unwrap_or(0) as u8;
+            let request = cua_driver_core::browser::BrowserConsentRequest {
+                action: cua_driver_core::browser::platform::BrowserConsentAction::default(),
+                pid,
+                window_id,
+                attempt,
+                wait_ms: None,
+            };
+            let outcome = run_async_consent(crate::browser_consent_ui::handle(request))
+                .map_err(|refusal| anyhow::anyhow!("{} ({:?})", refusal.message, refusal.code))?;
+            Ok(json!({
+                "pid": pid,
+                "window_id": window_id,
+                "outcome": format!("{outcome:?}"),
+            }))
         }
         "dismiss_modals" => {
             let xctx = ctx.ok_or_else(|| anyhow::anyhow!("X11 display context unavailable"))?;
@@ -2440,7 +2523,69 @@ mod tests {
         let run_err = serde_json::to_string(&run_res.content).unwrap();
         assert!(
             run_err.contains("nonexistent_flow"),
-            "expected flow lookup error after bypassing browser_exempt, got: {run_err}"
+            "expected flow lookup error after bypassing browser_exempt, got: {err_text}"
         );
+
+        // Verify P0-2: google-chrome.json must not bind Return to Allow remote debugging?
+        // and approve_remote_debugging flow must use approve_remote_debugging_consent.
+        assert!(
+            !resolved
+                .modal_handlers
+                .iter()
+                .any(|h| h.pattern.contains("Allow remote debugging") && h.key.as_deref() == Some("Return")),
+            "google-chrome.json modal_handlers must not send Return to Allow remote debugging? (would hit Cancel)"
+        );
+        let approve_flow = resolved
+            .flows
+            .get("approve_remote_debugging")
+            .expect("google-chrome.json must define approve_remote_debugging flow");
+        assert!(
+            approve_flow
+                .iter()
+                .any(|s| s.action == "approve_remote_debugging_consent"),
+            "approve_remote_debugging flow must use approve_remote_debugging_consent"
+        );
+        assert!(
+            !approve_flow.iter().any(|s| s.action == "dismiss_modals"),
+            "approve_remote_debugging flow must not use X11 dismiss_modals"
+        );
+    }
+
+    #[test]
+    fn resolve_consent_target_uses_explicit_args_or_fails_closed() {
+        let recipe: AppRecipe = serde_json::from_value(json!({
+            "schema_version": 1,
+            "app_id": "google-chrome",
+            "app_version": "1",
+            "version_source": "dpkg",
+            "fingerprint_sha256": "test",
+            "state_machine": { "initial_state": "ready", "states": [], "transitions": [] }
+        }))
+        .expect("minimal AppRecipe deserializes");
+        let (pid, wid) = super::resolve_consent_target(
+            None,
+            &recipe,
+            Some(99),
+            Some(42),
+            &json!({}),
+        )
+        .expect("explicit target_pid and target_window_id should resolve");
+        assert_eq!(pid, 42);
+        assert_eq!(wid, 99);
+
+        let (pid2, wid2) = super::resolve_consent_target(
+            None,
+            &recipe,
+            None,
+            None,
+            &json!({ "pid": 123, "window_id": 456 }),
+        )
+        .expect("args pid and window_id should resolve");
+        assert_eq!(pid2, 123);
+        assert_eq!(wid2, 456);
+
+        let err = super::resolve_consent_target(None, &recipe, None, None, &json!({}))
+            .expect_err("missing target without X11 context must fail");
+        assert!(err.to_string().contains("pid") || err.to_string().contains("window_id"));
     }
 }

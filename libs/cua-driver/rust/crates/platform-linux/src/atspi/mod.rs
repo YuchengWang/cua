@@ -183,6 +183,12 @@ pub fn walk_tree(pid: u32, xid: u64, query: Option<&str>) -> AtspiTreeResult {
     walk_tree_bounded(pid, xid, query, None, None)
 }
 
+/// Walk the AT-SPI tree for browser-chrome controls only, pruning
+/// `document web` / `document frame` subtrees (`skip_web_content = true`).
+pub fn walk_tree_no_web_content(pid: u32, xid: u64, query: Option<&str>) -> AtspiTreeResult {
+    walk_tree_bounded_within_options(pid, xid, query, None, None, DEFAULT_WALK_TIMEOUT, true)
+}
+
 /// Best-effort accessibility snapshot for synchronous trajectory evidence.
 ///
 /// Recording brackets an action with before/after captures, so it must use a
@@ -236,6 +242,19 @@ pub fn walk_tree_bounded_within(
     max_depth: Option<usize>,
     timeout: std::time::Duration,
 ) -> AtspiTreeResult {
+    walk_tree_bounded_within_options(pid, xid, query, max_elements, max_depth, timeout, false)
+}
+
+/// [`walk_tree_bounded_within`] with explicit `skip_web_content` pruning.
+pub fn walk_tree_bounded_within_options(
+    pid: u32,
+    xid: u64,
+    query: Option<&str>,
+    max_elements: Option<usize>,
+    max_depth: Option<usize>,
+    timeout: std::time::Duration,
+    skip_web_content: bool,
+) -> AtspiTreeResult {
     // Native AT-SPI (most complete). On a COLD launch the Qt6 (and some GTK)
     // AT-SPI bridge registers lazily — the first walk against a freshly
     // launched app can come back with just the root window (element_count=1,
@@ -254,7 +273,14 @@ pub fn walk_tree_bounded_within(
         if remaining.is_zero() {
             break;
         }
-        match native::walk_tree_bounded_with_timeout(pid, xid, max_elements, max_depth, remaining) {
+        match native::walk_tree_bounded_with_options(
+            pid,
+            xid,
+            max_elements,
+            max_depth,
+            remaining,
+            skip_web_content,
+        ) {
             Ok(Some(walked)) => {
                 // `nodes.len() <= 1` == only the root window resolved: the
                 // cold-registry symptom. Accept any real tree immediately; only

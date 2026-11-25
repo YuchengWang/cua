@@ -1851,6 +1851,7 @@ impl BrowserEngine {
                         pid,
                         window_id,
                         attempt: 1,
+                        wait_ms: None,
                     })
             },
             person_wait,
@@ -1895,6 +1896,7 @@ impl BrowserEngine {
                         pid,
                         window_id,
                         attempt: 2,
+                        wait_ms: None,
                     })
             },
             person_wait,

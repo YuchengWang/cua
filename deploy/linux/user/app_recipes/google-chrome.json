@@ -100,6 +100,84 @@
         "description": "Allow native bubble dismissal to settle"
       }
     ],
+    "approve_remote_debugging": [
+      {
+        "action": "verify_window_count_min",
+        "args": { "min": 1 },
+        "safety_level": "read_only",
+        "description": "Verify Chrome window is mapped before handling remote debugging consent"
+      },
+      {
+        "action": "approve_remote_debugging_consent",
+        "args": {},
+        "safety_level": "read_only",
+        "description": "Click the exact Allow button on Chrome's Allow remote debugging? native consent dialog via AT-SPI"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 200 },
+        "safety_level": "read_only",
+        "description": "Allow remote debugging consent state to settle"
+      }
+    ],
+    "verify_google_account": [
+      {
+        "action": "verify_window_count_min",
+        "args": { "min": 1 },
+        "safety_level": "read_only",
+        "description": "Verify at least one Chrome window is mapped on display"
+      },
+      {
+        "action": "verify_window_title_regex",
+        "args": { "pattern": ".*(@gmail\\.com|Google Account|Google Chrome - .+).*" },
+        "safety_level": "read_only",
+        "description": "Fast non-screenshot check for signed-in Google account or Chrome profile in window title"
+      }
+    ],
+    "enable_remote_debugging": [
+      {
+        "action": "verify_window_count_min",
+        "args": { "min": 1 },
+        "safety_level": "read_only",
+        "description": "Verify Chrome window is mapped before navigating to remote debugging settings"
+      },
+      {
+        "action": "hotkey",
+        "args": { "keys": ["ctrl", "l"] },
+        "safety_level": "read_only",
+        "description": "Focus Chrome omnibox"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 150 },
+        "safety_level": "read_only",
+        "description": "Allow omnibox focus to settle"
+      },
+      {
+        "action": "type_text",
+        "args": { "text": "chrome://inspect/#remote-debugging" },
+        "safety_level": "read_only",
+        "description": "Enter chrome://inspect/#remote-debugging URL into omnibox"
+      },
+      {
+        "action": "press_key",
+        "args": { "key": "Return" },
+        "safety_level": "read_only",
+        "description": "Navigate to chrome://inspect/#remote-debugging"
+      },
+      {
+        "action": "wait_for_stable_frame",
+        "args": { "ms": 400 },
+        "safety_level": "read_only",
+        "description": "Wait for chrome://inspect page to load"
+      },
+      {
+        "action": "verify_window_title_regex",
+        "args": { "pattern": ".*Inspect.*" },
+        "safety_level": "read_only",
+        "description": "Verify Chrome navigated to Inspect / Remote Debugging settings"
+      }
+    ],
     "paste_from_clipboard": [
       {
         "action": "click_anchor",

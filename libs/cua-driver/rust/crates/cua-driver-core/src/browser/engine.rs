@@ -154,22 +154,22 @@ pub(super) fn unsupported_engine_refusal(
 ) -> BrowserRefusal {
     let (message, protocol, limitation) = match classification.engine {
         BrowserEngineFamily::Gecko => (
-            "Firefox browser tools require a WebDriver BiDi or Remote Agent route; attaching to an ordinary running profile is not supported",
+            "Firefox browser tools require a WebDriver BiDi or Remote Agent route; attaching to an ordinary running profile is not supported. Fallback tiers: CDP/BiDi -> AT-SPI `page` (`get_text`/`query_dom`) -> AppRecipe ROI anchors",
             "webdriver_bidi",
             "remote_agent_requires_launch_time_enablement",
         ),
         BrowserEngineFamily::Webkit => (
-            "Safari browser tools require a WebKit-native automation route; Safari does not expose an attachable CDP endpoint for an ordinary running profile",
+            "WebKit/Safari browser tools do not expose an attachable CDP endpoint for an ordinary running profile. Fallback tiers: CDP -> AT-SPI `page` (`get_text`/`query_dom`) -> AppRecipe ROI anchors",
             "webkit_automation",
             "no_attachable_runtime_endpoint",
         ),
         BrowserEngineFamily::Chromium => (
-            "this Chromium-family browser does not expose a supported CDP route",
+            "this Chromium-family browser does not expose a supported CDP route. Fallback tiers: CDP -> AT-SPI `page` (`get_text`/`query_dom`) -> AppRecipe ROI anchors",
             "cdp",
             "cdp_unavailable",
         ),
         BrowserEngineFamily::Unknown => (
-            "this browser engine has no supported typed browser route",
+            "this browser engine has no supported typed CDP route. Fallback tiers: CDP -> AT-SPI `page` (`get_text`/`query_dom`) -> AppRecipe ROI anchors",
             "unknown",
             "engine_route_unavailable",
         ),
@@ -180,6 +180,11 @@ pub(super) fn unsupported_engine_refusal(
         "product": classification.product_kind,
         "required_protocol": protocol,
         "limitation": limitation,
+        "fallback_routing": [
+            { "tier": 1, "channel": "cdp", "note": "Attach via DevTools endpoint if launched with --remote-debugging-port" },
+            { "tier": 2, "channel": "atspi_page_tool", "tools": ["page"], "note": "Read or query WebView via AT-SPI LinuxPageBackend" },
+            { "tier": 3, "channel": "app_recipe_roi_anchors", "tools": ["run_app_recipe", "acquire_app_data"], "note": "Use AppRecipe relative_anchors and ROI screenshots for custom-rendered/atspi_blind surfaces" }
+        ],
     }))
 }
 
@@ -239,16 +244,21 @@ fn embedded_app_without_endpoint(
     refuse(
         BrowserRefusalCode::BrowserRequiresSetup,
         format!(
-            "pid {pid} is an Electron app with no DevTools endpoint. To read and drive a copy of \
-             it, call browser_prepare in detail.next_call: it launches a separate driver-owned \
-             instance on a fresh profile (the user's open window and its data are not attached), \
-             then bind that instance's window. To attach the user's own instance instead, it \
-             must be restarted with --remote-debugging-port=0; only the user can decide that."
+            "pid {pid} is an embedded/Electron app with no DevTools endpoint. Tiered fallback \
+             routes: (1) CDP: restart with --remote-debugging-port=0 or call browser_prepare in \
+             detail.next_call for an isolated instance; (2) AT-SPI: use `page` (get_text / \
+             query_dom) for Electron/CEF/WebKitGTK accessibility trees; (3) AppRecipe: use \
+             `run_app_recipe` / ROI anchors if the WebView is custom-rendered."
         ),
     )
     .with_detail(json!({
         "reason": "embedded_application_endpoint_closed",
         "supported_strategies": ["isolated_new", "remote_debugging_port_at_launch"],
+        "fallback_routing": [
+            { "tier": 1, "channel": "cdp", "note": "Restart with --remote-debugging-port=0 or launch isolated_new via browser_prepare" },
+            { "tier": 2, "channel": "atspi_page_tool", "tools": ["page"], "note": "Read or query WebView via AT-SPI LinuxPageBackend" },
+            { "tier": 3, "channel": "app_recipe_roi_anchors", "tools": ["run_app_recipe", "acquire_app_data"], "note": "Use AppRecipe relative_anchors and ROI screenshots when AT-SPI is blind" }
+        ],
         "next_call": {
             "tool": "browser_prepare",
             "arguments": {
@@ -1031,6 +1041,7 @@ impl BrowserEngine {
                         pid,
                         window_id: grant.window_id,
                         attempt,
+                        wait_ms: None,
                     }).await {
                         Ok(BrowserConsentOutcome::Accepted | BrowserConsentOutcome::NotPresent) => {
                             reconnect.await
@@ -3411,5 +3422,34 @@ allow:
                 .unwrap_err();
         assert_eq!(refusal.code, BrowserRefusalCode::BrowserOriginOutsideScope);
         assert!(authorize_live_browser_origin(None, "https://app.example.com").is_err());
+    }
+
+    #[test]
+    fn unsupported_engine_and_embedded_refusals_include_tiered_fallback_routing() {
+        let webkit = BrowserClassification {
+            is_browser: true,
+            engine: BrowserEngineFamily::Webkit,
+            product_kind: crate::browser::BrowserProduct::Other,
+            product: None,
+            channel: None,
+            process_role: BrowserProcessRole::EmbeddedApplication,
+            supports_cdp: false,
+        };
+        let refusal = unsupported_engine_refusal(&webkit, "get_browser_state");
+        assert!(refusal.message.contains("CDP -> AT-SPI"));
+        let detail = refusal.detail.expect("refusal detail");
+        let tiers = detail["fallback_routing"].as_array().expect("fallback_routing array");
+        assert_eq!(tiers.len(), 3);
+        assert_eq!(tiers[0]["channel"], "cdp");
+        assert_eq!(tiers[1]["channel"], "atspi_page_tool");
+        assert_eq!(tiers[2]["channel"], "app_recipe_roi_anchors");
+
+        let embedded = embedded_app_without_endpoint(
+            refuse(BrowserRefusalCode::BrowserRequiresSetup, "closed"),
+            "s1",
+            1234,
+        );
+        let emb_detail = embedded.detail.expect("embedded detail");
+        assert_eq!(emb_detail["fallback_routing"].as_array().unwrap().len(), 3);
     }
 }

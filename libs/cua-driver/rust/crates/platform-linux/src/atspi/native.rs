@@ -1487,6 +1487,10 @@ async fn resolve_window_frame(
 ///
 /// These caps protect against Electron / large web apps that produce
 /// 10k+ element trees and blow context windows.
+fn should_prune_web_subtree(skip_web_content: bool, in_web_doc: bool, role: &str) -> bool {
+    skip_web_content && (in_web_doc || is_document_role(role))
+}
+
 async fn collect_visited_bounded<'a>(
     conn: &'a AccessibilityConnection,
     pid: u32,
@@ -1494,13 +1498,14 @@ async fn collect_visited_bounded<'a>(
     max_elements: Option<usize>,
     max_depth: Option<usize>,
 ) -> Result<Option<Collected<'a>>> {
-    collect_visited_bounded_opts(conn, pid, xid, max_elements, max_depth, false).await
+    collect_visited_bounded_opts(conn, pid, xid, max_elements, max_depth, false, false).await
 }
 
-/// [`collect_visited_bounded`] with `walk_closed_menus`: a targeted walk
-/// (invoke_menu resolving a path segment by segment) descends into menus
-/// the snapshot walk keeps collapsed, since a toolkit that never marks its
-/// entries SHOWING (gail) cannot show the walk that a `doAction` opened one.
+/// [`collect_visited_bounded`] with `walk_closed_menus` and `skip_web_content`:
+/// - `walk_closed_menus`: descends into menus the snapshot walk keeps collapsed.
+/// - `skip_web_content`: prunes `document web` / `document frame` subtrees so
+///   browser-chrome callers (like `browser_consent_ui`) do not traverse thousands
+///   of web DOM nodes.
 async fn collect_visited_bounded_opts<'a>(
     conn: &'a AccessibilityConnection,
     pid: u32,
@@ -1508,6 +1513,7 @@ async fn collect_visited_bounded_opts<'a>(
     max_elements: Option<usize>,
     max_depth: Option<usize>,
     walk_closed_menus: bool,
+    skip_web_content: bool,
 ) -> Result<Option<Collected<'a>>> {
     if still_unresponsive(pid) {
         return Ok(Some(unresponsive_collected()));
@@ -1792,24 +1798,33 @@ async fn collect_visited_bounded_opts<'a>(
             call(acc.get_state()),
             call(raw_child_count(zconn, &oref)),
         );
-        // Fetch the child list only for real containers within the cap: leaves
-        // (the majority of nodes) save a round-trip, and a huge container is
-        // never enumerated (see CHILD_ENUMERATION_CAP).
-        let children_r: Option<Result<Vec<RawObjectRef>>> = match count_r {
-            Some(Ok(count)) if count <= 0 => Some(Ok(Vec::new())),
-            Some(Ok(count)) if count as usize > child_cap => {
-                huge_containers.push((count as usize, visited.len()));
-                Some(Ok(Vec::new()))
-            }
-            Some(Ok(_)) => call(raw_children(zconn, &oref)).await,
-            // Count unavailable (older bridges, error): fall back to the
-            // historical unconditional fetch.
-            Some(Err(_)) => call(raw_children(zconn, &oref)).await,
-            None => None,
-        };
         let role = match role_r {
             Some(Ok(r)) => r,
             _ => String::new(),
+        };
+        // Children inherit web-document context, plus this node's own role.
+        let child_in_web_doc = in_web_doc || is_document_role(&role);
+        // Fetch the child list only for real containers within the cap: leaves
+        // (the majority of nodes) save a round-trip, and a huge container is
+        // never enumerated (see CHILD_ENUMERATION_CAP). When `skip_web_content`
+        // is enabled, `document web` / `document frame` subtrees are pruned
+        // before enumerating their children.
+        let prune_web_subtree = should_prune_web_subtree(skip_web_content, in_web_doc, &role);
+        let children_r: Option<Result<Vec<RawObjectRef>>> = if prune_web_subtree {
+            Some(Ok(Vec::new()))
+        } else {
+            match count_r {
+                Some(Ok(count)) if count <= 0 => Some(Ok(Vec::new())),
+                Some(Ok(count)) if count as usize > child_cap => {
+                    huge_containers.push((count as usize, visited.len()));
+                    Some(Ok(Vec::new()))
+                }
+                Some(Ok(_)) => call(raw_children(zconn, &oref)).await,
+                // Count unavailable (older bridges, error): fall back to the
+                // historical unconditional fetch.
+                Some(Err(_)) => call(raw_children(zconn, &oref)).await,
+                None => None,
+            }
         };
         let mut name = match name_r {
             Some(Ok(n)) => n,
@@ -1963,13 +1978,10 @@ async fn collect_visited_bounded_opts<'a>(
             }
         }
 
-        // Children inherit web-document context, plus this node's own role.
-        let child_in_web_doc = in_web_doc || is_document_role(&role);
-
         // Enqueue children (fetched above) before moving `acc` into `visited`.
-        // Honor max_depth: skip enqueueing descendants whose depth
-        // would exceed the cap.
-        let descend = max_depth.map(|d| depth < d).unwrap_or(true);
+        // Honor max_depth and skip_web_content pruning.
+        let descend = !should_prune_web_subtree(skip_web_content, in_web_doc, &role)
+            && max_depth.map(|d| depth < d).unwrap_or(true);
         // A menu that is not open (a menubar entry that is not expanded, or
         // any menu that is not showing) keeps its child count and is not
         // walked: its items are hidden, never indexed, and cost a round-trip
@@ -2723,6 +2735,17 @@ pub(super) fn walk_tree_bounded_with_timeout(
     max_depth: Option<usize>,
     timeout: Duration,
 ) -> Result<Option<WalkedTree>> {
+    walk_tree_bounded_with_options(pid, xid, max_elements, max_depth, timeout, false)
+}
+
+pub(super) fn walk_tree_bounded_with_options(
+    pid: u32,
+    xid: u64,
+    max_elements: Option<usize>,
+    max_depth: Option<usize>,
+    timeout: Duration,
+    skip_web_content: bool,
+) -> Result<Option<WalkedTree>> {
     runtime().block_on(async {
         // Tree traversal and bounds collection form one snapshot. Keep one
         // deadline for both phases so a dead AT-SPI peer cannot outlive the
@@ -2737,7 +2760,16 @@ pub(super) fn walk_tree_bounded_with_timeout(
         let backstop = deadline + Duration::from_millis(500);
         let walk = OP_DEADLINE.scope(deadline, async {
             let conn = shared_connection().await?;
-            collect_visited_bounded(conn, pid, xid, max_elements, max_depth).await
+            collect_visited_bounded_opts(
+                conn,
+                pid,
+                xid,
+                max_elements,
+                max_depth,
+                false,
+                skip_web_content,
+            )
+            .await
         });
         let walked = match before_snapshot_deadline(backstop, walk).await {
             Ok(Ok(result)) => result,
@@ -3983,7 +4015,7 @@ pub fn invoke_menu_path_in(
     bounded(
         async {
             let conn = shared_connection().await?;
-            let collected = collect_visited_bounded_opts(conn, pid, xid, None, None, true)
+            let collected = collect_visited_bounded_opts(conn, pid, xid, None, None, true, false)
                 .await?
                 .ok_or_else(|| anyhow!("no AT-SPI application for pid {pid}"))?;
             let last = path.len() - 1;
@@ -4033,7 +4065,7 @@ pub fn invoke_menu_path_in(
             }
             drop(collected);
             for depth in 0..path.len() {
-                let collected = collect_visited_bounded_opts(conn, pid, xid, None, None, true)
+                let collected = collect_visited_bounded_opts(conn, pid, xid, None, None, true, false)
                     .await?
                     .ok_or_else(|| anyhow!("no AT-SPI application for pid {pid}"))?;
                 let index = resolve_menu_segment(
@@ -10229,5 +10261,21 @@ mod unresponsive_tests {
             assert!(Instant::now() < deadline, "the mark outlived its probe");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+}
+
+#[cfg(test)]
+mod skip_web_content_tests {
+    use super::should_prune_web_subtree;
+
+    #[test]
+    fn prunes_document_web_and_document_frame_when_skip_web_content_enabled() {
+        assert!(should_prune_web_subtree(true, false, "document web"));
+        assert!(should_prune_web_subtree(true, false, "document frame"));
+        assert!(should_prune_web_subtree(true, true, "push button"));
+        assert!(!should_prune_web_subtree(true, false, "alert"));
+        assert!(!should_prune_web_subtree(true, false, "push button"));
+        assert!(!should_prune_web_subtree(false, false, "document web"));
+        assert!(!should_prune_web_subtree(false, true, "push button"));
     }
 }

@@ -131,6 +131,23 @@ fn exact_setup_checkbox<'a>(
     }
 }
 
+const MISSING_A11Y_FAST_FAIL_POLLS: usize = 10;
+const MISSING_A11Y_FAST_FAIL_AFTER: Duration = Duration::from_secs(2);
+
+fn has_rendered_web_children(nodes: &[AtspiNode]) -> bool {
+    nodes.iter().any(|node| node.in_web_content)
+}
+
+fn should_fast_fail_missing_a11y(
+    nodes: &[AtspiNode],
+    empty_web_polls: usize,
+    elapsed_since_first_empty: Duration,
+) -> bool {
+    !has_rendered_web_children(nodes)
+        && empty_web_polls >= MISSING_A11Y_FAST_FAIL_POLLS
+        && elapsed_since_first_empty >= MISSING_A11Y_FAST_FAIL_AFTER
+}
+
 fn setup_not_ready_message(descriptor: &BrowserSetupDescriptor) -> String {
     format!(
         "the exact {} remote-debugging setup page did not become ready; on Linux, existing-profile setup requires the browser's complete AT-SPI tree (launch Chromium-family browsers with --force-renderer-accessibility, or use a screen reader that enables full renderer accessibility)",
@@ -584,13 +601,18 @@ fn set_remote_debugging(
     };
 
     let deadline = Instant::now() + EXISTING_PROFILE_SETUP_READY_TIMEOUT;
+    let mut empty_web_polls: usize = 0;
+    let mut empty_web_since: Option<Instant> = None;
     loop {
         let tree = match window_scoped_tree(pid, window_id) {
             Ok(tree) => tree,
             Err(error) => return Err(handle.abort(error)),
         };
         match exact_setup_checkbox(&tree.nodes, descriptor, handle.trusted_setup_navigation) {
-            Ok(Some(node)) => match node.checked {
+            Ok(Some(node)) => {
+                empty_web_polls = 0;
+                empty_web_since = None;
+                match node.checked {
                 Some(state) if state == desired_enabled => {
                     if desired_enabled && handle.enable_attempted {
                         handle.enabled_remote_debugging = true;
@@ -701,8 +723,23 @@ fn set_remote_debugging(
                         "AT-SPI did not expose the exact checkbox checked state",
                     )))
                 }
-            },
-            Ok(None) => {}
+            }
+            }
+            Ok(None) => {
+                if has_rendered_web_children(&tree.nodes) {
+                    empty_web_polls = 0;
+                    empty_web_since = None;
+                } else {
+                    empty_web_polls += 1;
+                    let since = *empty_web_since.get_or_insert_with(Instant::now);
+                    if should_fast_fail_missing_a11y(&tree.nodes, empty_web_polls, since.elapsed()) {
+                        return Err(handle.abort(BrowserRefusal::new(
+                            BrowserRefusalCode::BrowserWrongTargetRefused,
+                            setup_not_ready_message(descriptor),
+                        )));
+                    }
+                }
+            }
             Err(error) => return Err(handle.abort(error)),
         }
         if Instant::now() >= deadline {
@@ -1009,6 +1046,36 @@ mod tests {
         assert!(omnibox_holds_setup_url(
             &omnibox(Some("  CHROME://inspect/#remote-debugging  ")),
             descriptor()
+        ));
+    }
+
+    #[test]
+    fn fast_fails_when_document_web_has_zero_rendered_children() {
+        let doc_shell = node("document web", "Inspect", None, &[]);
+        assert!(!has_rendered_web_children(&[doc_shell.clone()]));
+        assert!(!should_fast_fail_missing_a11y(
+            std::slice::from_ref(&doc_shell),
+            MISSING_A11Y_FAST_FAIL_POLLS - 1,
+            Duration::from_secs(3),
+        ));
+        assert!(!should_fast_fail_missing_a11y(
+            std::slice::from_ref(&doc_shell),
+            MISSING_A11Y_FAST_FAIL_POLLS,
+            Duration::from_millis(500),
+        ));
+        assert!(should_fast_fail_missing_a11y(
+            &[doc_shell.clone()],
+            MISSING_A11Y_FAST_FAIL_POLLS,
+            MISSING_A11Y_FAST_FAIL_AFTER,
+        ));
+
+        let mut web_child = node("heading", "Remote debugging", None, &[]);
+        web_child.in_web_content = true;
+        assert!(has_rendered_web_children(&[doc_shell.clone(), web_child.clone()]));
+        assert!(!should_fast_fail_missing_a11y(
+            &[doc_shell, web_child],
+            MISSING_A11Y_FAST_FAIL_POLLS,
+            Duration::from_secs(5),
         ));
     }
 }

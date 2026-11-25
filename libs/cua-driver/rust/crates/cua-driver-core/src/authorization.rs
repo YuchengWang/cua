@@ -972,6 +972,7 @@ pub fn advertised_risk_for(tool: &str) -> RiskAssessment {
         | "start_recording"
         | "get_browser_state"
         | "browser_prepare"
+        | "approve_browser_consent"
         | "browser_navigate"
         | "browser_motion_policy"
         | "browser_click"
@@ -1289,6 +1290,7 @@ fn enforce_hard_invariants(
             | "verify_state"
             | "page"
             | "browser_prepare"
+            | "approve_browser_consent"
     );
     if process_targeting_tool
         && args.get("pid").and_then(Value::as_i64) == Some(i64::from(std::process::id()))
@@ -2254,5 +2256,16 @@ mod tests {
             status["daemon_authorization_ceiling"]["allowed_modes"],
             serde_json::json!(["standard"])
         );
+    }
+
+    #[test]
+    fn approve_browser_consent_has_r2_risk_classification() {
+        let risk = super::advertised_risk_for("approve_browser_consent");
+        assert_eq!(risk.class, super::RiskClass::R2);
+        let call_risk = super::classify_tool_call(
+            "approve_browser_consent",
+            &serde_json::json!({ "pid": 1234, "window_id": 56 }),
+        );
+        assert_eq!(call_risk.class, super::RiskClass::R2);
     }
 }
