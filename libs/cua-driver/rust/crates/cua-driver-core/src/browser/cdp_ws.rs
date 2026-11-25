@@ -25,6 +25,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
@@ -32,6 +33,17 @@ type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(20);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Align CDP WebSocket frame and message limits with Puppeteer (256 MiB) so
+/// large DOM snapshots, screenshots, and traces do not hit tungstenite's
+/// default 16 MiB frame / 64 MiB message caps.
+pub(crate) const CDP_WEBSOCKET_MAX_BYTES: usize = 256 << 20;
+
+pub(crate) fn cdp_websocket_config() -> WebSocketConfig {
+    let mut cfg = WebSocketConfig::default();
+    cfg.max_frame_size = Some(CDP_WEBSOCKET_MAX_BYTES);
+    cfg.max_message_size = Some(CDP_WEBSOCKET_MAX_BYTES);
+    cfg
+}
 /// Upper bound for a first existing-profile dial, whose handshake the browser
 /// holds until its remote-debugging prompt is answered. Longer than the
 /// person-consent bound of `browser_prepare`, which cancels the dial first.
@@ -392,11 +404,30 @@ async fn read_loop(mut read: SplitStream<WsStream>, demux: Arc<Demux>) {
     loop {
         let frame = match read.next().await {
             Some(Ok(frame)) => frame,
-            Some(Err(_)) | None => break,
+            Some(Err(err)) => {
+                tracing::warn!(error = %err, "upstream CDP websocket read failed");
+                break;
+            }
+            None => {
+                tracing::warn!("upstream CDP websocket stream ended (EOF)");
+                break;
+            }
         };
         let text = match frame {
             Message::Text(t) => t,
-            Message::Close(_) => break,
+            Message::Close(frame) => {
+                match frame {
+                    Some(close) => tracing::warn!(
+                        code = %close.code,
+                        reason = %close.reason,
+                        "upstream CDP websocket closed by peer"
+                    ),
+                    None => tracing::warn!(
+                        "upstream CDP websocket closed by peer without close frame"
+                    ),
+                }
+                break;
+            }
             _ => continue,
         };
         let v: Value = match serde_json::from_str(&text) {
@@ -521,9 +552,16 @@ impl CdpConnection {
 
     async fn connect_within(ws_url: &str, timeout: Duration) -> anyhow::Result<Self> {
         validate_loopback_ws_url(ws_url).map_err(|e| anyhow::anyhow!(e))?;
-        let (ws, _resp) = tokio::time::timeout(timeout, tokio_tungstenite::connect_async(ws_url))
-            .await
-            .map_err(|_| anyhow::anyhow!("CDP connect to {ws_url} timed out"))??;
+        let (ws, _resp) = tokio::time::timeout(
+            timeout,
+            tokio_tungstenite::connect_async_with_config(
+                ws_url,
+                Some(cdp_websocket_config()),
+                false,
+            ),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("CDP connect to {ws_url} timed out"))??;
         let (write, read) = ws.split();
         let (close_tx, _close_rx) = watch::channel(false);
         let demux = Arc::new(Demux {
@@ -2228,5 +2266,39 @@ mod tests {
             .iter()
             .any(|(m, p)| m == "Target.setDiscoverTargets" && p["discover"] == false));
         assert_eq!(server.accepted_connections(), 1, "still only one upstream handshake");
+    }
+
+    #[test]
+    fn cdp_websocket_config_matches_puppeteer_256mib_limit() {
+        let cfg = cdp_websocket_config();
+        assert_eq!(cfg.max_frame_size, Some(256 << 20));
+        assert_eq!(cfg.max_message_size, Some(256 << 20));
+    }
+
+    #[tokio::test]
+    async fn large_payload_above_default_16mib_frame_limit_succeeds() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async_with_config(
+                stream,
+                Some(cdp_websocket_config()),
+            )
+            .await
+            .unwrap();
+            if let Some(Ok(Message::Text(text))) = ws.next().await {
+                let v: Value = serde_json::from_str(&text).unwrap();
+                let big = "x".repeat(17 << 20);
+                let reply = json!({ "id": v["id"], "result": { "blob": big } });
+                ws.send(Message::Text(reply.to_string())).await.unwrap();
+            }
+        });
+
+        let conn = CdpConnection::connect(&format!("ws://127.0.0.1:{port}/devtools/browser/big"))
+            .await
+            .unwrap();
+        let res = conn.call(None, "Runtime.evaluate", json!({})).await.unwrap();
+        assert_eq!(res["blob"].as_str().unwrap().len(), 17 << 20);
     }
 }

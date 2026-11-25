@@ -32,7 +32,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, 
 use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::Message;
 
-use super::cdp_ws::{CdpConnection, CdpMethodPolicy, CdpPool};
+use super::cdp_ws::{cdp_websocket_config, CdpConnection, CdpMethodPolicy, CdpPool};
 
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const PATH_PREFIX: &str = "/devtools/browser/";
@@ -358,6 +358,12 @@ async fn run_accept_loop(mut cfg: AcceptLoopConfig) {
         tokio::select! {
             changed = cfg.shutdown_rx.changed() => {
                 if changed.is_err() || *cfg.shutdown_rx.borrow() {
+                    tracing::debug!(
+                        proxy_id = cfg.id,
+                        pid = cfg.key.pid,
+                        session = %cfg.key.session,
+                        "CDP proxy accept loop stopping on shutdown signal"
+                    );
                     break;
                 }
             }
@@ -368,6 +374,13 @@ async fn run_accept_loop(mut cfg: AcceptLoopConfig) {
                 }
             } => {
                 if closed.is_err() || cfg.upstream_close_rx.as_ref().is_some_and(|rx| *rx.borrow()) {
+                    tracing::warn!(
+                        proxy_id = cfg.id,
+                        pid = cfg.key.pid,
+                        session = %cfg.key.session,
+                        watch_dropped = closed.is_err(),
+                        "CDP proxy accept loop exiting because upstream browser socket closed"
+                    );
                     let _ = cfg.shutdown_tx.send(true);
                     break;
                 }
@@ -378,10 +391,24 @@ async fn run_accept_loop(mut cfg: AcceptLoopConfig) {
                 }
             }
             accepted = cfg.listener.accept() => {
-                let Ok((stream, peer_addr)) = accepted else {
-                    break;
+                let (stream, peer_addr) = match accepted {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        tracing::warn!(
+                            proxy_id = cfg.id,
+                            pid = cfg.key.pid,
+                            error = %err,
+                            "CDP proxy listener accept failed; stopping proxy"
+                        );
+                        break;
+                    }
                 };
                 if !peer_addr.ip().is_loopback() {
+                    tracing::warn!(
+                        proxy_id = cfg.id,
+                        peer = %peer_addr,
+                        "CDP proxy rejected non-loopback TCP connection"
+                    );
                     continue;
                 }
                 let expected_path = cfg.expected_path.clone();
@@ -430,23 +457,38 @@ async fn handle_proxy_client(
         return;
     }
 
-    let ws_stream = match tokio_tungstenite::accept_hdr_async(
+    let ws_stream = match tokio_tungstenite::accept_hdr_async_with_config(
         stream,
-        |req: &Request, response: Response| validate_upgrade_request(req, response, &expected_path, expected_port),
+        |req: &Request, response: Response| {
+            validate_upgrade_request(req, response, &expected_path, expected_port)
+        },
+        Some(cdp_websocket_config()),
     )
     .await
     {
         Ok(ws) => ws,
-        Err(_) => return,
+        Err(err) => {
+            tracing::debug!(peer = %peer_addr, error = %err, "CDP proxy downstream websocket handshake rejected or failed");
+            return;
+        }
     };
 
-    let Ok(conn) = upstream.acquire().await else {
-        return;
+    let conn = match upstream.acquire().await {
+        Ok(conn) => conn,
+        Err(err) => {
+            tracing::warn!(peer = %peer_addr, error = %err, "CDP proxy failed to acquire upstream connection");
+            return;
+        }
     };
-    let Ok((client_id, mut from_upstream_rx)) = conn.register_proxy_client() else {
-        return;
+    let (client_id, mut from_upstream_rx) = match conn.register_proxy_client() {
+        Ok(reg) => reg,
+        Err(err) => {
+            tracing::warn!(peer = %peer_addr, error = %err, "CDP proxy failed to register downstream client");
+            return;
+        }
     };
 
+    tracing::debug!(client_id, peer = %peer_addr, "CDP proxy downstream client connected");
     active_clients.fetch_add(1, Ordering::Relaxed);
     touch_owners(&owner_sessions, on_activity.as_ref());
 
@@ -457,22 +499,34 @@ async fn handle_proxy_client(
         tokio::select! {
             changed = shutdown_rx.changed() => {
                 if changed.is_err() || *shutdown_rx.borrow() {
+                    tracing::debug!(
+                        client_id,
+                        watch_dropped = changed.is_err(),
+                        "CDP proxy closing downstream client on proxy shutdown"
+                    );
                     let _ = ws_write.send(Message::Close(None)).await;
                     break;
                 }
             }
             closed = upstream_close_rx.changed() => {
                 if closed.is_err() || *upstream_close_rx.borrow() {
+                    tracing::warn!(
+                        client_id,
+                        watch_dropped = closed.is_err(),
+                        "CDP proxy closing downstream client because upstream socket closed"
+                    );
                     let _ = ws_write.send(Message::Close(None)).await;
                     break;
                 }
             }
             frame = from_upstream_rx.recv() => {
                 let Some(text) = frame else {
+                    tracing::warn!(client_id, "CDP proxy closing downstream client because upstream demux channel closed");
                     let _ = ws_write.send(Message::Close(None)).await;
                     break;
                 };
-                if ws_write.send(Message::Text(text)).await.is_err() {
+                if let Err(err) = ws_write.send(Message::Text(text)).await {
+                    tracing::warn!(client_id, error = %err, "CDP proxy failed sending frame to downstream client");
                     break;
                 }
             }
@@ -487,17 +541,44 @@ async fn handle_proxy_client(
                         ).await;
                         touch_owners(&owner_sessions, on_activity.as_ref());
                         if !keep_going {
+                            tracing::warn!(client_id, "CDP proxy closing downstream client after forwarding failure");
                             break;
                         }
                     }
                     Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
-                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
-                    Some(Ok(Message::Binary(_))) | Some(Ok(Message::Frame(_))) => break,
+                    Some(Ok(Message::Close(frame))) => {
+                        match frame {
+                            Some(close) => tracing::debug!(
+                                client_id,
+                                code = %close.code,
+                                reason = %close.reason,
+                                "CDP proxy downstream client closed websocket"
+                            ),
+                            None => tracing::debug!(
+                                client_id,
+                                "CDP proxy downstream client closed websocket without close frame"
+                            ),
+                        }
+                        break;
+                    }
+                    Some(Err(err)) => {
+                        tracing::warn!(client_id, error = %err, "CDP proxy downstream websocket read failed");
+                        break;
+                    }
+                    None => {
+                        tracing::debug!(client_id, "CDP proxy downstream websocket stream ended (EOF)");
+                        break;
+                    }
+                    Some(Ok(Message::Binary(_))) | Some(Ok(Message::Frame(_))) => {
+                        tracing::warn!(client_id, "CDP proxy closing downstream client after non-text frame");
+                        break;
+                    }
                 }
             }
         }
     }
 
+    tracing::debug!(client_id, "CDP proxy downstream client disconnected; unregistering");
     active_clients.fetch_sub(1, Ordering::Relaxed);
     conn.unregister_proxy_client(client_id).await;
     touch_owners(&owner_sessions, on_activity.as_ref());
@@ -828,5 +909,56 @@ mod tests {
             serde_json::from_str(&ws2.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
         assert_eq!(rep2["id"], 2);
         assert_eq!(server.accepted_connections(), 1);
+    }
+
+    #[tokio::test]
+    async fn proxy_forwards_large_frames_above_default_16mib_limit() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async_with_config(
+                stream,
+                Some(cdp_websocket_config()),
+            )
+            .await
+            .unwrap();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let v: Value = serde_json::from_str(&text).unwrap();
+                let big = "y".repeat(17 << 20);
+                let reply = json!({ "id": v["id"], "result": { "payload": big } });
+                if ws.send(Message::Text(reply.to_string())).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let upstream_url = format!("ws://127.0.0.1:{port}/devtools/browser/large");
+        let conn = Arc::new(CdpConnection::connect(&upstream_url).await.unwrap());
+        let mgr = CdpProxyManager::new();
+        let ws_endpoint = mgr
+            .ensure_existing_profile_proxy("s-big", vec!["s-big".to_owned()], 404, conn, None)
+            .await
+            .unwrap();
+
+        let (mut downstream, _) = tokio_tungstenite::connect_async_with_config(
+            &ws_endpoint,
+            Some(cdp_websocket_config()),
+            false,
+        )
+        .await
+        .unwrap();
+        downstream
+            .send(Message::Text(
+                json!({ "id": 1, "method": "Runtime.evaluate" }).to_string(),
+            ))
+            .await
+            .unwrap();
+        let reply: Value = serde_json::from_str(
+            &downstream.next().await.unwrap().unwrap().into_text().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reply["id"], 1);
+        assert_eq!(reply["result"]["payload"].as_str().unwrap().len(), 17 << 20);
     }
 }
