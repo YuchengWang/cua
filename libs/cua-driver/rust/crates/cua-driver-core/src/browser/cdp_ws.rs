@@ -532,6 +532,7 @@ async fn read_loop(mut read: SplitStream<WsStream>, demux: Arc<Demux>) {
 pub struct CdpConnection {
     writer: Mutex<SplitSink<WsStream, Message>>,
     proxy_control: Mutex<()>,
+    close_target_guard: Mutex<()>,
     demux: Arc<Demux>,
     next_id: AtomicU64,
     existing_profile_policy: AtomicBool,
@@ -579,6 +580,7 @@ impl CdpConnection {
         Ok(Self {
             writer: Mutex::new(write),
             proxy_control: Mutex::new(()),
+            close_target_guard: Mutex::new(()),
             demux,
             next_id: AtomicU64::new(1),
             existing_profile_policy: AtomicBool::new(false),
@@ -650,6 +652,15 @@ impl CdpConnection {
                 "{method} is blocked on existing-profile CDP proxy; disconnect instead"
             ));
         }
+        let _close_guard = if self.method_policy() == CdpMethodPolicy::ExistingProfile
+            && method == "Target.closeTarget"
+        {
+            let guard = self.close_target_guard.lock().await;
+            self.guard_existing_profile_close_target().await?;
+            Some(guard)
+        } else {
+            None
+        };
         let request_session_id = obj
             .get("sessionId")
             .and_then(Value::as_str)
@@ -715,6 +726,34 @@ impl CdpConnection {
         if let Err(e) = sent {
             self.demux.proxy.lock().unwrap().pending.remove(&upstream_id);
             return Err(format!("CDP send failed during {method}: {e}"));
+        }
+        Ok(())
+    }
+
+    async fn guard_existing_profile_close_target(&self) -> Result<(), String> {
+        let targets = self
+            .call(None, "Target.getTargets", serde_json::json!({}))
+            .await
+            .map_err(|err| {
+                format!(
+                    "Refusing Target.closeTarget on existing-profile CDP proxy: failed to inspect open targets ({err})"
+                )
+            })?;
+        let target_infos = targets
+            .get("targetInfos")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                "Refusing Target.closeTarget on existing-profile CDP proxy: Target.getTargets missing targetInfos"
+                    .to_owned()
+            })?;
+        let page_count = target_infos
+            .iter()
+            .filter(|info| info.get("type").and_then(Value::as_str) == Some("page"))
+            .count();
+        if page_count <= 1 {
+            return Err(
+                "Refusing to close the last page tab of an existing_profile browser".to_owned(),
+            );
         }
         Ok(())
     }

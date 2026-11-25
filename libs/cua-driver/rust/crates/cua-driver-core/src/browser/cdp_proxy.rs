@@ -16,7 +16,8 @@
 //!   headers (prevents DNS rebinding).
 //! - Never reveals upstream Chrome WebSocket URLs or user profile directories.
 //! - Blocks `Browser.close`, `Browser.crash`, and `Browser.crashGpuProcess` on
-//!   `ExistingProfile` sockets.
+//!   `ExistingProfile` sockets, and refuses `Target.closeTarget` when <= 1
+//!   `"type": "page"` target remains.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -960,5 +961,208 @@ mod tests {
         .unwrap();
         assert_eq!(reply["id"], 1);
         assert_eq!(reply["result"]["payload"].as_str().unwrap().len(), 17 << 20);
+    }
+
+    #[tokio::test]
+    async fn existing_profile_proxy_refuses_closing_last_page_target_and_keeps_connection_alive() {
+        let seen_methods = StdArc::new(StdMutex::new(Vec::<String>::new()));
+        let rec = seen_methods.clone();
+        let server = MockCdpServer::start(StdArc::new(move |call| {
+            rec.lock().unwrap().push(call.method.clone());
+            match call.method.as_str() {
+                "Target.getTargets" => MockReply::ok(json!({
+                    "targetInfos": [
+                        { "targetId": "page-1", "type": "page", "url": "https://example.com" },
+                        { "targetId": "sw-1", "type": "service_worker", "url": "chrome-extension://abc/sw.js" }
+                    ]
+                })),
+                "Browser.getVersion" => MockReply::ok(json!({ "product": "Chrome/135.0" })),
+                _ => MockReply::ok(json!({})),
+            }
+        }))
+        .await;
+
+        let conn = Arc::new(CdpConnection::connect(&server.ws_url()).await.unwrap());
+        conn.restrict_to_existing_profile();
+        let mgr = CdpProxyManager::new();
+        let ws_endpoint = mgr
+            .ensure_existing_profile_proxy("s-last", vec!["s-last".to_owned()], 505, conn, None)
+            .await
+            .unwrap();
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(&ws_endpoint).await.unwrap();
+        ws.send(Message::Text(
+            json!({
+                "id": 7,
+                "method": "Target.closeTarget",
+                "params": { "targetId": "page-1" }
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+
+        let reply: Value =
+            serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+        assert_eq!(reply["id"], 7);
+        assert_eq!(reply["error"]["code"], -32000);
+        assert!(reply["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Refusing to close the last page tab"));
+
+        // Proxy and downstream socket stay healthy after refusal.
+        ws.send(Message::Text(
+            json!({ "id": 8, "method": "Browser.getVersion" }).to_string(),
+        ))
+        .await
+        .unwrap();
+        let ver_reply: Value =
+            serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+        assert_eq!(ver_reply["id"], 8);
+        assert_eq!(ver_reply["result"]["product"], "Chrome/135.0");
+
+        let methods = seen_methods.lock().unwrap();
+        assert!(methods.iter().any(|m| m == "Target.getTargets"));
+        assert!(!methods.iter().any(|m| m == "Target.closeTarget"));
+    }
+
+    #[tokio::test]
+    async fn existing_profile_proxy_allows_closing_extra_page_then_guards_last_page() {
+        let open_pages = StdArc::new(StdMutex::new(vec![
+            "page-1".to_owned(),
+            "page-2".to_owned(),
+        ]));
+        let pages_for_server = open_pages.clone();
+        let server = MockCdpServer::start(StdArc::new(move |call| match call.method.as_str() {
+            "Target.getTargets" => {
+                let infos: Vec<Value> = pages_for_server
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|id| json!({ "targetId": id, "type": "page" }))
+                    .collect();
+                MockReply::ok(json!({ "targetInfos": infos }))
+            }
+            "Target.closeTarget" => {
+                let target_id = call.params.get("targetId").and_then(Value::as_str);
+                let mut pages = pages_for_server.lock().unwrap();
+                let existed = target_id.is_some_and(|tid| {
+                    let before = pages.len();
+                    pages.retain(|id| id != tid);
+                    pages.len() < before
+                });
+                MockReply::ok(json!({ "success": existed }))
+            }
+            _ => MockReply::ok(json!({})),
+        }))
+        .await;
+
+        let conn = Arc::new(CdpConnection::connect(&server.ws_url()).await.unwrap());
+        conn.restrict_to_existing_profile();
+        let mgr = CdpProxyManager::new();
+        let ws_endpoint = mgr
+            .ensure_existing_profile_proxy("s-multi", vec!["s-multi".to_owned()], 606, conn, None)
+            .await
+            .unwrap();
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(&ws_endpoint).await.unwrap();
+
+        // Closing page-1 while 2 pages are open succeeds.
+        ws.send(Message::Text(
+            json!({
+                "id": 1,
+                "method": "Target.closeTarget",
+                "params": { "targetId": "page-1" }
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+        let rep1: Value =
+            serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+        assert_eq!(rep1["id"], 1);
+        assert_eq!(rep1["result"]["success"], true);
+        assert_eq!(*open_pages.lock().unwrap(), vec!["page-2"]);
+
+        // Attempting to close the sole remaining page-2 is refused with -32000.
+        ws.send(Message::Text(
+            json!({
+                "id": 2,
+                "method": "Target.closeTarget",
+                "params": { "targetId": "page-2" }
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+        let rep2: Value =
+            serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+        assert_eq!(rep2["id"], 2);
+        assert_eq!(rep2["error"]["code"], -32000);
+        assert_eq!(*open_pages.lock().unwrap(), vec!["page-2"]);
+    }
+
+    #[tokio::test]
+    async fn existing_profile_proxy_refuses_close_target_when_zero_pages_remain_and_isolated_allows_it() {
+        let server = MockCdpServer::start(StdArc::new(|call| match call.method.as_str() {
+            "Target.getTargets" => MockReply::ok(json!({
+                "targetInfos": [
+                    { "targetId": "sw-1", "type": "service_worker" }
+                ]
+            })),
+            "Target.closeTarget" => MockReply::ok(json!({ "success": true })),
+            _ => MockReply::ok(json!({})),
+        }))
+        .await;
+
+        let mgr = CdpProxyManager::new();
+
+        // ExistingProfile with 0 page targets refuses.
+        let conn = Arc::new(CdpConnection::connect(&server.ws_url()).await.unwrap());
+        conn.restrict_to_existing_profile();
+        let existing_ep = mgr
+            .ensure_existing_profile_proxy("s-zero", vec!["s-zero".to_owned()], 707, conn, None)
+            .await
+            .unwrap();
+        let (mut ws_existing, _) = tokio_tungstenite::connect_async(&existing_ep).await.unwrap();
+        ws_existing
+            .send(Message::Text(
+                json!({ "id": 1, "method": "Target.closeTarget", "params": { "targetId": "p1" } })
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+        let rep: Value = serde_json::from_str(
+            &ws_existing.next().await.unwrap().unwrap().into_text().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rep["error"]["code"], -32000);
+
+        // Isolated proxy (Unrestricted) forwards Target.closeTarget even with <= 1 page.
+        let iso_ep = mgr
+            .ensure_isolated_proxy(
+                "s-iso-close",
+                vec!["s-iso-close".to_owned()],
+                708,
+                CdpPool::new(),
+                server.ws_url(),
+                None,
+            )
+            .await
+            .unwrap();
+        let (mut ws_iso, _) = tokio_tungstenite::connect_async(&iso_ep).await.unwrap();
+        ws_iso
+            .send(Message::Text(
+                json!({ "id": 2, "method": "Target.closeTarget", "params": { "targetId": "p1" } })
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+        let iso_rep: Value =
+            serde_json::from_str(&ws_iso.next().await.unwrap().unwrap().into_text().unwrap())
+                .unwrap();
+        assert_eq!(iso_rep["id"], 2);
+        assert_eq!(iso_rep["result"]["success"], true);
     }
 }
