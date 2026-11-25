@@ -42,11 +42,12 @@ pub fn parse_devtools_active_port(text: &str) -> Option<(u16, &str)> {
 /// discovered URL that points anywhere else can never match the attested
 /// listener port.
 pub fn loopback_websocket_port(url: &str) -> Option<u16> {
+    super::cdp_ws::validate_loopback_ws_url(url).ok()?;
     ["ws://127.0.0.1:", "ws://localhost:", "ws://[::1]:"]
         .iter()
         .find_map(|prefix| {
             url.strip_prefix(prefix)?
-                .split('/')
+                .split(['/', '?', '#'])
                 .next()?
                 .parse::<u16>()
                 .ok()

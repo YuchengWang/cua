@@ -26,7 +26,8 @@ use super::impl_::{
     spawn_blocking_bounded, spawn_isolated_hyprland, synthetic_pointer_is_dropped,
     unavailable_chromium_background, unavailable_wayland_focused_input_background,
     window_local_to_screen, window_scope_unproven_refusal, with_pixel_points,
-    x11_pixel_click_no_focus_steal, AimedPoint, CoordinateContext, PointerRoute, ToolState,
+    x11_pixel_click_no_focus_steal_with_policy, AimedPoint, CoordinateContext, PointerRoute,
+    ToolState,
 };
 
 #[cfg(test)]
@@ -537,6 +538,7 @@ impl ClickTool {
         button: u8,
         count: usize,
         modifiers: &[String],
+        preserve_host: bool,
     ) -> ToolResult {
         let observed_for_state = observed.clone();
         let decided = tokio::task::spawn_blocking(move || {
@@ -615,26 +617,40 @@ impl ClickTool {
                 reveal_pointer_action_target_for(&self.state, cursor_id, sx, sy, true, target_rect)
                     .await;
                 let modifier_owned = modifiers.to_vec();
+                let effective_preserve =
+                    preserve_host || crate::x11::window_is_override_redirect(xid);
                 let result = spawn_blocking_bounded(
                     "foreground element click",
                     foreground_budget(0),
                     move || {
                         let modifier_refs: Vec<&str> =
                             modifier_owned.iter().map(String::as_str).collect();
-                        crate::interaction::with_x11_foreground(
-                            xid,
-                            crate::input::ForegroundOptions::pointer(),
-                            crate::interaction::session_policy().click,
-                            || {
-                                crate::input::send_click_xtest_desktop_with_modifiers(
-                                    sx.round() as i32,
-                                    sy.round() as i32,
-                                    button,
-                                    count,
-                                    &modifier_refs,
-                                )
-                            },
-                        )
+                        if effective_preserve {
+                            crate::input::send_click_xtest_desktop_with_modifiers(
+                                sx.round() as i32,
+                                sy.round() as i32,
+                                button,
+                                count,
+                                &modifier_refs,
+                            )
+                            .map(|()| None)
+                        } else {
+                            crate::interaction::with_x11_foreground(
+                                xid,
+                                crate::input::ForegroundOptions::pointer(),
+                                crate::interaction::session_policy().click,
+                                || {
+                                    crate::input::send_click_xtest_desktop_with_modifiers(
+                                        sx.round() as i32,
+                                        sy.round() as i32,
+                                        button,
+                                        count,
+                                        &modifier_refs,
+                                    )
+                                },
+                            )
+                            .map(|((), report)| Some(report))
+                        }
                     },
                 )
                 .await;
@@ -642,7 +658,29 @@ impl ClickTool {
                     .map(|w| (sx.round() as i32 - w.x, sy.round() as i32 - w.y))
                     .unwrap_or((sx.round() as i32, sy.round() as i32));
                 match result {
-                    Ok(Ok(((), report))) => {
+                    Ok(Ok(None)) => {
+                        let result = ToolResult::text(format!(
+                            "Clicked element [{idx}] (pid {pid}) with preserve_host XTest \
+                             (delivery_mode=foreground, no window activation){}.",
+                            redirect_note
+                                .as_deref()
+                                .map(|n| format!(" ({n})"))
+                                .unwrap_or_default(),
+                        ))
+                        .with_structured(json!({
+                            "path": "x11_xtest_preserve_host",
+                            "focus_policy": "preserve_host",
+                            "delivery_mode": "foreground",
+                            "verified": false,
+                            "effect": "unverifiable",
+                        }));
+                        with_pixel_points(
+                            result,
+                            Some((sx.round() as i32, sy.round() as i32)),
+                            window_point,
+                        )
+                    }
+                    Ok(Ok(Some(report))) => {
                         let confirmed = report.window_change_confirms();
                         let result = ToolResult::text(format!(
                             "Clicked element [{idx}] (pid {pid}) with a real pointer click \
@@ -713,21 +751,46 @@ impl ClickTool {
                     cursor_overlay::OverlayCommand::PinAbove(xid),
                 );
                 let observed_for_ax = observed.clone();
+                let effective_preserve =
+                    preserve_host || crate::x11::window_is_override_redirect(xid);
                 let result = spawn_blocking_bounded(
                     "foreground element action",
                     foreground_budget(0),
                     move || {
-                        crate::interaction::with_x11_foreground(
-                            xid,
-                            crate::input::ForegroundOptions::pointer(),
-                            crate::interaction::session_policy().click,
-                            || crate::atspi::perform_action_observed(&observed_for_ax),
-                        )
+                        if effective_preserve {
+                            crate::atspi::perform_action_observed(&observed_for_ax)
+                                .map(|res| (res, None))
+                        } else {
+                            crate::interaction::with_x11_foreground(
+                                xid,
+                                crate::input::ForegroundOptions::pointer(),
+                                crate::interaction::session_policy().click,
+                                || crate::atspi::perform_action_observed(&observed_for_ax),
+                            )
+                            .map(|(res, report)| (res, Some(report)))
+                        }
                     },
                 )
                 .await;
                 match result {
-                    Ok(Ok(((action, suspected_noop, unacknowledged), report))) => {
+                    Ok(Ok(((action, suspected_noop, unacknowledged), None))) => {
+                        ToolResult::text(format!(
+                            "Clicked element [{idx}] (pid {pid}) through its AT-SPI action \
+                             \"{action}\" with preserve_host (delivery_mode=foreground, \
+                             path=ax_preserve_host, no window activation)."
+                        ))
+                        .with_structured(json!({
+                            "path": "ax_preserve_host",
+                            "focus_policy": "preserve_host",
+                            "ax_action": action,
+                            "bounds_reason": reason,
+                            "delivery_mode": "foreground",
+                            "verified": false,
+                            "effect": if suspected_noop { "suspected_noop" } else { "unverifiable" },
+                            "unacknowledged": unacknowledged,
+                        }))
+                    }
+                    Ok(Ok(((action, suspected_noop, unacknowledged), Some(report)))) => {
                         let mut extra = serde_json::Map::new();
                         extra.insert("ax_action".into(), json!(action));
                         extra.insert("bounds_reason".into(), json!(reason));
@@ -993,7 +1056,8 @@ impl Tool for ClickTool {
                     "from_zoom":{"type":"boolean","description":"Set true after a zoom call to auto-translate zoom-image pixel coordinates back to full-window space."},
                     "scope":{"type":"string","enum":["window","desktop"],"default":"window","description":"Coordinate frame (default \"window\"). Pass \"desktop\" with x,y and no pid/window_id for a screen-absolute click in get_desktop_state coordinates."},
                     "coordinate_frame": coordinate_frame_schema(),
-                    "delivery_mode": crate::input::delivery::delivery_mode_schema()
+                    "delivery_mode": crate::input::delivery::delivery_mode_schema(),
+                    "focus_policy": cua_driver_core::tool_schema::focus_policy_schema()
                 },"additionalProperties":false
             }),
             read_only: false, destructive: true, idempotent: false, open_world: true,
@@ -1010,6 +1074,13 @@ impl Tool for ClickTool {
         }
         let cursor_id = resolve_cursor_key(&args);
         let modifiers: Vec<String> = args.str_array("modifier");
+        let focus_policy = match cua_driver_core::delivery::FocusPolicy::from_args(&args) {
+            Ok(fp) => fp,
+            Err(msg) => {
+                return ToolResult::error(msg)
+                    .with_structured(json!({ "code": "invalid_arguments" }));
+            }
+        };
 
         // ── Window-less screen-absolute branch (desktop target) ───────────────
         // x,y with NO pid and NO window_id → TRUE SCREEN pixels. Foreground,
@@ -1259,6 +1330,8 @@ impl Tool for ClickTool {
                 Ok(placement) => placement,
                 Err(refusal) => return refusal,
             };
+            let preserve_host = focus_policy.is_preserve_host()
+                || xid_hint.is_some_and(crate::x11::window_is_override_redirect);
             // X11 foreground element click: behave like a user — activate the
             // window and XTest-click the element's screen centre. No AT-SPI
             // action, no second tree walk. Element bounds come from the
@@ -1270,7 +1343,7 @@ impl Tool for ClickTool {
                 return self
                     .foreground_element_click(
                         &cursor_id, pid, idx, &observed, xid_hint, placement, button, count,
-                        &modifiers,
+                        &modifiers, preserve_host,
                     )
                     .await;
             }
@@ -1355,7 +1428,7 @@ impl Tool for ClickTool {
                 )
             {
                 let observed_for_ax = observed.clone();
-                let guard_pid = (!delivery.is_foreground()).then_some(pid);
+                let guard_pid = (!delivery.is_foreground() && !preserve_host).then_some(pid);
                 let ax_result = match tokio::time::timeout(
                     ELEMENT_AX_BUDGET,
                     tokio::task::spawn_blocking(move || {
@@ -1541,34 +1614,48 @@ impl Tool for ClickTool {
                     // selectable rows) expose bounds but no AT-SPI Action and
                     // ignore a targeted XSendEvent; limiting XTest to modified
                     // clicks made those rows addressable but not selectable.
+                    let effective_preserve =
+                        preserve_host || crate::x11::window_is_override_redirect(xid2);
                     if delivery.is_foreground() && !crate::wayland::is_wayland() {
                         let (_, sx, sy) = placement
                             .ok_or_else(|| anyhow::anyhow!("element screen bounds unavailable"))?;
-                        crate::interaction::with_x11_foreground(
-                            xid2,
-                            crate::input::ForegroundOptions::pointer(),
-                            crate::interaction::session_policy().click,
-                            || {
-                                crate::input::send_click_xtest_desktop_with_modifiers(
-                                    sx.round() as i32,
-                                    sy.round() as i32,
-                                    button,
-                                    count,
-                                    &modifier_refs,
-                                )
-                            },
-                        )
-                        .map(|((), report)| PointerRoute::Foreground {
-                            menu_open: report.menu_open,
-                        })
+                        if effective_preserve {
+                            crate::input::send_click_xtest_desktop_with_modifiers(
+                                sx.round() as i32,
+                                sy.round() as i32,
+                                button,
+                                count,
+                                &modifier_refs,
+                            )
+                            .map(|()| PointerRoute::Foreground { menu_open: None })
+                        } else {
+                            crate::interaction::with_x11_foreground(
+                                xid2,
+                                crate::input::ForegroundOptions::pointer(),
+                                crate::interaction::session_policy().click,
+                                || {
+                                    crate::input::send_click_xtest_desktop_with_modifiers(
+                                        sx.round() as i32,
+                                        sy.round() as i32,
+                                        button,
+                                        count,
+                                        &modifier_refs,
+                                    )
+                                },
+                            )
+                            .map(|((), report)| PointerRoute::Foreground {
+                                menu_open: report.menu_open,
+                            })
+                        }
                     } else if modifier_refs.is_empty() && !crate::wayland::is_wayland() {
-                        x11_pixel_click_no_focus_steal(
+                        x11_pixel_click_no_focus_steal_with_policy(
                             &cursor_id_for_fallback,
                             xid2,
                             lx as i32,
                             ly as i32,
                             button,
                             count,
+                            effective_preserve,
                         )
                     } else {
                         crate::input::send_click_with_modifiers(
@@ -1594,12 +1681,16 @@ impl Tool for ClickTool {
                 // around the element, focus untouched); the other routes stay
                 // unverifiable and the caller confirms via screenshot.
                 Ok(Ok(route)) => {
+                    let mut structured = route.structured(mode_label);
+                    if preserve_host || placement.is_some_and(|(x, _, _)| crate::x11::window_is_override_redirect(x)) {
+                        structured["focus_policy"] = json!("preserve_host");
+                    }
                     attach_focused_cell(
                         ToolResult::text(format!(
                             "Clicked element [{idx}] (pid {pid}) with a real pointer click {}",
                             route.text_suffix(mode_label)
                         ))
-                        .with_structured(route.structured(mode_label)),
+                        .with_structured(structured),
                         pid,
                     )
                     .await
@@ -1613,7 +1704,10 @@ impl Tool for ClickTool {
         // action of the control under a plain left click still lands: that
         // route tries it first and refuses only on a miss.
         let plain_left = button == 1 && count == 1 && modifiers.is_empty();
-        let chromium_atspi_only = match (!isolated_background)
+        let coord_xid_opt = args.opt_u64("window_id");
+        let preserve_host_coord = focus_policy.is_preserve_host()
+            || coord_xid_opt.is_some_and(crate::x11::window_is_override_redirect);
+        let chromium_atspi_only = match (!isolated_background && !preserve_host_coord)
             .then(|| unavailable_chromium_background(pid, delivery))
             .flatten()
         {
@@ -1865,6 +1959,10 @@ impl Tool for ClickTool {
                 // Native Wayland: focus+raise the target toplevel
                 // (foreign-toplevel `activate`), then drive `count` virtual-pointer
                 // button events. Wayland injection routes to the compositor focus.
+                if preserve_host_coord {
+                    crate::wayland::click_focused(aimed, count as u32, button)?;
+                    return Ok(("wayland_preserve_host", None, None, None));
+                }
                 crate::interaction::with_target_foreground(pid, xid, crate::interaction::session_policy().click, || {
                     crate::wayland::click_focused(aimed, count as u32, button)
                 })?;
@@ -1888,7 +1986,7 @@ impl Tool for ClickTool {
                     // following type, so leave it to the refusal.
                     let real_click_for_focus_roles =
                         chromium_atspi_only || crate::input::real_pointer_input_available();
-                    let (hit, guard) = crate::input::focus_guard::guarded(Some(pid), || {
+                    let run_atspi = || {
                         Ok(match crate::atspi::perform_action_at_point_in(
                             pid,
                             xid,
@@ -1903,7 +2001,12 @@ impl Tool for ClickTool {
                             }
                             Err(_) => Ok(None),
                         })
-                    })?;
+                    };
+                    let (hit, guard) = if preserve_host_coord {
+                        (run_atspi()?, None)
+                    } else {
+                        crate::input::focus_guard::guarded(Some(pid), run_atspi)?
+                    };
                     if let Some(hit) = hit? {
                         return Ok(("x11_atspi", Some(PointerRoute::Atspi(hit)), guard));
                     }
@@ -1912,6 +2015,26 @@ impl Tool for ClickTool {
                     return Ok(("background_unavailable_chromium", None, None));
                 }
                 if !fg
+                    && preserve_host_coord
+                    && (!crate::input::real_pointer_input_available()
+                        || unavailable_chromium_background(pid, delivery).is_some()
+                        || synthetic_pointer_is_dropped(pid))
+                {
+                    if let Ok((sx, sy)) = window_local_to_screen(xid, xi as f64, yi as f64) {
+                        let modifier_refs: Vec<&str> =
+                            modifiers_for_task.iter().map(String::as_str).collect();
+                        crate::input::send_click_xtest_desktop_with_modifiers(
+                            sx.round() as i32,
+                            sy.round() as i32,
+                            button,
+                            count,
+                            &modifier_refs,
+                        )?;
+                        return Ok(("x11_xtest_preserve_host", None, None));
+                    }
+                }
+                if !fg
+                    && !preserve_host_coord
                     && !crate::input::real_pointer_input_available()
                     && synthetic_pointer_is_dropped(pid)
                 {
@@ -1939,19 +2062,28 @@ impl Tool for ClickTool {
                             count,
                             &modifier_refs,
                         )?;
-                        return Ok(("x11_xtest_fg", None, None));
+                        return Ok((
+                            if preserve_host_coord {
+                                "x11_xtest_preserve_host"
+                            } else {
+                                "x11_xtest_fg"
+                            },
+                            None,
+                            None,
+                        ));
                     }
                 }
                 if modifiers_for_task.is_empty() {
                     // The MPX press train runs under its own (settled) focus
                     // guard inside the helper; its report rides on the route.
-                    let route = x11_pixel_click_no_focus_steal(
+                    let route = x11_pixel_click_no_focus_steal_with_policy(
                         &cursor_id_for_task,
                         xid,
                         xi,
                         yi,
                         button,
                         count,
+                        preserve_host_coord,
                     )?;
                     return Ok((route.path().unwrap_or("x11_pixel"), Some(route), None));
                 } else {
@@ -1968,7 +2100,7 @@ impl Tool for ClickTool {
                 }
                 Ok((if fg { "x11_pixel_fg" } else { "x11_pixel" }, None, None))
             };
-            if delivery.is_foreground() {
+            if delivery.is_foreground() && !preserve_host_coord {
                 crate::interaction::with_x11_foreground(
                     xid,
                     crate::input::ForegroundOptions::pointer(),
@@ -1976,6 +2108,8 @@ impl Tool for ClickTool {
                     || inject(true),
                 )
                 .map(|((path, route, guard), report)| (path, Some(report), route, guard))
+            } else if delivery.is_foreground() {
+                inject(true).map(|(path, route, guard)| (path, None, route, guard))
             } else {
                 inject(false).map(|(path, route, guard)| (path, None, route, guard))
             }
@@ -2055,6 +2189,9 @@ impl Tool for ClickTool {
                         "delivery_mode": mode_label,
                     }),
                 };
+                if preserve_host_coord {
+                    structured["focus_policy"] = json!("preserve_host");
+                }
                 if let Some(report) = &report {
                     apply_foreground_report(&mut structured, report);
                 }
@@ -2140,5 +2277,37 @@ mod click_button_schema_tests {
         assert!(!maps_indicate_gtk(
             "7f00-7f01 r-xp /usr/lib/x86_64-linux-gnu/libgdk_pixbuf-2.0.so"
         ));
+    }
+
+    #[tokio::test]
+    async fn schema_advertises_focus_policy_and_rejects_invalid_value() {
+        let tool = ClickTool {
+            state: super::ToolState::new(),
+        };
+        let props = tool
+            .def()
+            .input_schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("properties");
+        assert!(props.contains_key("focus_policy"));
+
+        let res = tool
+            .invoke(serde_json::json!({
+                "pid": 1,
+                "window_id": 1,
+                "x": 10,
+                "y": 10,
+                "focus_policy": "bad_policy"
+            }))
+            .await;
+        assert_eq!(res.is_error, Some(true));
+        assert_eq!(
+            res.structured_content
+                .as_ref()
+                .and_then(|s| s.get("code"))
+                .and_then(|v| v.as_str()),
+            Some("invalid_arguments")
+        );
     }
 }

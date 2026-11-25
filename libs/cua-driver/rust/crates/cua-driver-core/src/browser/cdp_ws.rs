@@ -102,23 +102,89 @@ impl CdpMethodPolicy {
 }
 
 /// Validate that `url` is a plain-`ws` loopback WebSocket URL.
-/// Anything else — `wss`, remote hosts, hostnames that merely *resolve*
-/// to loopback — is rejected; the endpoint contract is a literal
-/// loopback address handed over by the platform adapter.
+/// Anything else — `wss`, userinfo (`@`), invalid ports, remote hosts, or
+/// non-canonical hostnames that merely *resolve* to loopback — is rejected;
+/// the endpoint contract is a literal loopback address handed over by the
+/// platform adapter.
 pub fn validate_loopback_ws_url(url: &str) -> Result<(), String> {
     let rest = url
         .strip_prefix("ws://")
         .ok_or_else(|| format!("endpoint URL must use the ws:// scheme: {url}"))?;
-    let authority = rest.split('/').next().unwrap_or("");
-    let host = if let Some(bracketed) = authority.strip_prefix('[') {
-        // [::1]:9222 form.
-        bracketed.split(']').next().unwrap_or("")
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if authority.is_empty() {
+        return Err(format!("endpoint URL is missing host: {url}"));
+    }
+    if authority.contains('@') {
+        return Err(format!(
+            "endpoint URL must not contain userinfo ('@'): {url}"
+        ));
+    }
+    if authority.contains('\\') || authority.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(format!(
+            "endpoint URL authority contains invalid characters: {url}"
+        ));
+    }
+    let (host, port_str) = if let Some(after_open) = authority.strip_prefix('[') {
+        let Some((inner, tail)) = after_open.split_once(']') else {
+            return Err(format!("endpoint URL has malformed IPv6 host: {url}"));
+        };
+        if inner != "::1" {
+            return Err(format!("endpoint host {inner:?} is not loopback: {url}"));
+        }
+        if tail.is_empty() {
+            ("[::1]", None)
+        } else if let Some(port_part) = tail.strip_prefix(':') {
+            ("[::1]", Some(port_part))
+        } else {
+            return Err(format!(
+                "endpoint URL authority {authority:?} is invalid: {url}"
+            ));
+        }
     } else {
-        authority.rsplit_once(':').map_or(authority, |(h, _)| h)
+        match authority.split_once(':') {
+            Some((h, port_part)) => (h, Some(port_part)),
+            None => (authority, None),
+        }
     };
-    match host {
-        "127.0.0.1" | "::1" | "localhost" => Ok(()),
+    if !matches!(host, "127.0.0.1" | "localhost" | "[::1]") {
+        return Err(format!("endpoint host {host:?} is not loopback: {url}"));
+    }
+    if let Some(port_part) = port_str {
+        if port_part.is_empty() || !port_part.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(format!("endpoint port {port_part:?} is invalid: {url}"));
+        }
+        let port = port_part
+            .parse::<u16>()
+            .map_err(|_| format!("endpoint port {port_part:?} is invalid: {url}"))?;
+        if port == 0 {
+            return Err(format!("endpoint port 0 is invalid: {url}"));
+        }
+    }
+    let parsed = url::Url::parse(url)
+        .map_err(|err| format!("endpoint URL is malformed ({err}): {url}"))?;
+    if parsed.scheme() != "ws" || !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(format!(
+            "endpoint URL must be plain ws:// without userinfo: {url}"
+        ));
+    }
+    match parsed.host_str() {
+        Some("127.0.0.1" | "localhost" | "[::1]") => Ok(()),
         other => Err(format!("endpoint host {other:?} is not loopback: {url}")),
+    }
+}
+
+/// Return a sanitized loopback endpoint label without exposing raw path/token secrets.
+pub fn redacted_loopback_ws_endpoint(ws_url: &str) -> String {
+    match url::Url::parse(ws_url) {
+        Ok(parsed) => {
+            let host = parsed.host_str().unwrap_or("loopback");
+            match parsed.port() {
+                Some(port) => format!("cdp-loopback://{host}:{port}/[redacted]"),
+                None => format!("cdp-loopback://{host}/[redacted]"),
+            }
+        }
+        Err(_) => "cdp-loopback://[redacted]".to_owned(),
     }
 }
 
@@ -1507,10 +1573,28 @@ mod tests {
             "ws://example.com:9222/devtools/browser/abc",
             "ws://127.0.0.1.evil.test:9222/x",
             "ws://[fe80::1]:9222/x",
+            "ws://127.0.0.1:9222@evil.com/devtools/browser/abc",
+            "ws://evil@127.0.0.1:9222/devtools/browser/abc",
+            "ws://@127.0.0.1:9222/devtools/browser/abc",
+            "ws://[::1]:9222@evil.com/devtools/browser/abc",
+            "ws://127.0.0.1:9222\\@evil.com/devtools/browser/abc",
+            "ws://127.0.0.1:0/devtools/browser/abc",
+            "ws://127.0.0.1:70000/devtools/browser/abc",
+            "ws://127.0.0.1:/devtools/browser/abc",
+            "ws://127.0.0.1:abc/devtools/browser/abc",
+            "ws://127.0.0.1:9222:8080/devtools/browser/abc",
+            "ws://[::1]extra:9222/devtools/browser/abc",
+            "ws://[0:0:0:0:0:0:0:1]:9222/devtools/browser/abc",
+            "ws://127.0.0.2:9222/devtools/browser/abc",
+            "ws:///devtools/browser/abc",
             "",
         ] {
             assert!(validate_loopback_ws_url(bad).is_err(), "{bad}");
         }
+        let redacted = redacted_loopback_ws_endpoint("ws://127.0.0.1:9222/devtools/browser/secret-uuid");
+        assert_eq!(redacted, "cdp-loopback://127.0.0.1:9222/[redacted]");
+        assert!(!redacted.contains("secret-uuid"));
+        assert!(!redacted.contains("ws://"));
     }
 
     #[tokio::test]

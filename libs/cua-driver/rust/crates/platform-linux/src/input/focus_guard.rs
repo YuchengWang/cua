@@ -55,6 +55,61 @@ const STABLE_POLLS: u32 = 3;
 /// Bound on the ancestor / transient walk when attributing a window to a pid.
 const OWNER_WALK_LIMIT: usize = 16;
 
+pub(super) fn window_property_u32(
+    conn: &RustConnection,
+    window: Window,
+    atom: u32,
+    len: u32,
+) -> Vec<u32> {
+    conn.get_property(false, window, atom, AtomEnum::ANY, 0, len)
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .and_then(|r| r.value32().map(|v| v.collect()))
+        .unwrap_or_default()
+}
+
+pub(super) fn is_passive_popup_window(conn: &RustConnection, window: Window) -> bool {
+    let intern = |name: &[u8]| {
+        conn.intern_atom(true, name)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .map(|r| r.atom)
+            .filter(|atom| *atom != 0)
+    };
+    let Some(window_type) = intern(b"_NET_WM_WINDOW_TYPE") else {
+        return false;
+    };
+    let passive: Vec<u32> = [
+        &b"_NET_WM_WINDOW_TYPE_TOOLTIP"[..],
+        b"_NET_WM_WINDOW_TYPE_NOTIFICATION",
+        b"_NET_WM_WINDOW_TYPE_DND",
+    ]
+    .into_iter()
+    .filter_map(intern)
+    .collect();
+    window_property_u32(conn, window, window_type, 8)
+        .iter()
+        .any(|atom| passive.contains(atom))
+}
+
+pub(super) fn mapped_popup_windows(conn: &RustConnection, root: Window) -> HashSet<Window> {
+    let tree = match conn.query_tree(root).map(|c| c.reply()) {
+        Ok(Ok(tree)) => tree,
+        _ => return HashSet::new(),
+    };
+    let cookies: Vec<_> = tree
+        .children
+        .iter()
+        .filter_map(|w| conn.get_window_attributes(*w).ok().map(|c| (*w, c)))
+        .collect();
+    cookies
+        .into_iter()
+        .filter_map(|(w, c)| c.reply().ok().map(|a| (w, a)))
+        .filter(|(_, a)| a.override_redirect && a.map_state == MapState::VIEWABLE)
+        .map(|(w, _)| w)
+        .collect()
+}
+
 struct Atoms {
     net_active_window: u32,
     net_client_list_stacking: u32,
@@ -87,12 +142,7 @@ impl X {
     }
 
     fn window_property(&self, window: Window, atom: u32, len: u32) -> Vec<u32> {
-        self.conn
-            .get_property(false, window, atom, AtomEnum::ANY, 0, len)
-            .ok()
-            .and_then(|c| c.reply().ok())
-            .and_then(|r| r.value32().map(|v| v.collect()))
-            .unwrap_or_default()
+        window_property_u32(&self.conn, window, atom, len)
     }
 
     fn active_window(&self) -> Option<Window> {
@@ -188,48 +238,13 @@ impl X {
     /// `window` says it is a tooltip, notification or drag icon: mapped and
     /// override-redirect, but it holds no grab.
     fn passive_popup(&self, window: Window) -> bool {
-        let intern = |name: &[u8]| {
-            self.conn
-                .intern_atom(true, name)
-                .ok()
-                .and_then(|c| c.reply().ok())
-                .map(|r| r.atom)
-                .filter(|atom| *atom != 0)
-        };
-        let Some(window_type) = intern(b"_NET_WM_WINDOW_TYPE") else {
-            return false;
-        };
-        let passive: Vec<u32> = [
-            &b"_NET_WM_WINDOW_TYPE_TOOLTIP"[..],
-            b"_NET_WM_WINDOW_TYPE_NOTIFICATION",
-            b"_NET_WM_WINDOW_TYPE_DND",
-        ]
-        .into_iter()
-        .filter_map(intern)
-        .collect();
-        self.window_property(window, window_type, 8)
-            .iter()
-            .any(|atom| passive.contains(atom))
+        is_passive_popup_window(&self.conn, window)
     }
 
     /// Mapped override-redirect children of the root: menus, combo popups,
     /// tooltips. Requests are pipelined so a busy desktop costs one round trip.
     fn mapped_popups(&self) -> HashSet<Window> {
-        let tree = match self.conn.query_tree(self.root).map(|c| c.reply()) {
-            Ok(Ok(tree)) => tree,
-            _ => return HashSet::new(),
-        };
-        let cookies: Vec<_> = tree
-            .children
-            .iter()
-            .filter_map(|w| self.conn.get_window_attributes(*w).ok().map(|c| (*w, c)))
-            .collect();
-        cookies
-            .into_iter()
-            .filter_map(|(w, c)| c.reply().ok().map(|a| (w, a)))
-            .filter(|(_, a)| a.override_redirect && a.map_state == MapState::VIEWABLE)
-            .map(|(w, _)| w)
-            .collect()
+        mapped_popup_windows(&self.conn, self.root)
     }
 
     /// Current server time (PropertyNotify round trip), bounded at 300 ms;

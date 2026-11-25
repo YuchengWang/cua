@@ -24,6 +24,9 @@
 use cua_driver_core::tool::ToolRegistry;
 
 pub mod health_report;
+pub mod hot_config;
+#[cfg(target_os = "linux")]
+pub mod os_events;
 pub mod overlay;
 pub mod overlay_capture;
 pub mod tools;
@@ -52,10 +55,16 @@ pub mod history;
 pub mod browser_platform;
 
 #[cfg(target_os = "linux")]
+pub mod webview_probe;
+
+#[cfg(target_os = "linux")]
 mod browser_setup_ui;
 
 #[cfg(target_os = "linux")]
 mod browser_consent_ui;
+
+#[cfg(target_os = "linux")]
+pub mod dialog_matcher;
 
 #[cfg(target_os = "linux")]
 pub mod installed_apps;

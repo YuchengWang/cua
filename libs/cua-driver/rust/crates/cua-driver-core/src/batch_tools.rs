@@ -275,6 +275,7 @@ impl Tool for RunStepsTool {
                         "enum": ["background", "foreground"],
                         "description": "Default delivery_mode for steps whose tool takes one and that set none."
                     },
+                    "focus_policy": crate::tool_schema::focus_policy_schema(),
                     "foreground_fallback": {
                         "type": "boolean",
                         "description": "When a step is refused because its target ignores background input (Electron, LibreOffice and other toolkits), retry it once with delivery_mode:\"foreground\": the window is activated and the pointer may move. Default false."
@@ -469,6 +470,19 @@ impl Plan {
                 ))
             }
         };
+        let default_focus_policy = match object.get("focus_policy") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(policy)) => {
+                let parsed = crate::delivery::FocusPolicy::parse(Some(policy.as_str()))
+                    .map_err(PlanError::batch)?;
+                Some(parsed.as_str().to_owned())
+            }
+            Some(_) => {
+                return Err(PlanError::batch(
+                    "`focus_policy` must be \"default\", \"preserve_host\", or \"no_activate\"",
+                ))
+            }
+        };
         let foreground_fallback = match object.get("foreground_fallback") {
             None | Some(Value::Null) => false,
             Some(Value::Bool(flag)) => *flag,
@@ -558,6 +572,13 @@ impl Plan {
                     }
                 }
             }
+            if let (Some(policy), Some(action)) = (&default_focus_policy, step.action.as_mut()) {
+                if accepts(registry, action.tool, "focus_policy") {
+                    if let Some(object) = action.args.as_object_mut() {
+                        object.entry("focus_policy").or_insert_with(|| json!(policy));
+                    }
+                }
+            }
             // An `element_token` names its snapshot, and so its window; a
             // token the runtime no longer holds names nothing (fail closed).
             let names_window = step.action.as_ref().is_some_and(|action| {
@@ -629,6 +650,59 @@ impl Plan {
     }
 
     async fn run(self, registry: &ToolRegistry) -> ToolResult {
+        let action_steps = self
+            .steps
+            .iter()
+            .filter(|step| step.action.is_some())
+            .count();
+        let has_expect = self.steps.iter().any(|step| !step.expect.is_empty());
+        let has_preserve_host = self.steps.iter().any(|step| {
+            step.action.as_ref().is_some_and(|action| {
+                crate::delivery::FocusPolicy::from_args(&action.args)
+                    .is_ok_and(crate::delivery::FocusPolicy::is_preserve_host)
+            })
+        });
+        let use_batch_foreground = !has_preserve_host
+            && (action_steps > 1
+                || self.observe.is_some()
+                || !self.tail_reads.is_empty()
+                || has_expect);
+        if use_batch_foreground {
+            let batch_fg = crate::batch_foreground::BatchForegroundContext::new();
+            let abort_guard = batch_fg.abort_guard();
+            let mut result = crate::batch_foreground::scope_context(
+                batch_fg.clone(),
+                self.run_inner(registry),
+            )
+            .await;
+            let finish_result = batch_fg.finish_async().await;
+            drop(abort_guard);
+            if let Err(error) = finish_result {
+                let detail = format!("{error:#}");
+                if let Some(crate::protocol::Content::Text { text, .. }) = result.content.first_mut()
+                {
+                    text.push_str(&format!("\nfocus_restore ERROR: {detail}"));
+                } else {
+                    result.content.insert(
+                        0,
+                        Content::text(format!("focus_restore ERROR: {detail}")),
+                    );
+                }
+                if let Some(structured) = result.structured_content.as_mut() {
+                    structured["focus_restore_error"] = json!(detail);
+                    if result.is_error != Some(true) {
+                        structured["ok"] = json!(false);
+                        structured["code"] = json!("focus_restore_failed");
+                    }
+                }
+                result.is_error = Some(true);
+            }
+            return result;
+        }
+        self.run_inner(registry).await
+    }
+
+    async fn run_inner(self, registry: &ToolRegistry) -> ToolResult {
         let total = self.steps.len();
         let started = Instant::now();
         let mut locator = Locator::new(

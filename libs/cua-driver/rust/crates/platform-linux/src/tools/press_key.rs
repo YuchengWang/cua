@@ -12,16 +12,17 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 
 use super::impl_::{
-    background_key_route, coordinate_frame_is_desktop, coordinate_frame_schema, focus_by_pixel,
-    focus_hyprland_foreground, focus_nested_inject_target, foreground_budget,
+    background_key_route_with_policy, coordinate_frame_is_desktop, coordinate_frame_schema,
+    focus_by_pixel, focus_hyprland_foreground, focus_nested_inject_target, foreground_budget,
     foreground_hyprland_action, foreground_hyprland_key, foreground_hyprland_refusal,
     hyprland_foreground, inject_terminal_input, input_error_result, invalid_pointer_arguments,
-    isolated_hyprland_action, isolated_hyprland_background, isolated_hyprland_refusal,
-    key_route_result, position_named_session_keyboard_cursor, prove_token_element,
-    resolve_cursor_key, spawn_blocking_bounded, split_key_combo, stale_observed_element,
-    unavailable_chromium_background, unavailable_gtk_keyboard_background,
-    unavailable_qt_shortcut_background, unavailable_wayland_focused_input_background,
-    unavailable_webkit_keyboard_background, wm_chord_background, KeyRoute, ToolState,
+    is_gtk_process, isolated_hyprland_action, isolated_hyprland_background,
+    isolated_hyprland_refusal, key_route_result, position_named_session_keyboard_cursor,
+    prove_token_element, resolve_cursor_key, spawn_blocking_bounded, split_key_combo,
+    stale_observed_element, synthetic_pointer_is_dropped, unavailable_chromium_background,
+    unavailable_gtk_keyboard_background, unavailable_qt_shortcut_background,
+    unavailable_wayland_focused_input_background, unavailable_webkit_keyboard_background,
+    wm_chord_background, KeyRoute, ToolState,
 };
 
 /// True when `key` names the Enter key in the shared X keysym vocabulary
@@ -73,7 +74,8 @@ impl Tool for PressKeyTool {
                     "y":{"type":"number","description":"Pixel Y (see x)."},
                     "scope":{"type":"string","enum":["window","desktop"],"default":"window","description":"Use \"desktop\" with no pid to send the key to the focused application. Default \"window\"."},
                     "coordinate_frame": coordinate_frame_schema(),
-                    "delivery_mode": crate::input::delivery::delivery_mode_schema()
+                    "delivery_mode": crate::input::delivery::delivery_mode_schema(),
+                    "focus_policy": cua_driver_core::tool_schema::focus_policy_schema()
                 },"additionalProperties":false
             }),
             read_only: false, destructive: true, idempotent: false, open_world: true,
@@ -216,6 +218,16 @@ impl Tool for PressKeyTool {
         // background path (the focus-click already handled fronting when fg). Pass x,y
         // (no element_token) for Chromium/Electron surfaces the AX path can't focus.
         let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
+        let focus_policy = match cua_driver_core::delivery::FocusPolicy::from_args(&args) {
+            Ok(fp) => fp,
+            Err(msg) => {
+                return ToolResult::error(msg)
+                    .with_structured(json!({ "code": "invalid_arguments" }));
+            }
+        };
+        let preserve_host =
+            focus_policy.is_preserve_host() || crate::x11::window_is_override_redirect(xid);
+        let bypass_bg_focus_gate = preserve_host && !crate::wayland::is_wayland();
         if isolated_hyprland_background(delivery) {
             if xid_opt.is_none() {
                 return isolated_hyprland_refusal(
@@ -243,15 +255,17 @@ impl Tool for PressKeyTool {
             )
             .await;
         }
-        if let Some(refusal) = unavailable_chromium_background(pid, delivery) {
-            return refusal;
-        }
+        if !bypass_bg_focus_gate {
+            if let Some(refusal) = unavailable_chromium_background(pid, delivery) {
+                return refusal;
+            }
 
-        if let Some(refusal) = unavailable_webkit_keyboard_background(pid, delivery) {
-            return refusal;
-        }
-        if let Some(refusal) = unavailable_gtk_keyboard_background(pid, delivery) {
-            return refusal;
+            if let Some(refusal) = unavailable_webkit_keyboard_background(pid, delivery) {
+                return refusal;
+            }
+            if let Some(refusal) = unavailable_gtk_keyboard_background(pid, delivery) {
+                return refusal;
+            }
         }
         if let Some(refusal) = unavailable_wayland_focused_input_background(delivery, true) {
             return refusal;
@@ -381,25 +395,30 @@ impl Tool for PressKeyTool {
             let chord = press_key_chord(&mods, &key);
             let element = token.clone();
             let result = spawn_blocking_bounded("press_key", foreground_budget(1), move || {
-                crate::interaction::with_target_foreground(
-                    pid,
-                    xid,
-                    crate::interaction::session_policy().key,
-                    || {
-                        if let Some(element) = &element {
-                            if !crate::atspi::focus_token(pid, element)? {
-                                anyhow::bail!(
-                                    "AT-SPI Component.GrabFocus returned false for element {}",
-                                    element.index
-                                );
-                            }
+                let send = || {
+                    if let Some(element) = &element {
+                        if !preserve_host && !crate::atspi::focus_token(pid, element)? {
+                            anyhow::bail!(
+                                "AT-SPI Component.GrabFocus returned false for element {}",
+                                element.index
+                            );
                         }
-                        match chord {
-                            Some(keys) => crate::wayland::hotkey_focused(&keys),
-                            None => crate::wayland::press_key_focused(&key_w),
-                        }
-                    },
-                )
+                    }
+                    match chord {
+                        Some(keys) => crate::wayland::hotkey_focused(&keys),
+                        None => crate::wayland::press_key_focused(&key_w),
+                    }
+                };
+                if preserve_host {
+                    send()
+                } else {
+                    crate::interaction::with_target_foreground(
+                        pid,
+                        xid,
+                        crate::interaction::session_policy().key,
+                        send,
+                    )
+                }
             })
             .await;
             return match result {
@@ -439,6 +458,10 @@ impl Tool for PressKeyTool {
             // events through the XI2 virtual master keyboard (no focus steal),
             // else direct XSendEvent for apps that accept it.
             if deliver_fg {
+                if preserve_host {
+                    return crate::input::send_key_xtest(&key_for_task, &m)
+                        .map(|()| KeyRoute::PreserveHost);
+                }
                 return crate::interaction::with_x11_foreground(
                     xid,
                     crate::input::ForegroundOptions::keyboard(),
@@ -457,7 +480,16 @@ impl Tool for PressKeyTool {
                 )
                 .map(|((), report)| KeyRoute::Foreground(report));
             }
-            background_key_route(
+            if preserve_host
+                && (crate::input::real_keyboard_input_available() == false
+                    || unavailable_chromium_background(pid, delivery).is_some()
+                    || is_gtk_process(pid)
+                    || synthetic_pointer_is_dropped(pid))
+            {
+                return crate::input::send_key_xtest(&key_for_task, &m)
+                    .map(|()| KeyRoute::PreserveHost);
+            }
+            background_key_route_with_policy(
                 &cursor_id,
                 pid,
                 xid,
@@ -465,6 +497,7 @@ impl Tool for PressKeyTool {
                 &key_for_task,
                 &m,
                 token.as_ref(),
+                preserve_host,
             )
         })
         .await;
@@ -526,6 +559,38 @@ mod press_key_tests {
         assert_eq!(
             press_key_chord(&["ctrl".to_owned(), "shift".to_owned()], "t"),
             Some(vec!["ctrl".to_owned(), "shift".to_owned(), "t".to_owned()])
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_advertises_focus_policy_and_rejects_invalid_value() {
+        use cua_driver_core::tool::Tool;
+        let tool = super::PressKeyTool {
+            state: super::ToolState::new(),
+        };
+        let props = tool
+            .def()
+            .input_schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("properties");
+        assert!(props.contains_key("focus_policy"));
+
+        let res = tool
+            .invoke(serde_json::json!({
+                "pid": 1,
+                "window_id": 1,
+                "key": "Down",
+                "focus_policy": "steal_everything"
+            }))
+            .await;
+        assert_eq!(res.is_error, Some(true));
+        assert_eq!(
+            res.structured_content
+                .as_ref()
+                .and_then(|s| s.get("code"))
+                .and_then(|v| v.as_str()),
+            Some("invalid_arguments")
         );
     }
 }

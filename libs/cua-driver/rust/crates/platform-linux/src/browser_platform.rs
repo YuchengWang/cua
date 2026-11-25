@@ -143,7 +143,7 @@ fn is_chromium(name: &str) -> bool {
     is_chromium_identity(name)
 }
 
-fn browser_product(identity: &str) -> BrowserProduct {
+pub(crate) fn browser_product(identity: &str) -> BrowserProduct {
     let tokens = identity
         .to_ascii_lowercase()
         .split(|ch: char| !ch.is_ascii_alphanumeric())
@@ -289,7 +289,7 @@ fn process_role_for_pid(pid: i64, product: BrowserProduct) -> BrowserProcessRole
     }
 }
 
-fn parse_proc_net_loopback_listeners(text: &str) -> Vec<(u16, u64)> {
+pub(crate) fn parse_proc_net_loopback_listeners(text: &str) -> Vec<(u16, u64)> {
     text.lines()
         .skip(1)
         .filter_map(|line| {
@@ -327,7 +327,7 @@ fn descendant_pids(root: i64, relationships: impl IntoIterator<Item = (i64, i64)
     family
 }
 
-fn process_family_pids(root: i64) -> Result<HashSet<i64>, BrowserRefusal> {
+pub(crate) fn process_family_pids(root: i64) -> Result<HashSet<i64>, BrowserRefusal> {
     if !std::path::Path::new(&format!("/proc/{root}")).exists() {
         return Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserBindingStale,
@@ -352,7 +352,7 @@ fn process_family_pids(root: i64) -> Result<HashSet<i64>, BrowserRefusal> {
     Ok(descendant_pids(root, relationships))
 }
 
-fn socket_inodes_for_process_tree(pid: i64) -> Result<HashSet<u64>, BrowserRefusal> {
+pub(crate) fn socket_inodes_for_process_tree(pid: i64) -> Result<HashSet<u64>, BrowserRefusal> {
     let process_family = process_family_pids(pid)?;
     let mut inodes = HashSet::new();
     for owner_pid in process_family {
@@ -375,7 +375,7 @@ fn socket_inodes_for_process_tree(pid: i64) -> Result<HashSet<u64>, BrowserRefus
     Ok(inodes)
 }
 
-fn loopback_ports_for_pid(pid: i64) -> Result<Vec<u16>, BrowserRefusal> {
+pub(crate) fn loopback_ports_for_pid(pid: i64) -> Result<Vec<u16>, BrowserRefusal> {
     // Chromium may delegate its DevTools listener to a utility child. Core's
     // ownership contract explicitly accepts the approved browser PID or one
     // of its children, so inspect the bounded descendant tree as well as the

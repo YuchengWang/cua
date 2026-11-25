@@ -65,6 +65,7 @@ pub mod app_recipe;
 pub mod auth_site;
 pub mod authorization;
 pub mod background_input;
+pub mod batch_foreground;
 pub mod batch_nudge;
 pub mod batch_tools;
 pub mod browser;

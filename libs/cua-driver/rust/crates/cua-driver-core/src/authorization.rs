@@ -244,6 +244,10 @@ const PRIVATE_OBSERVATION_OPERATIONS: &[&str] = &[
     "page[action=get_text|query_dom]",
     "zoom",
     "start_recording",
+    "poll_os_events",
+    "wait_for_os_event",
+    "probe_webview_targets",
+    "match_and_act_dialog",
 ];
 const PRIVATE_OBSERVATION_SCOPE_KEYS: &[&str] = &[
     "daemon_generation",
@@ -287,6 +291,7 @@ const DESKTOP_INPUT_OPERATIONS: &[&str] = &[
     "set_value",
     "bring_to_front",
     "set_window_frame",
+    "match_and_act_dialog",
 ];
 const DESKTOP_INPUT_SCOPE_KEYS: &[&str] = &[
     "daemon_generation",
@@ -786,6 +791,10 @@ pub fn enforcement_adapters_for_call(
             | "get_browser_state"
             | "zoom"
             | "start_recording"
+            | "poll_os_events"
+            | "wait_for_os_event"
+            | "probe_webview_targets"
+            | "match_and_act_dialog"
     ) || (tool == "page"
         && matches!(
             args.get("action").and_then(Value::as_str),
@@ -801,7 +810,10 @@ pub fn enforcement_adapters_for_call(
         add("computer_history");
     }
 
-    if DESKTOP_INPUT_OPERATIONS.contains(&tool) {
+    if DESKTOP_INPUT_OPERATIONS.contains(&tool)
+        && !(tool == "match_and_act_dialog"
+            && args.get("dry_run").and_then(Value::as_bool) == Some(true))
+    {
         add("desktop_input");
     }
 
@@ -962,6 +974,10 @@ pub fn advertised_risk_for(tool: &str) -> RiskAssessment {
         | "sudo_in_terminal"
         | "inspect_app_flow"
         | "resolve_auth_site"
+        | "poll_os_events"
+        | "wait_for_os_event"
+        | "probe_webview_targets"
+        | "match_and_act_dialog"
         | "list_apps"
         | "list_windows"
         | "debug_window_info"
@@ -1107,7 +1123,11 @@ pub fn classify_tool_call(tool: &str, args: &Value) -> RiskAssessment {
         | "type_totp_from_env"
         | "sudo_in_terminal"
         | "inspect_app_flow"
-        | "resolve_auth_site" => RiskAssessment {
+        | "resolve_auth_site"
+        | "poll_os_events"
+        | "wait_for_os_event"
+        | "probe_webview_targets"
+        | "match_and_act_dialog" => RiskAssessment {
             class: RiskClass::R2,
             enforcement: RiskEnforcement::Active,
             operation_sensitive: true,
@@ -1293,6 +1313,10 @@ fn enforce_hard_invariants(
             | "page"
             | "browser_prepare"
             | "approve_browser_consent"
+            | "poll_os_events"
+            | "wait_for_os_event"
+            | "match_and_act_dialog"
+            | "probe_webview_targets"
     );
     if process_targeting_tool
         && args.get("pid").and_then(Value::as_i64) == Some(i64::from(std::process::id()))
@@ -2281,5 +2305,49 @@ mod tests {
         );
         assert_eq!(call_risk.class, super::RiskClass::R2);
         assert_eq!(call_risk.enforcement, super::RiskEnforcement::Active);
+    }
+
+    #[test]
+    fn phase2_os_dialog_and_webview_tools_have_r2_risk_classification() {
+        for tool in [
+            "poll_os_events",
+            "wait_for_os_event",
+            "match_and_act_dialog",
+            "probe_webview_targets",
+        ] {
+            let risk = super::advertised_risk_for(tool);
+            assert_eq!(risk.class, super::RiskClass::R2, "{tool}");
+            assert_eq!(
+                risk.enforcement,
+                super::RiskEnforcement::Active,
+                "advertised enforcement must match active runtime enforcement for {tool}"
+            );
+            let call_risk = super::classify_tool_call(tool, &serde_json::json!({ "pid": 1234 }));
+            assert_eq!(call_risk.class, super::RiskClass::R2, "{tool}");
+            assert_eq!(
+                call_risk.enforcement,
+                super::RiskEnforcement::Active,
+                "{tool}"
+            );
+            assert!(
+                !super::enforcement_adapters_for_call(tool, &serde_json::json!({ "pid": 1234 }))
+                    .is_empty(),
+                "{tool} must map to at least one active enforcement adapter"
+            );
+        }
+        let dialog_act: Vec<&str> =
+            super::enforcement_adapters_for_call("match_and_act_dialog", &serde_json::json!({}))
+                .into_iter()
+                .map(|a| a.id)
+                .collect();
+        assert_eq!(dialog_act, vec!["private_observation", "desktop_input"]);
+        let dialog_dry: Vec<&str> = super::enforcement_adapters_for_call(
+            "match_and_act_dialog",
+            &serde_json::json!({ "dry_run": true }),
+        )
+        .into_iter()
+        .map(|a| a.id)
+        .collect();
+        assert_eq!(dialog_dry, vec!["private_observation"]);
     }
 }

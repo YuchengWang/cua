@@ -657,14 +657,76 @@ fn confirmed(target: Window, active: Option<Window>, focus_within: bool) -> bool
     )
 }
 
-fn confirm_phase(target: Window, deadline: Instant) -> Result<ConfirmOutcome> {
+fn holds_active_focus_facts(
+    active_matches_target: bool,
+    focused_within_target: bool,
+    focused_same_pid: bool,
+    focused_in_active_popup: bool,
+    has_active_popup: bool,
+    has_core_focus: bool,
+) -> bool {
+    if !active_matches_target {
+        return false;
+    }
+    if !has_core_focus {
+        return has_active_popup;
+    }
+    focused_within_target || focused_same_pid || focused_in_active_popup
+}
+
+impl X11 {
+    /// Mapped override-redirect root children that may belong to `target_pid`,
+    /// excluding the driver's own cursor overlay and passive tooltips/DND/notifications.
+    fn mapped_active_popups(&self, target_pid: Option<u32>) -> Vec<Window> {
+        let foreign = |w: Window| {
+            target_pid.is_some() && self.window_pid(w).is_some_and(|p| Some(p) != target_pid)
+        };
+        super::focus_guard::mapped_popup_windows(&self.conn, self.root)
+            .into_iter()
+            .filter(|w| {
+                !crate::overlay::is_x11_overlay_window(*w)
+                    && !super::focus_guard::is_passive_popup_window(&self.conn, *w)
+                    && !foreign(*w)
+            })
+            .collect()
+    }
+
+    /// Read-only check: `target` is `_NET_ACTIVE_WINDOW` and core input focus
+    /// sits inside `target`, inside another window of `target_pid`, or inside
+    /// a non-passive override-redirect popup that may belong to `target_pid`.
+    fn target_holds_active_focus(&self, target: Window, target_pid: Option<u32>) -> bool {
+        let active_matches = confirmed(target, self.active_window(), true);
+        if !active_matches {
+            return false;
+        }
+        match self.focused() {
+            Some(focused) if self.is_within(focused, target) => true,
+            Some(focused) => {
+                let same_pid = target_pid.is_some_and(|pid| self.owning_pid(focused) == Some(pid));
+                let in_popup = !same_pid
+                    && self
+                        .mapped_active_popups(target_pid)
+                        .into_iter()
+                        .any(|popup| self.is_within(focused, popup));
+                holds_active_focus_facts(true, false, same_pid, in_popup, false, true)
+            }
+            None => {
+                let has_popup = !self.mapped_active_popups(target_pid).is_empty();
+                holds_active_focus_facts(true, false, false, false, has_popup, false)
+            }
+        }
+    }
+}
+
+fn confirm_phase(target: Window, fallback_pid: Option<u32>, deadline: Instant) -> Result<ConfirmOutcome> {
     let x = X11::open()?;
     let start = Instant::now();
     let prior = x.active_window().unwrap_or(0);
+    let target_pid = x.window_pid(target).or(fallback_pid);
     let mut retried = false;
     // Already active and focused: leave the window (and any open menu / grab)
     // untouched — re-activating is what popped GTK menus back down.
-    if confirmed(target, Some(prior), x.focus_is_within(target)) {
+    if x.target_holds_active_focus(target, target_pid) {
         return Ok(ConfirmOutcome {
             confirmed: true,
             already_active: true,
@@ -782,8 +844,9 @@ pub fn activate(xid: u64, opts: ForegroundOptions) -> Result<Activated> {
     let started = Instant::now();
     let settle = operation_deadline(opts.settle);
     let phase = operation_deadline(opts.settle + Duration::from_millis(1500));
-    let outcome =
-        run_with_deadline(phase, move || confirm_phase(target, settle)).ok_or_else(|| {
+    let fallback_pid = opts.target_pid;
+    let outcome = run_with_deadline(phase, move || confirm_phase(target, fallback_pid, settle))
+        .ok_or_else(|| {
             anyhow!(
                 "{CODE_TIMEOUT}: the X server did not answer the activation of window \
                  0x{xid:x} within {:?}; no input was sent",
@@ -816,6 +879,50 @@ pub fn activate(xid: u64, opts: ForegroundOptions) -> Result<Activated> {
         outcome,
         windows_before: pid_window_set(target_pid),
     })
+}
+
+/// Read-only focus verification for follow-up steps inside a batch foreground
+/// transaction: confirms `xid` (or its open popup/dialog) still holds active
+/// focus without sending `_NET_ACTIVE_WINDOW` or `XSetInputFocus`. Returns
+/// `Ok(None)` when focus left `xid` so the caller can fall back to [`activate`].
+pub fn verify_active_for_batch(xid: u64, opts: ForegroundOptions) -> Result<Option<Activated>> {
+    let target = xid as Window;
+    let started = Instant::now();
+    let phase = operation_deadline(opts.settle + Duration::from_millis(1500));
+    let fallback_pid = opts.target_pid;
+    let verified = run_with_deadline(phase, move || -> Result<Option<(Option<u32>, Duration)>> {
+        let x = X11::open()?;
+        let target_pid = x.window_pid(target).or(fallback_pid);
+        if x.target_holds_active_focus(target, target_pid) {
+            Ok(Some((target_pid, started.elapsed())))
+        } else {
+            Ok(None)
+        }
+    })
+    .ok_or_else(|| {
+        anyhow!(
+            "{CODE_TIMEOUT}: the X server did not answer the focus check for window \
+             0x{xid:x} within {:?}; no input was sent",
+            started.elapsed()
+        )
+    })??;
+    let Some((target_pid, elapsed)) = verified else {
+        return Ok(None);
+    };
+    Ok(Some(Activated {
+        target,
+        target_pid,
+        outcome: ConfirmOutcome {
+            confirmed: true,
+            already_active: true,
+            retried: false,
+            elapsed,
+            active_after: target,
+            focus_within: true,
+            focus_holder: None,
+        },
+        windows_before: pid_window_set(target_pid),
+    }))
 }
 
 impl Activated {
@@ -1135,10 +1242,32 @@ mod tests {
     fn unavailable_display_is_structured() {
         let display = crate::test_env::unreachable_x11_display();
         let result = activate(0x1234, ForegroundOptions::pointer());
+        let verify_result = verify_active_for_batch(0x1234, ForegroundOptions::pointer());
         drop(display);
         let Err(error) = result else {
             panic!("connect must fail")
         };
         assert!(error_code(&error).is_some(), "{error}");
+        let Err(verify_error) = verify_result else {
+            panic!("verify connect must fail")
+        };
+        assert!(error_code(&verify_error).is_some(), "{verify_error}");
+    }
+
+    #[test]
+    fn active_focus_facts_accept_target_and_open_popups_but_reject_elsewhere() {
+        // Active != target is always rejected regardless of core focus.
+        assert!(!holds_active_focus_facts(false, true, true, true, true, true));
+        // Active == target with core focus within target.
+        assert!(holds_active_focus_facts(true, true, false, false, false, true));
+        // Active == target with core focus on an override-redirect popup.
+        assert!(holds_active_focus_facts(true, false, false, true, true, true));
+        // Active == target with core focus on a same-pid window/dialog.
+        assert!(holds_active_focus_facts(true, false, true, false, false, true));
+        // Active == target with core focus elsewhere and no popup.
+        assert!(!holds_active_focus_facts(true, false, false, false, false, true));
+        // Active == target with core focus None/PointerRoot only allowed if an active popup exists.
+        assert!(holds_active_focus_facts(true, false, false, false, true, false));
+        assert!(!holds_active_focus_facts(true, false, false, false, false, false));
     }
 }

@@ -22,8 +22,16 @@ use cua_driver_core::{
         DataChannel, ModalHandler, RecipeState, RecipeStep, RecipeTransition, RelativeAnchor,
         SafetyLevel, StateMachine, VerifyResult, VersionGate,
     },
+    authorization::{configured_permission_mode, launch_grant_enabled, PermissionMode},
+    browser::{
+        cdp_ws::{
+            redacted_loopback_ws_endpoint, validate_loopback_ws_url, CdpConnection, CdpMethodPolicy,
+        },
+        fetch_json_version_ws_url, is_electron_app_layout, loopback_websocket_port, BrowserProduct,
+    },
     protocol::ToolResult,
-    tool::{Tool, ToolDef},
+    session_authorization::EffectiveAuthorizationContext,
+    tool::{current_dispatch_authorization_context, Tool, ToolDef},
     tool_args::ArgsExt,
 };
 use serde_json::{json, Value};
@@ -363,6 +371,7 @@ impl Tool for RunAppRecipeTool {
             Err(e) => return ToolResult::error(e.to_string()),
         };
         let display_id = resolve_display_id(&args);
+        let auth_ctx = current_dispatch_authorization_context();
         let mut req = InspectAppFlowRequest {
             pid: args.opt_u64("pid").map(|v| v as u32),
             window_id: args.opt_u64("window_id"),
@@ -429,12 +438,13 @@ impl Tool for RunAppRecipeTool {
                     steps: executed_steps,
                     artifacts,
                     error: step_err,
-                } = execute_flow_steps(
+                } = execute_flow_steps_with_auth(
                     ctx.as_deref(),
                     &recipe,
                     target_window_id,
                     target_pid,
                     steps,
+                    auth_ctx.as_deref(),
                 );
                 if let Some((idx, action, err)) = step_err {
                     return Ok(ToolResult::error(format!(
@@ -541,13 +551,33 @@ impl Tool for RunAppRecipeTool {
                 if let Some(ms) = tx.wait_for_stable_frame_ms {
                     std::thread::sleep(std::time::Duration::from_millis(ms.min(5_000)));
                 }
-                let details = execute_recipe_step(
+                let tx_step = RecipeStep {
+                    action: tx.action.clone(),
+                    args: tx.args.clone(),
+                    wait_for_stable_frame_ms: tx.wait_for_stable_frame_ms,
+                    description: None,
+                    method: None,
+                    safety_level: None,
+                    latency_ms_est: None,
+                    fallback_method: None,
+                };
+                if let Err(blocked) = check_safety_gate(
+                    &recipe,
+                    None,
+                    std::slice::from_ref(&tx_step),
+                    SafetyLevel::ReadOnly,
+                    allow_safety_level,
+                ) {
+                    return Ok(blocked);
+                }
+                let details = execute_recipe_step_with_auth(
                     ctx.as_deref(),
                     &recipe,
                     target_window_id,
                     target_pid,
                     &tx.action,
                     &tx.args,
+                    auth_ctx.as_deref(),
                 )?;
                 executed_steps.push(json!({
                     "from": tx.from_state,
@@ -639,6 +669,7 @@ impl Tool for AcquireAppDataTool {
             Err(e) => return ToolResult::error(e.to_string()),
         };
         let display_id = resolve_display_id(&args);
+        let auth_ctx = current_dispatch_authorization_context();
         let mut req = InspectAppFlowRequest {
             pid: args.opt_u64("pid").map(|v| v as u32),
             window_id: args.opt_u64("window_id"),
@@ -691,7 +722,7 @@ impl Tool for AcquireAppDataTool {
                 &recipe,
                 spec.flow.as_deref(),
                 flow_steps,
-                spec.safety_level,
+                effective_capability_safety_level(spec),
                 allow_safety_level,
             ) {
                 return Ok(blocked);
@@ -708,6 +739,7 @@ impl Tool for AcquireAppDataTool {
                 target_pid,
                 &capability,
                 spec,
+                auth_ctx.as_deref(),
             ) {
                 Ok((steps, artifacts)) => {
                     let summary = format_artifacts_summary(&artifacts);
@@ -739,7 +771,21 @@ impl Tool for AcquireAppDataTool {
                 }
                 Err(primary_err) if fallback => {
                     if let Some(fb_method) = spec.fallback_method {
-                        let fb_artifact = execute_fallback_channel(
+                        let fb_required = if fb_method == DataChannel::Cdp {
+                            SafetyLevel::AuthOnly
+                        } else {
+                            SafetyLevel::ReadOnly
+                        };
+                        if let Err(blocked) = check_safety_gate(
+                            &recipe,
+                            None,
+                            &[],
+                            fb_required,
+                            allow_safety_level,
+                        ) {
+                            return Ok(blocked);
+                        }
+                        let fb_artifact = execute_fallback_channel_with_auth(
                             ctx.as_deref(),
                             &recipe,
                             &inspection,
@@ -747,6 +793,7 @@ impl Tool for AcquireAppDataTool {
                             target_pid,
                             fb_method,
                             spec,
+                            auth_ctx.as_deref(),
                         )?;
                         let fb_artifacts = vec![fb_artifact];
                         let summary = format_artifacts_summary(&fb_artifacts);
@@ -789,7 +836,7 @@ impl Tool for AcquireAppDataTool {
                             &recipe,
                             fb_spec.flow.as_deref(),
                             fb_steps,
-                            fb_spec.safety_level,
+                            effective_capability_safety_level(fb_spec),
                             allow_safety_level,
                         ) {
                             return Ok(blocked);
@@ -802,6 +849,7 @@ impl Tool for AcquireAppDataTool {
                             target_pid,
                             fb_cap_name,
                             fb_spec,
+                            auth_ctx.as_deref(),
                         )?;
                         let summary = format_artifacts_summary(&artifacts);
                         let msg = if summary.is_empty() {
@@ -879,14 +927,44 @@ fn normalize_shortcut_str(keys: &[String]) -> String {
 
 fn default_step_safety_level(action: &str) -> SafetyLevel {
     match action {
-        "type_secret_from_env" | "type_totp_from_env" => SafetyLevel::AuthOnly,
+        "type_secret_from_env"
+        | "type_totp_from_env"
+        | "cdp_call"
+        | "atspi_click"
+        | "atspi_set_value"
+        | "interact_popup" => SafetyLevel::AuthOnly,
         _ => SafetyLevel::ReadOnly,
     }
 }
 
+fn effective_capability_safety_level(spec: &CapabilitySpec) -> SafetyLevel {
+    let min_level = match spec.data_channel {
+        DataChannel::Cdp => SafetyLevel::AuthOnly,
+        _ => SafetyLevel::ReadOnly,
+    };
+    spec.safety_level.max(min_level)
+}
+
 fn effective_step_safety_level(step: &RecipeStep) -> SafetyLevel {
-    step.safety_level
-        .unwrap_or_else(|| default_step_safety_level(&step.action))
+    let base = default_step_safety_level(&step.action);
+    let inferred = if step.action == "atspi_match_dialog"
+        && (step
+            .args
+            .get("env_key")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+            || step
+                .args
+                .get("rule")
+                .and_then(|r| r.get("env_key"))
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty()))
+    {
+        SafetyLevel::AuthOnly
+    } else {
+        base
+    };
+    step.safety_level.map_or(inferred, |explicit| explicit.max(inferred))
 }
 
 #[allow(clippy::result_large_err)]
@@ -974,12 +1052,13 @@ struct FlowExecutionResult {
     error: Option<(usize, String, anyhow::Error)>,
 }
 
-fn execute_flow_steps(
+fn execute_flow_steps_with_auth(
     ctx: Option<&X11ScreenContext>,
     recipe: &AppRecipe,
     target_window_id: Option<u64>,
     target_pid: Option<u32>,
     steps: &[RecipeStep],
+    auth_ctx: Option<&EffectiveAuthorizationContext>,
 ) -> FlowExecutionResult {
     let _ime_guard = match ctx {
         Some(c) => crate::ime::ImeGuard::acquire_for_target(&c.target),
@@ -991,13 +1070,14 @@ fn execute_flow_steps(
         if let Some(ms) = step.wait_for_stable_frame_ms {
             std::thread::sleep(std::time::Duration::from_millis(ms.min(5_000)));
         }
-        match execute_recipe_step(
+        match execute_recipe_step_with_auth(
             ctx,
             recipe,
             target_window_id,
             target_pid,
             &step.action,
             &step.args,
+            auth_ctx,
         ) {
             Ok(details) => {
                 if let Some(art) = details.get("artifact") {
@@ -1042,6 +1122,7 @@ fn execute_capability_primary(
     target_pid: Option<u32>,
     capability: &str,
     spec: &CapabilitySpec,
+    auth_ctx: Option<&EffectiveAuthorizationContext>,
 ) -> anyhow::Result<(Vec<Value>, Vec<Value>)> {
     if let Some(ref flow_name) = spec.flow {
         let steps = recipe.flows.get(flow_name).ok_or_else(|| {
@@ -1053,7 +1134,14 @@ fn execute_capability_primary(
             steps: executed,
             mut artifacts,
             error,
-        } = execute_flow_steps(ctx, recipe, target_window_id, target_pid, steps);
+        } = execute_flow_steps_with_auth(
+            ctx,
+            recipe,
+            target_window_id,
+            target_pid,
+            steps,
+            auth_ctx,
+        );
         if let Some((idx, action, e)) = error {
             anyhow::bail!("flow '{flow_name}' failed at step {idx} ({action}): {e:#}");
         }
@@ -1070,7 +1158,7 @@ fn execute_capability_primary(
         return Ok((executed, artifacts));
     }
 
-    let artifact = execute_fallback_channel(
+    let artifact = execute_fallback_channel_with_auth(
         ctx,
         recipe,
         inspection,
@@ -1078,11 +1166,35 @@ fn execute_capability_primary(
         target_pid,
         spec.data_channel,
         spec,
+        auth_ctx,
     )?;
     Ok((Vec::new(), vec![artifact]))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn execute_fallback_channel(
+    ctx: Option<&X11ScreenContext>,
+    recipe: &AppRecipe,
+    inspection: &crate::app_inspector::AppFlowInspection,
+    target_window_id: Option<u64>,
+    target_pid: Option<u32>,
+    channel: DataChannel,
+    spec: &CapabilitySpec,
+) -> anyhow::Result<Value> {
+    execute_fallback_channel_with_auth(
+        ctx,
+        recipe,
+        inspection,
+        target_window_id,
+        target_pid,
+        channel,
+        spec,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_fallback_channel_with_auth(
     ctx: Option<&X11ScreenContext>,
     _recipe: &AppRecipe,
     inspection: &crate::app_inspector::AppFlowInspection,
@@ -1090,6 +1202,7 @@ fn execute_fallback_channel(
     target_pid: Option<u32>,
     channel: DataChannel,
     spec: &CapabilitySpec,
+    auth_ctx: Option<&EffectiveAuthorizationContext>,
 ) -> anyhow::Result<Value> {
     match channel {
         DataChannel::WindowMeta => Ok(json!({
@@ -1131,8 +1244,29 @@ fn execute_fallback_channel(
             let details = verify_file_export_at_path(&expand_home_path(raw_path), 0, 1, 30)?;
             Ok(details.get("artifact").cloned().unwrap_or(details))
         }
-        DataChannel::Atspi | DataChannel::Cdp => {
-            anyhow::bail!("direct {:?} channel requires a named flow in recipe", channel)
+        DataChannel::Atspi => {
+            let (pid_opt, wid_opt) = resolve_step_pid_window(ctx, target_window_id, target_pid, &json!({}));
+            let pid = pid_opt.ok_or_else(|| {
+                anyhow::anyhow!("atspi channel requires target pid or mapped window_id")
+            })?;
+            let xid = wid_opt.unwrap_or(0);
+            let args = json!({ "max_elements": 250, "max_depth": 20 });
+            let (walked, indices) = query_atspi_nodes(pid, xid, &args)?;
+            let nodes = atspi_nodes_json(&walked, &indices, 80);
+            Ok(json!({
+                "kind": "atspi",
+                "pid": pid,
+                "window_id": wid_opt,
+                "count": nodes.len(),
+                "total_walked": walked.nodes.len(),
+                "truncated": walked.truncated,
+                "degraded_reason": walked.degraded_reason,
+                "nodes": nodes,
+            }))
+        }
+        DataChannel::Cdp => {
+            let (pid_opt, wid_opt) = resolve_step_pid_window(ctx, target_window_id, target_pid, &json!({}));
+            execute_cdp_channel(pid_opt, wid_opt, spec, auth_ctx)
         }
     }
 }
@@ -1450,19 +1584,707 @@ fn resolve_consent_target(
     Ok((pid, window_id))
 }
 
-fn run_async_consent<F, T>(fut: F) -> T
+fn run_async_step<F, T>(fut: F) -> T
 where
     F: std::future::Future<Output = T> + Send,
+    T: Send,
 {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.block_on(fut)
+        if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+            tokio::task::block_in_place(|| handle.block_on(fut))
+        } else {
+            std::thread::scope(|s| {
+                s.spawn(move || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("tokio runtime for recipe step")
+                        .block_on(fut)
+                })
+                .join()
+                .expect("recipe step async helper thread panicked")
+            })
+        }
     } else {
         tokio::runtime::Runtime::new()
-            .expect("tokio runtime for browser consent")
+            .expect("tokio runtime for recipe step")
             .block_on(fut)
     }
 }
 
+fn run_async_consent<F, T>(fut: F) -> T
+where
+    F: std::future::Future<Output = T> + Send,
+    T: Send,
+{
+    run_async_step(fut)
+}
+
+fn resolve_step_pid_window(
+    ctx: Option<&X11ScreenContext>,
+    target_window_id: Option<u64>,
+    target_pid: Option<u32>,
+    args: &Value,
+) -> (Option<u32>, Option<u64>) {
+    let wid = args.get("window_id").and_then(Value::as_u64).or(target_window_id);
+    let mut pid = args
+        .get("pid")
+        .and_then(Value::as_u64)
+        .map(|v| v as u32)
+        .or(target_pid);
+    if pid.is_none() {
+        if let Some(xid) = wid {
+            pid = ctx
+                .and_then(|c| crate::x11::window_info_with_context(c, xid))
+                .and_then(|w| w.pid)
+                .or_else(|| crate::x11::window_pid(xid));
+        }
+    }
+    (pid, wid)
+}
+
+fn query_atspi_nodes(
+    pid: u32,
+    xid: u64,
+    args: &Value,
+) -> anyhow::Result<(crate::atspi::AtspiTreeResult, Vec<usize>)> {
+    let query = args.get("query").and_then(Value::as_str);
+    let role_filter = args.get("role").and_then(Value::as_str);
+    let role_re = role_filter
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(regex::Regex::new)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("invalid 'role' regex: {e}"))?;
+    let name_re = args
+        .get("name_regex")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(regex::Regex::new)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("invalid 'name_regex' regex: {e}"))?;
+    let max_elements = args
+        .get("max_elements")
+        .and_then(Value::as_u64)
+        .map(|v| (v as usize).clamp(1, 2000))
+        .unwrap_or(300);
+    let max_depth = args
+        .get("max_depth")
+        .and_then(Value::as_u64)
+        .map(|v| (v as usize).clamp(1, 64))
+        .unwrap_or(24);
+    let skip_web_content = args
+        .get("skip_web_content")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let timeout_ms = args
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(4_000)
+        .clamp(300, 15_000);
+
+    let walked = crate::atspi::walk_tree_bounded_within_options(
+        pid,
+        xid,
+        query,
+        Some(max_elements),
+        Some(max_depth),
+        std::time::Duration::from_millis(timeout_ms),
+        skip_web_content,
+    );
+    let mut matched = Vec::new();
+    for (idx, node) in walked.nodes.iter().enumerate() {
+        if let Some(ref re) = role_re {
+            let exact_ci = role_filter.is_some_and(|r| node.role.eq_ignore_ascii_case(r.trim()));
+            if !exact_ci && !re.is_match(&node.role) {
+                continue;
+            }
+        }
+        if let Some(ref re) = name_re {
+            let name = node.name.as_deref().unwrap_or("");
+            if !re.is_match(name) {
+                continue;
+            }
+        }
+        matched.push(idx);
+    }
+    Ok((walked, matched))
+}
+
+fn atspi_nodes_json(
+    walked: &crate::atspi::AtspiTreeResult,
+    indices: &[usize],
+    limit: usize,
+) -> Vec<Value> {
+    let bounds_by_idx: HashMap<usize, (i32, i32, u32, u32)> = walked
+        .bounds
+        .iter()
+        .map(|(i, x, y, w, h)| (*i, (*x, *y, *w, *h)))
+        .collect();
+    indices
+        .iter()
+        .take(limit)
+        .filter_map(|idx| walked.nodes.get(*idx))
+        .map(|n| {
+            let bounds = n
+                .element_index
+                .and_then(|ei| bounds_by_idx.get(&ei).copied())
+                .map(|(x, y, w, h)| json!([x, y, w, h]));
+            json!({
+                "element_index": n.element_index,
+                "role": n.role,
+                "name": n.name,
+                "value": n.value,
+                "enabled": n.enabled,
+                "focused": n.focused,
+                "actions": n.actions,
+                "bounds": bounds,
+            })
+        })
+        .collect()
+}
+
+struct AuthorizedCdpTarget {
+    ws_url: String,
+    method_policy: CdpMethodPolicy,
+}
+
+fn is_consumer_browser_product(product: BrowserProduct) -> bool {
+    matches!(
+        product,
+        BrowserProduct::GoogleChrome
+            | BrowserProduct::Chromium
+            | BrowserProduct::MicrosoftEdge
+            | BrowserProduct::Brave
+            | BrowserProduct::Vivaldi
+            | BrowserProduct::Opera
+            | BrowserProduct::Arc
+    )
+}
+
+fn evaluate_cdp_target_policy(
+    pid: u32,
+    wid: Option<u64>,
+    product: BrowserProduct,
+    is_electron_layout: bool,
+    mode: PermissionMode,
+    has_existing_profile_grant: bool,
+    manifest: Option<&cua_driver_core::session_manifest::SessionManifest>,
+) -> anyhow::Result<CdpMethodPolicy> {
+    if product == BrowserProduct::Firefox {
+        anyhow::bail!("pid {pid} is Firefox, which does not expose a supported CDP endpoint");
+    }
+    if !is_electron_layout && is_consumer_browser_product(product) {
+        match mode {
+            PermissionMode::Unrestricted => {}
+            PermissionMode::Bounded => {
+                let m = manifest.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "consumer browser pid {pid} requires an approved capability manifest in bounded mode"
+                    )
+                })?;
+                m.authorize_call(
+                    "browser_prepare",
+                    &json!({
+                        "pid": pid,
+                        "window_id": wid,
+                        "strategy": { "kind": "existing_profile" },
+                    }),
+                )
+                .map_err(|msg| {
+                    anyhow::anyhow!("consumer browser CDP access denied for pid {pid}: {msg}")
+                })?;
+            }
+            PermissionMode::Standard => {
+                if !has_existing_profile_grant {
+                    anyhow::bail!(
+                        "consumer browser CDP access for pid {pid} ({product:?}) requires --grant existing-profile in standard mode; use browser_prepare with strategy=existing_profile"
+                    );
+                }
+            }
+        }
+        return Ok(CdpMethodPolicy::ExistingProfile);
+    }
+    Ok(CdpMethodPolicy::Unrestricted)
+}
+
+fn inspect_process_for_cdp(pid: u32) -> anyhow::Result<(BrowserProduct, bool)> {
+    if !Path::new(&format!("/proc/{pid}")).exists() {
+        anyhow::bail!("target process {pid} is not running or inaccessible for CDP authorization");
+    }
+    let exe_path = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
+    let electron_layout = exe_path.as_deref().is_some_and(is_electron_app_layout);
+    let identity = exe_path
+        .map(|p| p.to_string_lossy().into_owned())
+        .or_else(|| {
+            std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                .ok()
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("cannot inspect target process {pid} identity for CDP authorization")
+        })?;
+    let product = if electron_layout {
+        BrowserProduct::Electron
+    } else {
+        crate::browser_platform::browser_product(&identity)
+    };
+    Ok((product, electron_layout))
+}
+
+fn classify_and_authorize_cdp_pid(
+    pid: u32,
+    wid: Option<u64>,
+    auth_ctx: Option<&EffectiveAuthorizationContext>,
+) -> anyhow::Result<CdpMethodPolicy> {
+    if pid <= 1 {
+        anyhow::bail!("refusing CDP access for invalid or system pid {pid}");
+    }
+    #[cfg(not(test))]
+    if pid == std::process::id() {
+        anyhow::bail!("refusing CDP access targeting cua-driver's own process");
+    }
+    let (product, electron_layout) = inspect_process_for_cdp(pid)?;
+    let mode = auth_ctx
+        .map(|ctx| ctx.mode())
+        .map(Ok)
+        .unwrap_or_else(configured_permission_mode)
+        .map_err(|e| anyhow::anyhow!("permission mode unavailable: {e}"))?;
+    let manifest = auth_ctx.and_then(|ctx| ctx.capability_manifest());
+    evaluate_cdp_target_policy(
+        pid,
+        wid,
+        product,
+        electron_layout,
+        mode,
+        launch_grant_enabled("existing_profile"),
+        manifest,
+    )
+}
+
+fn find_loopback_listener_pids(port: u16) -> anyhow::Result<Vec<u32>> {
+    let mut inodes = std::collections::HashSet::new();
+    for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            for (p, inode) in crate::browser_platform::parse_proc_net_loopback_listeners(&text) {
+                if p == port && inode > 0 {
+                    inodes.insert(inode);
+                }
+            }
+        }
+    }
+    if inodes.is_empty() {
+        anyhow::bail!(
+            "cannot verify target process permission: no loopback listener found on port {port}"
+        );
+    }
+    let mut owners = Vec::new();
+    let entries = std::fs::read_dir("/proc")
+        .map_err(|e| anyhow::anyhow!("cannot scan /proc to verify port {port} owner: {e}"))?;
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else {
+            continue;
+        };
+        let owns = fds.flatten().any(|fd| {
+            std::fs::read_link(fd.path()).ok().is_some_and(|target| {
+                let s = target.to_string_lossy();
+                s.strip_prefix("socket:[")
+                    .and_then(|v| v.strip_suffix(']'))
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .is_some_and(|inode| inodes.contains(&inode))
+            })
+        });
+        if owns {
+            owners.push(pid);
+        }
+    }
+    if owners.is_empty() {
+        anyhow::bail!(
+            "cannot verify target process permission for loopback port {port} (unowned or inaccessible /proc/<pid>/fd)"
+        );
+    }
+    owners.sort_unstable();
+    Ok(owners)
+}
+
+fn verify_port_owned_by_pid(pid: u32, port: u16) -> anyhow::Result<()> {
+    let owned_ports = crate::browser_platform::loopback_ports_for_pid(i64::from(pid))
+        .map_err(|refusal| anyhow::anyhow!("{}", refusal.message))?;
+    if !owned_ports.contains(&port) {
+        anyhow::bail!(
+            "CDP loopback port {port} is not owned by target pid {pid} process tree"
+        );
+    }
+    Ok(())
+}
+
+fn redact_ws_url(text: &str, ws_url: &str, redacted: &str) -> String {
+    let mut out = text.replace(ws_url, redacted);
+    if let Some(rest) = ws_url.strip_prefix("ws://") {
+        if let Some(idx) = rest.find('/') {
+            let path = &rest[idx..];
+            if path.len() > 1 {
+                out = out.replace(path, "/[redacted]");
+            }
+        }
+    }
+    out
+}
+
+fn cdp_policy_label(policy: CdpMethodPolicy) -> &'static str {
+    match policy {
+        CdpMethodPolicy::ExistingProfile => "existing_profile",
+        CdpMethodPolicy::Unrestricted => "unrestricted",
+    }
+}
+
+async fn resolve_and_authorize_cdp_target_async(
+    pid: Option<u32>,
+    wid: Option<u64>,
+    explicit_ws: Option<&str>,
+    port: Option<u16>,
+    auth_ctx: Option<&EffectiveAuthorizationContext>,
+) -> anyhow::Result<AuthorizedCdpTarget> {
+    let explicit_ws = explicit_ws.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(ws) = explicit_ws {
+        validate_loopback_ws_url(ws).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    if port == Some(0) {
+        anyhow::bail!("CDP port 0 is invalid");
+    }
+    let port_hint = port.or_else(|| explicit_ws.and_then(loopback_websocket_port));
+    if explicit_ws.is_some() && port_hint.is_none() {
+        anyhow::bail!("explicit ws_url must specify a valid loopback TCP port");
+    }
+
+    let explicit_target_pid = match (pid, wid) {
+        (Some(p), _) => Some(p),
+        (None, Some(w)) => Some(crate::x11::window_pid(w).ok_or_else(|| {
+            anyhow::anyhow!("cannot resolve _NET_WM_PID for window_id {w} to verify CDP permission")
+        })?),
+        (None, None) => None,
+    };
+
+    let (target_pid, mut method_policy) = if let Some(tpid) = explicit_target_pid {
+        let mut policy = classify_and_authorize_cdp_pid(tpid, wid, auth_ctx)?;
+        if let Some(p) = port_hint {
+            verify_port_owned_by_pid(tpid, p)?;
+            for owner in find_loopback_listener_pids(p)? {
+                if classify_and_authorize_cdp_pid(owner, wid, auth_ctx)?
+                    == CdpMethodPolicy::ExistingProfile
+                {
+                    policy = CdpMethodPolicy::ExistingProfile;
+                }
+            }
+        }
+        (tpid, policy)
+    } else if let Some(p) = port_hint {
+        let owners = find_loopback_listener_pids(p)?;
+        let mut combined = CdpMethodPolicy::Unrestricted;
+        for owner in &owners {
+            if classify_and_authorize_cdp_pid(*owner, None, auth_ctx)?
+                == CdpMethodPolicy::ExistingProfile
+            {
+                combined = CdpMethodPolicy::ExistingProfile;
+            }
+        }
+        (owners[0], combined)
+    } else {
+        anyhow::bail!(
+            "CDP access requires target pid, window_id, or verifiable loopback endpoint"
+        );
+    };
+
+    let ws_url = if let Some(ws) = explicit_ws {
+        ws.to_owned()
+    } else if let Some(p) = port {
+        let ws_url = fetch_json_version_ws_url(p)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("no /json/version WebSocket URL on loopback port {p}"))?;
+        validate_loopback_ws_url(&ws_url).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let resolved_port = loopback_websocket_port(&ws_url).ok_or_else(|| {
+            anyhow::anyhow!("/json/version WebSocket URL is missing a valid loopback port")
+        })?;
+        verify_port_owned_by_pid(target_pid, resolved_port)?;
+        for owner in find_loopback_listener_pids(resolved_port)? {
+            if classify_and_authorize_cdp_pid(owner, wid, auth_ctx)?
+                == CdpMethodPolicy::ExistingProfile
+            {
+                method_policy = CdpMethodPolicy::ExistingProfile;
+            }
+        }
+        ws_url
+    } else {
+        let report =
+            crate::webview_probe::probe_webview_targets(Some(target_pid), wid, true, None).await?;
+        let mut selected = None;
+        'outer: for ep in &report.endpoints {
+            if let Some(ref ws) = ep.browser_ws_url {
+                if validate_loopback_ws_url(ws).is_ok() {
+                    if let Some(resolved_port) = loopback_websocket_port(ws) {
+                        if verify_port_owned_by_pid(target_pid, resolved_port).is_ok() {
+                            selected = Some((ws.clone(), resolved_port));
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+            for page in &ep.page_targets {
+                if page.target_type.as_deref() == Some("page") {
+                    if let Some(ref ws) = page.ws_url {
+                        if validate_loopback_ws_url(ws).is_ok() {
+                            if let Some(resolved_port) = loopback_websocket_port(ws) {
+                                if verify_port_owned_by_pid(target_pid, resolved_port).is_ok() {
+                                    selected = Some((ws.clone(), resolved_port));
+                                    break 'outer;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let (ws_url, resolved_port) = selected.ok_or_else(|| {
+            anyhow::anyhow!(
+                "no verified owned loopback CDP endpoint found for pid={} window_id={:?} (listening_ports={:?})",
+                target_pid,
+                wid,
+                report.listening_ports
+            )
+        })?;
+        for owner in find_loopback_listener_pids(resolved_port)? {
+            if classify_and_authorize_cdp_pid(owner, wid, auth_ctx)?
+                == CdpMethodPolicy::ExistingProfile
+            {
+                method_policy = CdpMethodPolicy::ExistingProfile;
+            }
+        }
+        ws_url
+    };
+
+    Ok(AuthorizedCdpTarget {
+        ws_url,
+        method_policy,
+    })
+}
+
+async fn execute_cdp_call_async(
+    pid: Option<u32>,
+    wid: Option<u64>,
+    args: &Value,
+    auth_ctx: Option<&EffectiveAuthorizationContext>,
+) -> anyhow::Result<Value> {
+    let method = args
+        .get("method")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("cdp_call requires 'method'"))?;
+    let explicit_ws = args
+        .get("ws_url")
+        .or_else(|| args.get("ws_endpoint"))
+        .and_then(Value::as_str);
+    let port = args.get("port").and_then(Value::as_u64).map(|p| p as u16);
+    let timeout_ms = args
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(10_000)
+        .clamp(500, 60_000);
+    let params = args.get("params").cloned().unwrap_or_else(|| json!({}));
+    let explicit_session = args
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let target_url_re = args
+        .get("target_url_regex")
+        .and_then(Value::as_str)
+        .map(regex::Regex::new)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("invalid target_url_regex: {e}"))?;
+    let auto_attach_page = args
+        .get("auto_attach_page")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    let target = resolve_and_authorize_cdp_target_async(pid, wid, explicit_ws, port, auth_ctx).await?;
+    let ws_url = target.ws_url;
+    let method_policy = target.method_policy;
+    let redacted_endpoint = redacted_loopback_ws_endpoint(&ws_url);
+    let policy_label = cdp_policy_label(method_policy);
+
+    let fut = async {
+        let conn = CdpConnection::connect(&ws_url)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", redact_ws_url(&e.to_string(), &ws_url, &redacted_endpoint)))?;
+        if method_policy == CdpMethodPolicy::ExistingProfile {
+            conn.restrict_to_existing_profile();
+        }
+        let mut session_id = explicit_session;
+        let is_browser_endpoint = ws_url.contains("/devtools/browser/");
+        let is_browser_method = method.starts_with("Target.") || method.starts_with("Browser.");
+        if session_id.is_none() && is_browser_endpoint && !is_browser_method && auto_attach_page {
+            let targets_val = conn
+                .call(None, "Target.getTargets", json!({}))
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", redact_ws_url(&e.to_string(), &ws_url, &redacted_endpoint)))?;
+            let chosen = targets_val
+                .get("targetInfos")
+                .and_then(Value::as_array)
+                .and_then(|arr| {
+                    arr.iter().find(|t| {
+                        let is_page = t.get("type").and_then(Value::as_str) == Some("page");
+                        if !is_page {
+                            return false;
+                        }
+                        match &target_url_re {
+                            Some(re) => t
+                                .get("url")
+                                .and_then(Value::as_str)
+                                .is_some_and(|u| re.is_match(u)),
+                            None => true,
+                        }
+                    })
+                })
+                .and_then(|t| t.get("targetId").and_then(Value::as_str))
+                .map(str::to_owned);
+            if let Some(tid) = chosen {
+                let attached = conn
+                    .call(
+                        None,
+                        "Target.attachToTarget",
+                        json!({ "targetId": tid, "flatten": true }),
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{}", redact_ws_url(&e.to_string(), &ws_url, &redacted_endpoint)))?;
+                session_id = attached
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+            }
+        }
+        let result = conn
+            .call(session_id.as_deref(), method, params)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", redact_ws_url(&e.to_string(), &ws_url, &redacted_endpoint)))?;
+        Ok::<Value, anyhow::Error>(json!({
+            "artifact": {
+                "kind": "cdp",
+                "method": method,
+                "endpoint": redacted_endpoint,
+                "method_policy": policy_label,
+                "session_id": session_id,
+                "result": result,
+            },
+            "method": method,
+            "endpoint": redacted_endpoint,
+            "method_policy": policy_label,
+            "session_id": session_id,
+            "result": result,
+        }))
+    };
+
+    tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), fut)
+        .await
+        .map_err(|_| anyhow::anyhow!("cdp_call '{method}' timed out after {timeout_ms}ms"))?
+}
+
+fn execute_cdp_channel(
+    pid: Option<u32>,
+    wid: Option<u64>,
+    spec: &CapabilitySpec,
+    auth_ctx: Option<&EffectiveAuthorizationContext>,
+) -> anyhow::Result<Value> {
+    let artifact_hint = spec.artifact_path.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let (explicit_ws, explicit_port): (Option<String>, Option<u16>) = match artifact_hint {
+        Some(raw) if raw.starts_with("ws://") || raw.starts_with("wss://") => {
+            (Some(raw.to_owned()), None)
+        }
+        Some(raw) if raw.starts_with("http://") => {
+            let p = crate::webview_probe::parse_loopback_port_value(raw).ok_or_else(|| {
+                anyhow::anyhow!("cdp channel artifact_path '{raw}' must be a loopback http/ws endpoint")
+            })?;
+            (None, Some(p))
+        }
+        Some(raw) => {
+            if let Ok(p) = raw.parse::<u16>() {
+                (None, Some(p))
+            } else {
+                (None, None)
+            }
+        }
+        None => (None, None),
+    };
+
+    run_async_step(async move {
+        let target = resolve_and_authorize_cdp_target_async(
+            pid,
+            wid,
+            explicit_ws.as_deref(),
+            explicit_port,
+            auth_ctx,
+        )
+        .await?;
+        let ws_url = target.ws_url;
+        let method_policy = target.method_policy;
+        let redacted_endpoint = redacted_loopback_ws_endpoint(&ws_url);
+        let policy_label = cdp_policy_label(method_policy);
+
+        let conn = CdpConnection::connect(&ws_url)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", redact_ws_url(&e.to_string(), &ws_url, &redacted_endpoint)))?;
+        if method_policy == CdpMethodPolicy::ExistingProfile {
+            conn.restrict_to_existing_profile();
+        }
+        let targets = conn.call(None, "Target.getTargets", json!({})).await.ok();
+        let mut page_summary = Value::Null;
+        if let Some(tid) = targets
+            .as_ref()
+            .and_then(|v| v.get("targetInfos"))
+            .and_then(Value::as_array)
+            .and_then(|arr| arr.iter().find(|t| t.get("type").and_then(Value::as_str) == Some("page")))
+            .and_then(|t| t.get("targetId").and_then(Value::as_str))
+        {
+            if let Ok(attached) = conn
+                .call(None, "Target.attachToTarget", json!({ "targetId": tid, "flatten": true }))
+                .await
+            {
+                if let Some(sid) = attached.get("sessionId").and_then(Value::as_str) {
+                    if let Ok(eval_res) = conn
+                        .call(
+                            Some(sid),
+                            "Runtime.evaluate",
+                            json!({
+                                "expression": "JSON.stringify({ url: location.href, title: document.title, text: (document.body?.innerText || '').slice(0, 2000) })",
+                                "returnByValue": true
+                            }),
+                        )
+                        .await
+                    {
+                        page_summary = eval_res;
+                    }
+                }
+            }
+        }
+        Ok(json!({
+            "kind": "cdp",
+            "endpoint": redacted_endpoint,
+            "method_policy": policy_label,
+            "targets": targets,
+            "page_summary": page_summary,
+        }))
+    })
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 fn execute_recipe_step(
     ctx: Option<&X11ScreenContext>,
     recipe: &AppRecipe,
@@ -1470,6 +2292,18 @@ fn execute_recipe_step(
     target_pid: Option<u32>,
     action: &str,
     args: &Value,
+) -> anyhow::Result<Value> {
+    execute_recipe_step_with_auth(ctx, recipe, target_window_id, target_pid, action, args, None)
+}
+
+fn execute_recipe_step_with_auth(
+    ctx: Option<&X11ScreenContext>,
+    recipe: &AppRecipe,
+    target_window_id: Option<u64>,
+    target_pid: Option<u32>,
+    action: &str,
+    args: &Value,
+    auth_ctx: Option<&EffectiveAuthorizationContext>,
 ) -> anyhow::Result<Value> {
     match action {
         "wait_for_stable_frame" => {
@@ -1813,6 +2647,302 @@ fn execute_recipe_step(
             let path = expand_home_path(raw_path);
             verify_file_export_at_path(&path, wait_ms, min_bytes, preview_lines)
         }
+        "wait_for_os_event" => {
+            crate::os_events::ensure_watchers_active();
+            let (pid_opt, _) = resolve_step_pid_window(ctx, target_window_id, target_pid, args);
+            let pid = if args.get("pid").is_some()
+                || args.get("use_target_pid").and_then(Value::as_bool).unwrap_or(false)
+            {
+                pid_opt
+            } else {
+                None
+            };
+            let mut event_kinds = Vec::new();
+            if let Some(arr) = args.get("event_kinds").and_then(Value::as_array) {
+                for v in arr {
+                    if let Some(s) = v.as_str() {
+                        event_kinds.push(s.to_owned());
+                    }
+                }
+            } else if let Some(s) = args.get("event_kinds").and_then(Value::as_str) {
+                event_kinds.push(s.to_owned());
+            }
+            let role = args.get("role").and_then(Value::as_str).map(str::to_owned);
+            let name_regex = args.get("name_regex").and_then(Value::as_str);
+            let filter =
+                crate::os_events::OsEventFilter::from_params(pid, event_kinds, role, name_regex)?;
+            let cursor = args.get("cursor").and_then(Value::as_u64);
+            let timeout_ms = args
+                .get("timeout_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(5_000)
+                .clamp(50, 60_000);
+            let res = run_async_step(crate::os_events::global_os_event_bus().wait_for(
+                cursor,
+                &filter,
+                std::time::Duration::from_millis(timeout_ms),
+            ));
+            if res.timed_out || !res.matched {
+                anyhow::bail!("wait_for_os_event timed out after {}ms", res.elapsed_ms);
+            }
+            Ok(serde_json::to_value(res)?)
+        }
+        "atspi_query" => {
+            let (pid_opt, wid_opt) = resolve_step_pid_window(ctx, target_window_id, target_pid, args);
+            let pid = pid_opt.ok_or_else(|| anyhow::anyhow!("atspi_query requires target 'pid'"))?;
+            let xid = wid_opt.unwrap_or(0);
+            let limit = args
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map(|v| (v as usize).clamp(1, 200))
+                .unwrap_or(50);
+            let (walked, indices) = query_atspi_nodes(pid, xid, args)?;
+            let nodes = atspi_nodes_json(&walked, &indices, limit);
+            Ok(json!({
+                "artifact": {
+                    "kind": "atspi",
+                    "pid": pid,
+                    "window_id": wid_opt,
+                    "count": nodes.len(),
+                    "nodes": nodes,
+                },
+                "pid": pid,
+                "window_id": wid_opt,
+                "matched_count": indices.len(),
+                "nodes": nodes,
+            }))
+        }
+        "atspi_click" => {
+            let (pid_opt, wid_opt) = resolve_step_pid_window(ctx, target_window_id, target_pid, args);
+            let pid = pid_opt.ok_or_else(|| anyhow::anyhow!("atspi_click requires target 'pid'"))?;
+            let xid = wid_opt.unwrap_or(0);
+            let focus_policy = cua_driver_core::delivery::FocusPolicy::from_args(args)
+                .map_err(|m| anyhow::anyhow!("{m}"))?;
+            let match_index = args.get("match_index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let (walked, indices) = query_atspi_nodes(pid, xid, args)?;
+            let node_idx = *indices
+                .get(match_index)
+                .ok_or_else(|| anyhow::anyhow!("atspi_click matched {} node(s), index {match_index} out of range", indices.len()))?;
+            let node = &walked.nodes[node_idx];
+            let ((action_name, suspected_noop, unacknowledged), _guard) =
+                if focus_policy.is_preserve_host() || (xid != 0 && crate::x11::window_is_override_redirect(xid)) {
+                    (crate::atspi::perform_action_walked(pid, xid, node)?, None)
+                } else {
+                    crate::input::focus_guard::guarded(Some(pid), || {
+                        crate::atspi::perform_action_walked(pid, xid, node)
+                    })?
+                };
+            Ok(json!({
+                "pid": pid,
+                "window_id": wid_opt,
+                "role": node.role,
+                "name": node.name,
+                "action": action_name,
+                "suspected_noop": suspected_noop,
+                "unacknowledged": unacknowledged,
+                "focus_policy": focus_policy.as_str(),
+            }))
+        }
+        "atspi_set_value" => {
+            let (pid_opt, wid_opt) = resolve_step_pid_window(ctx, target_window_id, target_pid, args);
+            let pid = pid_opt.ok_or_else(|| anyhow::anyhow!("atspi_set_value requires target 'pid'"))?;
+            let xid = wid_opt.unwrap_or(0);
+            let value = args
+                .get("value")
+                .or_else(|| args.get("text"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("atspi_set_value requires 'value'"))?;
+            let match_index = args.get("match_index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let (walked, indices) = query_atspi_nodes(pid, xid, args)?;
+            let node_idx = *indices
+                .get(match_index)
+                .ok_or_else(|| anyhow::anyhow!("atspi_set_value matched {} node(s), index {match_index} out of range", indices.len()))?;
+            let node = &walked.nodes[node_idx];
+            let obj_ref = node
+                .object_ref
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("matched AT-SPI node lacks a live D-Bus object_ref"))?;
+            crate::atspi::native::set_value_ref(obj_ref, value)?;
+            Ok(json!({
+                "pid": pid,
+                "window_id": wid_opt,
+                "role": node.role,
+                "name": node.name,
+                "bytes": value.len(),
+            }))
+        }
+        "atspi_match_dialog" => {
+            let (pid_opt, wid_opt) = resolve_step_pid_window(ctx, target_window_id, target_pid, args);
+            let focus_policy = args
+                .get("focus_policy")
+                .is_some()
+                .then(|| cua_driver_core::delivery::FocusPolicy::from_args(args))
+                .transpose()
+                .map_err(|m| anyhow::anyhow!("{m}"))?;
+            let inline_rule = args
+                .get("rule")
+                .map(|v| serde_json::from_value(v.clone()))
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("invalid inline dialog rule: {e}"))?;
+            let req = crate::dialog_matcher::MatchAndActRequest {
+                pid: pid_opt,
+                window_id: wid_opt,
+                display_id: args
+                    .get("display_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                rule_id: args
+                    .get("rule_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                inline_rule,
+                focus_policy,
+                env_key: args
+                    .get("env_key")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                env_file: args
+                    .get("env_file")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                verify_disappeared: args.get("verify_disappeared").and_then(Value::as_bool),
+                wait_ms: args.get("wait_ms").and_then(Value::as_u64),
+                dry_run: args.get("dry_run").and_then(Value::as_bool).unwrap_or(false),
+            };
+            let outcome = crate::dialog_matcher::match_and_act(req)?;
+            Ok(serde_json::to_value(outcome)?)
+        }
+        "interact_popup" => {
+            let (pid_opt, wid_opt) = resolve_step_pid_window(ctx, target_window_id, target_pid, args);
+            let focus_policy = if args.get("focus_policy").is_some() {
+                cua_driver_core::delivery::FocusPolicy::from_args(args)
+                    .map_err(|m| anyhow::anyhow!("{m}"))?
+            } else {
+                cua_driver_core::delivery::FocusPolicy::PreserveHost
+            };
+            if args.get("query").is_some()
+                || args.get("role").is_some()
+                || args.get("name_regex").is_some()
+            {
+                let pid = pid_opt.ok_or_else(|| anyhow::anyhow!("interact_popup AT-SPI match requires 'pid'"))?;
+                let xid = wid_opt.unwrap_or(0);
+                let match_index = args.get("match_index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let (walked, indices) = query_atspi_nodes(pid, xid, args)?;
+                let node_idx = *indices
+                    .get(match_index)
+                    .ok_or_else(|| anyhow::anyhow!("interact_popup matched 0 nodes"))?;
+                let node = &walked.nodes[node_idx];
+                let (action_name, suspected_noop, unacknowledged) = if focus_policy.is_preserve_host() {
+                    crate::atspi::perform_action_walked(pid, xid, node)?
+                } else {
+                    crate::input::focus_guard::guarded(Some(pid), || {
+                        crate::atspi::perform_action_walked(pid, xid, node)
+                    })?
+                    .0
+                };
+                return Ok(json!({
+                    "mode": "atspi",
+                    "pid": pid,
+                    "window_id": wid_opt,
+                    "focus_policy": focus_policy.as_str(),
+                    "action": action_name,
+                    "suspected_noop": suspected_noop,
+                    "unacknowledged": unacknowledged,
+                }));
+            }
+            let xctx = ctx.ok_or_else(|| anyhow::anyhow!("X11 display context unavailable"))?;
+            let keys = parse_shortcut_keys(args);
+            if !keys.is_empty() {
+                if !focus_policy.is_preserve_host() {
+                    if let Some(wid) = wid_opt {
+                        let _ = xtest_focus_window(xctx, wid);
+                    }
+                }
+                if keys.len() == 1 {
+                    xtest_press_key(xctx, &keys[0])?;
+                } else {
+                    xtest_hotkey(xctx, &keys)?;
+                }
+                return Ok(json!({
+                    "mode": "key",
+                    "window_id": wid_opt,
+                    "keys": keys,
+                    "focus_policy": focus_policy.as_str(),
+                }));
+            }
+            let x = args.get("x").and_then(Value::as_f64);
+            let y = args.get("y").and_then(Value::as_f64);
+            if let (Some(rx), Some(ry)) = (x, y) {
+                let desktop = args.get("coordinate_frame").and_then(Value::as_str) == Some("desktop")
+                    || args.get("scope").and_then(Value::as_str) == Some("desktop");
+                let (sx, sy) = if !desktop {
+                    if let Some(wid) = wid_opt {
+                        if let Some(win) = crate::x11::window_info_with_context(xctx, wid) {
+                            (win.x as f64 + rx, win.y as f64 + ry)
+                        } else {
+                            (rx, ry)
+                        }
+                    } else {
+                        (rx, ry)
+                    }
+                } else {
+                    (rx, ry)
+                };
+                let button = match args.get("button").and_then(Value::as_str) {
+                    Some("right") => 3,
+                    Some("middle") => 2,
+                    _ => 1,
+                };
+                if !focus_policy.is_preserve_host() {
+                    if let Some(wid) = wid_opt {
+                        let _ = xtest_focus_window(xctx, wid);
+                    }
+                }
+                xtest_click(xctx, sx.round() as i16, sy.round() as i16, button)?;
+                return Ok(json!({
+                    "mode": "pointer",
+                    "window_id": wid_opt,
+                    "screen_x": sx.round() as i32,
+                    "screen_y": sy.round() as i32,
+                    "button": button,
+                    "focus_policy": focus_policy.as_str(),
+                }));
+            }
+            anyhow::bail!("interact_popup requires AT-SPI filter (query/role/name_regex), keys/key, or x/y coordinates")
+        }
+        "probe_webview_targets" => {
+            let (pid_opt, wid_opt) = resolve_step_pid_window(ctx, target_window_id, target_pid, args);
+            let probe_http = args
+                .get("probe_http")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let cfg_path = match args.get("config_path").and_then(Value::as_str) {
+                Some(raw) => Some(
+                    crate::tools::mcp_webview_probe::validate_config_path(raw)
+                        .map_err(|msg| anyhow::anyhow!("{msg}"))?,
+                ),
+                None => None,
+            };
+            let report = run_async_step(crate::webview_probe::probe_webview_targets(
+                pid_opt,
+                wid_opt,
+                probe_http,
+                cfg_path.as_deref(),
+            ))?;
+            let val = serde_json::to_value(&report)?;
+            let mut art = val.clone();
+            if let Some(obj) = art.as_object_mut() {
+                obj.insert("kind".into(), json!("webview_probe"));
+            }
+            Ok(json!({
+                "artifact": art,
+                "report": val,
+            }))
+        }
+        "cdp_call" => {
+            let (pid_opt, wid_opt) = resolve_step_pid_window(ctx, target_window_id, target_pid, args);
+            run_async_step(execute_cdp_call_async(pid_opt, wid_opt, args, auth_ctx))
+        }
         other => anyhow::bail!("unsupported recipe action '{other}'"),
     }
 }
@@ -1930,6 +3060,28 @@ pub(crate) fn format_artifacts_summary(artifacts: &[Value]) -> String {
                 let pid = art.get("pid").and_then(Value::as_u64);
                 parts.push(format!(
                     "[artifact {idx} window_meta] pid={pid:?} title={title:?}"
+                ));
+            }
+            "atspi" => {
+                let count = art.get("count").and_then(Value::as_u64).unwrap_or(0);
+                let pid = art.get("pid").and_then(Value::as_u64);
+                parts.push(format!(
+                    "[artifact {idx} atspi] pid={pid:?} nodes={count}: {}",
+                    truncate_utf8_snippet(&art.to_string(), 1500)
+                ));
+            }
+            "cdp" => {
+                let method = art.get("method").and_then(Value::as_str).unwrap_or("targets");
+                parts.push(format!(
+                    "[artifact {idx} cdp] method={method}: {}",
+                    truncate_utf8_snippet(&art.to_string(), 1500)
+                ));
+            }
+            "webview_probe" => {
+                let pid = art.get("pid").and_then(Value::as_u64);
+                parts.push(format!(
+                    "[artifact {idx} webview_probe] pid={pid:?}: {}",
+                    truncate_utf8_snippet(&art.to_string(), 1500)
                 ));
             }
             _ => {
@@ -2587,5 +3739,723 @@ mod tests {
         let err = super::resolve_consent_target(None, &recipe, None, None, &json!({}))
             .expect_err("missing target without X11 context must fail");
         assert!(err.to_string().contains("pid") || err.to_string().contains("window_id"));
+    }
+
+    #[test]
+    fn atspi_match_dialog_with_env_key_escalates_safety_level_to_auth_only() {
+        let plain_step: RecipeStep = serde_json::from_value(json!({
+            "action": "atspi_match_dialog",
+            "args": { "rule_id": "generic" }
+        }))
+        .expect("step");
+        assert_eq!(effective_step_safety_level(&plain_step), SafetyLevel::ReadOnly);
+
+        let secret_step: RecipeStep = serde_json::from_value(json!({
+            "action": "atspi_match_dialog",
+            "args": { "env_key": "CUA_YCWANG_TEST_PIN" }
+        }))
+        .expect("secret step");
+        assert_eq!(effective_step_safety_level(&secret_step), SafetyLevel::AuthOnly);
+    }
+
+    #[test]
+    fn recipe_step_wait_for_os_event_receives_published_event() {
+        let recipe: AppRecipe = serde_json::from_value(json!({
+            "schema_version": 1,
+            "app_id": "test-app",
+            "app_version": "1",
+            "version_source": "dpkg",
+            "fingerprint_sha256": "test",
+            "state_machine": { "initial_state": "ready", "states": [], "transitions": [] }
+        }))
+        .expect("recipe");
+
+        let cursor = crate::os_events::global_os_event_bus().latest_seq();
+        let pid = std::process::id();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            crate::os_events::global_os_event_bus().push(crate::os_events::OsEventDraft {
+                source: "atspi".into(),
+                kind: "window.activate".into(),
+                pid: Some(pid),
+                role: Some("frame".into()),
+                name: Some("Phase2 Recipe Event".into()),
+                ..Default::default()
+            });
+        });
+
+        let res = super::execute_recipe_step(
+            None,
+            &recipe,
+            None,
+            Some(pid),
+            "wait_for_os_event",
+            &json!({
+                "cursor": cursor,
+                "pid": pid,
+                "event_kinds": ["window.activate"],
+                "name_regex": "Phase2 Recipe",
+                "timeout_ms": 2000
+            }),
+        )
+        .expect("wait_for_os_event step");
+        assert_eq!(res.get("matched").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            res.get("event").and_then(|e| e.get("pid")).and_then(Value::as_u64),
+            Some(u64::from(pid))
+        );
+    }
+
+    #[test]
+    fn recipe_step_cdp_call_and_fallback_channel_validate_loopback() {
+        let recipe: AppRecipe = serde_json::from_value(json!({
+            "schema_version": 1,
+            "app_id": "test-app",
+            "app_version": "1",
+            "version_source": "dpkg",
+            "fingerprint_sha256": "test",
+            "state_machine": { "initial_state": "ready", "states": [], "transitions": [] }
+        }))
+        .expect("recipe");
+
+        let err = super::execute_recipe_step(
+            None,
+            &recipe,
+            None,
+            None,
+            "cdp_call",
+            &json!({
+                "ws_url": "ws://evil.example:9222/devtools/page/1",
+                "method": "Runtime.evaluate"
+            }),
+        )
+        .expect_err("non-loopback ws_url must fail");
+        assert!(err.to_string().contains("loopback") || err.to_string().contains("127.0.0.1"));
+
+        let inspection = crate::app_inspector::AppFlowInspection {
+            channel: "desktop_recipe".into(),
+            exempt_reason: None,
+            app_id: "test-app".into(),
+            app_version: "1".into(),
+            version_source: serde_json::from_value(json!("dpkg")).expect("version_source"),
+            tech_stack: "electron".into(),
+            fingerprint_sha256: "test".into(),
+            fp8: "testtest".into(),
+            executable_path: None,
+            wm_class: None,
+            window_title: None,
+            verified_shortcuts: Vec::new(),
+            menu_topology: Vec::new(),
+            interactive_elements_count: 0,
+            atspi_blind: false,
+            recommended_interaction: "atspi_semantic".into(),
+            remediation_hints: Vec::new(),
+            launch_isolation_hints: Vec::new(),
+            visual_hotspots: Vec::new(),
+            discovered_anchors: Vec::new(),
+            sample_roles: Vec::new(),
+            notes: Vec::new(),
+        };
+        let spec_atspi: CapabilitySpec =
+            serde_json::from_value(json!({ "data_channel": "atspi" })).expect("spec");
+        let err_atspi = super::execute_fallback_channel(
+            None,
+            &recipe,
+            &inspection,
+            None,
+            None,
+            DataChannel::Atspi,
+            &spec_atspi,
+        )
+        .expect_err("Atspi channel without pid fails with missing target, not unsupported stub");
+        assert!(!err_atspi.to_string().contains("requires a named flow"));
+    }
+
+    #[test]
+    fn elevated_step_actions_and_cdp_channel_are_blocked_under_read_only_gate() {
+        let recipe: AppRecipe = serde_json::from_value(json!({
+            "schema_version": 1,
+            "app_id": "test-app",
+            "app_version": "seeded",
+            "version_source": "dpkg",
+            "fingerprint_sha256": "seeded",
+            "state_machine": { "initial_state": "ready", "states": [], "transitions": [] }
+        }))
+        .expect("recipe");
+
+        for action in ["cdp_call", "atspi_click", "atspi_set_value", "interact_popup"] {
+            assert_eq!(
+                super::default_step_safety_level(action),
+                SafetyLevel::AuthOnly,
+                "{action} default safety level must be AuthOnly"
+            );
+            // Explicit read_only in JSON must NOT downgrade the action floor.
+            let downgraded_step: RecipeStep = serde_json::from_value(json!({
+                "action": action,
+                "safety_level": "read_only",
+                "args": {}
+            }))
+            .expect("step");
+            assert_eq!(
+                effective_step_safety_level(&downgraded_step),
+                SafetyLevel::AuthOnly,
+                "{action} must not downgrade below AuthOnly"
+            );
+            let blocked = check_safety_gate(
+                &recipe,
+                Some("test_flow"),
+                std::slice::from_ref(&downgraded_step),
+                SafetyLevel::ReadOnly,
+                SafetyLevel::ReadOnly,
+            )
+            .expect_err("ReadOnly gate must block elevated action");
+            assert_eq!(
+                blocked.structured_content.as_ref().unwrap()["code"],
+                "safety_gate_blocked"
+            );
+            assert!(
+                check_safety_gate(
+                    &recipe,
+                    Some("test_flow"),
+                    &[downgraded_step],
+                    SafetyLevel::ReadOnly,
+                    SafetyLevel::AuthOnly,
+                )
+                .is_ok(),
+                "{action} must pass under AuthOnly gate"
+            );
+        }
+
+        let cdp_spec: CapabilitySpec = serde_json::from_value(json!({
+            "data_channel": "cdp",
+            "safety_level": "read_only"
+        }))
+        .expect("cdp spec");
+        assert_eq!(
+            super::effective_capability_safety_level(&cdp_spec),
+            SafetyLevel::AuthOnly
+        );
+    }
+
+    #[tokio::test]
+    async fn run_app_recipe_state_machine_enforces_safety_gate_on_transitions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recipe_path = dir.path().join("sm_cdp.json");
+        let recipe = json!({
+            "schema_version": 1,
+            "app_id": "google-chrome",
+            "app_version": "seeded",
+            "version_source": "dpkg",
+            "fingerprint_sha256": "seeded",
+            "safety_policy": {
+                "default_max_level": "read_only",
+                "blocked_shortcuts": ["ctrl+q"],
+                "blocked_flows": []
+            },
+            "state_machine": {
+                "initial_state": "ready",
+                "states": [{ "id": "ready" }, { "id": "done" }],
+                "transitions": [{
+                    "from_state": "ready",
+                    "to_state": "done",
+                    "action": "cdp_call",
+                    "args": {
+                        "ws_url": "ws://127.0.0.1:9222/devtools/browser/blocked",
+                        "method": "Runtime.evaluate"
+                    }
+                }]
+            }
+        });
+        std::fs::write(&recipe_path, recipe.to_string()).expect("write recipe");
+
+        let res = RunAppRecipeTool
+            .invoke(json!({
+                "app_id": "google-chrome",
+                "recipe_path": recipe_path.display().to_string(),
+                "app_path": "/opt/google/chrome/chrome",
+                "allow_safety_level": "read_only"
+            }))
+            .await;
+        assert_eq!(res.is_error, Some(true));
+        assert_eq!(
+            res.structured_content
+                .as_ref()
+                .and_then(|v| v.get("code"))
+                .and_then(Value::as_str),
+            Some("safety_gate_blocked"),
+            "state machine transition must be gated: {res:?}"
+        );
+
+        let shortcut_recipe_path = dir.path().join("sm_shortcut.json");
+        let shortcut_recipe = json!({
+            "schema_version": 1,
+            "app_id": "google-chrome",
+            "app_version": "seeded",
+            "version_source": "dpkg",
+            "fingerprint_sha256": "seeded",
+            "safety_policy": {
+                "default_max_level": "read_only",
+                "blocked_shortcuts": ["ctrl+q"],
+                "blocked_flows": []
+            },
+            "state_machine": {
+                "initial_state": "ready",
+                "states": [{ "id": "ready" }, { "id": "done" }],
+                "transitions": [{
+                    "from_state": "ready",
+                    "to_state": "done",
+                    "action": "hotkey",
+                    "args": { "keys": ["ctrl", "q"] }
+                }]
+            }
+        });
+        std::fs::write(&shortcut_recipe_path, shortcut_recipe.to_string()).expect("write recipe");
+        let res_shortcut = RunAppRecipeTool
+            .invoke(json!({
+                "app_id": "google-chrome",
+                "recipe_path": shortcut_recipe_path.display().to_string(),
+                "app_path": "/opt/google/chrome/chrome",
+                "allow_safety_level": "restricted"
+            }))
+            .await;
+        assert_eq!(res_shortcut.is_error, Some(true));
+        assert_eq!(
+            res_shortcut
+                .structured_content
+                .as_ref()
+                .and_then(|v| v.get("code"))
+                .and_then(Value::as_str),
+            Some("safety_gate_blocked")
+        );
+    }
+
+    #[test]
+    fn consumer_browser_cdp_policy_enforces_existing_profile_grant_and_method_restrictions() {
+        for product in [
+            super::BrowserProduct::GoogleChrome,
+            super::BrowserProduct::Chromium,
+            super::BrowserProduct::MicrosoftEdge,
+            super::BrowserProduct::Brave,
+            super::BrowserProduct::Vivaldi,
+            super::BrowserProduct::Opera,
+            super::BrowserProduct::Arc,
+        ] {
+            let err = super::evaluate_cdp_target_policy(
+                4242,
+                Some(7),
+                product,
+                false,
+                super::PermissionMode::Standard,
+                false,
+                None,
+            )
+            .expect_err("consumer browser without --grant existing-profile must be refused");
+            assert!(err.to_string().contains("--grant existing-profile"));
+
+            let bounded_err = super::evaluate_cdp_target_policy(
+                4242,
+                Some(7),
+                product,
+                false,
+                super::PermissionMode::Bounded,
+                false,
+                None,
+            )
+            .expect_err("consumer browser in bounded mode without manifest must be refused");
+            assert!(bounded_err.to_string().contains("manifest"));
+
+            let policy = super::evaluate_cdp_target_policy(
+                4242,
+                Some(7),
+                product,
+                false,
+                super::PermissionMode::Standard,
+                true,
+                None,
+            )
+            .expect("consumer browser with --grant existing-profile must succeed");
+            assert_eq!(policy, super::CdpMethodPolicy::ExistingProfile);
+
+            let unres = super::evaluate_cdp_target_policy(
+                4242,
+                Some(7),
+                product,
+                false,
+                super::PermissionMode::Unrestricted,
+                false,
+                None,
+            )
+            .expect("consumer browser in unrestricted mode still enforces ExistingProfile policy");
+            assert_eq!(unres, super::CdpMethodPolicy::ExistingProfile);
+        }
+
+        // Embedded Electron/CEF/JxBrowser targets do not trigger existing_profile gate.
+        assert_eq!(
+            super::evaluate_cdp_target_policy(
+                5555,
+                None,
+                super::BrowserProduct::Electron,
+                true,
+                super::PermissionMode::Standard,
+                false,
+                None,
+            )
+            .unwrap(),
+            super::CdpMethodPolicy::Unrestricted
+        );
+        assert_eq!(
+            super::evaluate_cdp_target_policy(
+                5556,
+                None,
+                super::BrowserProduct::Other,
+                false,
+                super::PermissionMode::Standard,
+                false,
+                None,
+            )
+            .unwrap(),
+            super::CdpMethodPolicy::Unrestricted
+        );
+        assert!(
+            super::evaluate_cdp_target_policy(
+                5557,
+                None,
+                super::BrowserProduct::Firefox,
+                false,
+                super::PermissionMode::Standard,
+                true,
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    fn sha1_digest(data: &[u8]) -> [u8; 20] {
+        let mut msg = data.to_vec();
+        let bit_len = (data.len() as u64) * 8;
+        msg.push(0x80);
+        while (msg.len() % 64) != 56 {
+            msg.push(0);
+        }
+        msg.extend_from_slice(&bit_len.to_be_bytes());
+        let mut h: [u32; 5] = [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476, 0xc3d2_e1f0];
+        for chunk in msg.chunks_exact(64) {
+            let mut w = [0u32; 80];
+            for (i, word) in chunk.chunks_exact(4).enumerate() {
+                w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+            }
+            for i in 16..80 {
+                w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+            }
+            let [mut a, mut b, mut c, mut d, mut e] = h;
+            for (i, &wi) in w.iter().enumerate() {
+                let (f, k) = match i {
+                    0..=19 => ((b & c) | ((!b) & d), 0x5a82_7999u32),
+                    20..=39 => (b ^ c ^ d, 0x6ed9_eba1u32),
+                    40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1b_bcdcu32),
+                    _ => (b ^ c ^ d, 0xca62_c1d6u32),
+                };
+                let temp = a
+                    .rotate_left(5)
+                    .wrapping_add(f)
+                    .wrapping_add(e)
+                    .wrapping_add(k)
+                    .wrapping_add(wi);
+                e = d;
+                d = c;
+                c = b.rotate_left(30);
+                b = a;
+                a = temp;
+            }
+            h[0] = h[0].wrapping_add(a);
+            h[1] = h[1].wrapping_add(b);
+            h[2] = h[2].wrapping_add(c);
+            h[3] = h[3].wrapping_add(d);
+            h[4] = h[4].wrapping_add(e);
+        }
+        let mut out = [0u8; 20];
+        for (i, word) in h.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        out
+    }
+
+    async fn spawn_mock_cdp_ws_server() -> (u16, String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock cdp listener");
+        let port = listener.local_addr().expect("local_addr").port();
+        let ws_url = format!("ws://127.0.0.1:{port}/devtools/browser/secret-token-xyz");
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    loop {
+                        let Ok(n) = sock.read(&mut tmp).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let req = String::from_utf8_lossy(&buf);
+                    let key = req
+                        .lines()
+                        .find_map(|line| {
+                            let (k, v) = line.split_once(':')?;
+                            k.trim().eq_ignore_ascii_case("sec-websocket-key").then(|| v.trim())
+                        })
+                        .unwrap_or("");
+                    let accept_raw = format!("{key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+                    let accept = B64.encode(sha1_digest(accept_raw.as_bytes()));
+                    let resp = format!(
+                        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+                    );
+                    if sock.write_all(resp.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    loop {
+                        let mut hdr = [0u8; 2];
+                        if sock.read_exact(&mut hdr).await.is_err() {
+                            return;
+                        }
+                        let opcode = hdr[0] & 0x0f;
+                        let masked = (hdr[1] & 0x80) != 0;
+                        let mut len = (hdr[1] & 0x7f) as usize;
+                        if len == 126 {
+                            let mut ext = [0u8; 2];
+                            if sock.read_exact(&mut ext).await.is_err() {
+                                return;
+                            }
+                            len = u16::from_be_bytes(ext) as usize;
+                        }
+                        let mut mask = [0u8; 4];
+                        if masked && sock.read_exact(&mut mask).await.is_err() {
+                            return;
+                        }
+                        let mut payload = vec![0u8; len];
+                        if sock.read_exact(&mut payload).await.is_err() {
+                            return;
+                        }
+                        if masked {
+                            for (i, b) in payload.iter_mut().enumerate() {
+                                *b ^= mask[i % 4];
+                            }
+                        }
+                        if opcode == 0x8 {
+                            return;
+                        }
+                        if opcode == 0x9 {
+                            // Pong
+                            let mut pong = vec![0x8a, payload.len() as u8];
+                            pong.extend_from_slice(&payload);
+                            let _ = sock.write_all(&pong).await;
+                            continue;
+                        }
+                        let Ok(req_val) = serde_json::from_slice::<Value>(&payload) else {
+                            continue;
+                        };
+                        let id = req_val.get("id").cloned().unwrap_or(json!(1));
+                        let method = req_val.get("method").and_then(Value::as_str).unwrap_or("");
+                        let result = match method {
+                            "Target.getTargets" => json!({
+                                "targetInfos": [{
+                                    "targetId": "page-1",
+                                    "type": "page",
+                                    "url": "https://example.test",
+                                    "title": "Example"
+                                }]
+                            }),
+                            "Target.attachToTarget" => json!({ "sessionId": "sid-1" }),
+                            "Runtime.evaluate" => json!({ "result": { "type": "string", "value": "ok" } }),
+                            _ => json!({}),
+                        };
+                        let reply = json!({ "id": id, "result": result }).to_string();
+                        let bytes = reply.as_bytes();
+                        let mut frame = Vec::with_capacity(4 + bytes.len());
+                        frame.push(0x81);
+                        if bytes.len() < 126 {
+                            frame.push(bytes.len() as u8);
+                        } else {
+                            frame.push(126);
+                            frame.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+                        }
+                        frame.extend_from_slice(bytes);
+                        if sock.write_all(&frame).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (port, ws_url, handle)
+    }
+
+    #[tokio::test]
+    async fn cdp_call_and_channel_redact_ws_url_and_enforce_port_ownership() {
+        let (port, ws_url, server_task) = spawn_mock_cdp_ws_server().await;
+
+        let res = super::execute_cdp_call_async(
+            None,
+            None,
+            &json!({
+                "ws_url": ws_url,
+                "method": "Runtime.evaluate",
+                "params": { "expression": "'ok'" }
+            }),
+            None,
+        )
+        .await
+        .expect("cdp_call against owned mock server");
+
+        let serialized = res.to_string();
+        assert!(!serialized.contains(&ws_url), "must not leak raw ws_url: {serialized}");
+        assert!(
+            !serialized.contains("secret-token-xyz"),
+            "must not leak raw ws token: {serialized}"
+        );
+        assert!(!serialized.contains("ws://"), "must not leak ws:// URL: {serialized}");
+        assert_eq!(
+            res["endpoint"].as_str(),
+            Some(format!("cdp-loopback://127.0.0.1:{port}/[redacted]").as_str())
+        );
+        let summary = format_artifacts_summary(&[res["artifact"].clone()]);
+        assert!(!summary.contains("secret-token-xyz"));
+        assert!(!summary.contains("ws://"));
+
+        // execute_cdp_channel also redacts ws_url.
+        let cdp_spec: CapabilitySpec = serde_json::from_value(json!({
+            "data_channel": "cdp",
+            "safety_level": "auth_only",
+            "artifact_path": ws_url
+        }))
+        .expect("spec");
+        let ch_res = tokio::task::spawn_blocking(move || {
+            super::execute_cdp_channel(None, None, &cdp_spec, None)
+        })
+        .await
+        .unwrap()
+        .expect("execute_cdp_channel");
+        let ch_serialized = ch_res.to_string();
+        assert!(!ch_serialized.contains("secret-token-xyz"));
+        assert!(!ch_serialized.contains("ws://"));
+        assert_eq!(
+            ch_res["endpoint"].as_str(),
+            Some(format!("cdp-loopback://127.0.0.1:{port}/[redacted]").as_str())
+        );
+
+        // System PID 1 (init/systemd) must never be used to bypass process-tree ownership checks.
+        let pid1_err = super::execute_cdp_call_async(
+            Some(1),
+            None,
+            &json!({
+                "ws_url": ws_url,
+                "method": "Runtime.evaluate"
+            }),
+            None,
+        )
+        .await
+        .expect_err("system pid 1 must be rejected");
+        assert!(pid1_err.to_string().contains("system pid"));
+
+        // Passing another unrelated PID that does not own the loopback port must be refused.
+        let mut unrelated_child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn unrelated child");
+        let mismatch_err = super::execute_cdp_call_async(
+            Some(unrelated_child.id()),
+            None,
+            &json!({
+                "ws_url": ws_url,
+                "method": "Runtime.evaluate"
+            }),
+            None,
+        )
+        .await
+        .expect_err("port owned by another process must be rejected");
+        let _ = unrelated_child.kill();
+        let _ = unrelated_child.wait();
+        assert!(
+            mismatch_err.to_string().contains("not owned"),
+            "unexpected error: {mismatch_err}"
+        );
+
+        // Passing an unowned/non-listening port without PID must fail closed.
+        let unowned_err = super::execute_cdp_call_async(
+            None,
+            None,
+            &json!({
+                "ws_url": "ws://127.0.0.1:1/devtools/browser/unowned-secret",
+                "method": "Runtime.evaluate"
+            }),
+            None,
+        )
+        .await
+        .expect_err("unowned loopback port must fail closed");
+        assert!(unowned_err.to_string().contains("verify target process permission"));
+
+        // @ userinfo spoofing is rejected.
+        let spoof_err = super::execute_cdp_call_async(
+            None,
+            None,
+            &json!({
+                "ws_url": "ws://127.0.0.1:9222@evil.com/devtools/browser/1",
+                "method": "Runtime.evaluate"
+            }),
+            None,
+        )
+        .await
+        .expect_err("@ userinfo spoof must fail");
+        assert!(spoof_err.to_string().contains("userinfo"));
+
+        // probe_webview_targets step rejects path traversal config_path.
+        let recipe: AppRecipe = serde_json::from_value(json!({
+            "schema_version": 1,
+            "app_id": "test-app",
+            "app_version": "seeded",
+            "version_source": "dpkg",
+            "fingerprint_sha256": "seeded",
+            "state_machine": { "initial_state": "ready", "states": [], "transitions": [] }
+        }))
+        .expect("recipe");
+        let traversal_err = super::execute_recipe_step(
+            None,
+            &recipe,
+            None,
+            Some(std::process::id()),
+            "probe_webview_targets",
+            &json!({ "config_path": "../../etc/passwd" }),
+        )
+        .expect_err("config_path traversal in recipe step must fail");
+        assert!(traversal_err.to_string().contains(".."));
+
+        // Applying CdpMethodPolicy::ExistingProfile on a live connection blocks non-allowlisted methods.
+        let restricted_conn = super::CdpConnection::connect(&ws_url).await.unwrap();
+        restricted_conn.restrict_to_existing_profile();
+        assert!(restricted_conn.call(None, "Target.getTargets", json!({})).await.is_ok());
+        assert!(restricted_conn.call(None, "Network.enable", json!({})).await.is_err());
+        assert!(restricted_conn.call(None, "Browser.close", json!({})).await.is_err());
+
+        // redact_ws_url strips both full ws_url and secret token path from errors.
+        let redacted = super::redacted_loopback_ws_endpoint(&ws_url);
+        let sanitized = super::redact_ws_url(
+            &format!("CDP connect to {ws_url} failed (/devtools/browser/secret-token-xyz)"),
+            &ws_url,
+            &redacted,
+        );
+        assert!(!sanitized.contains("secret-token-xyz"));
+        assert!(!sanitized.contains("ws://"));
+
+        server_task.abort();
     }
 }

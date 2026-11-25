@@ -832,6 +832,20 @@ pub fn window_is_viewable(xid: u64) -> bool {
     window_info(xid).is_some_and(|w| w.is_on_screen)
 }
 
+/// True when `xid` is a valid X11 window with `override_redirect` set (menus, popups, dropdowns).
+pub(crate) fn window_is_override_redirect(xid: u64) -> bool {
+    let Ok(window) = u32::try_from(xid) else {
+        return false;
+    };
+    let Ok((conn, _)) = RustConnection::connect(None) else {
+        return false;
+    };
+    conn.get_window_attributes(window)
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .is_some_and(|attrs| attrs.override_redirect)
+}
+
 /// `_NET_WM_PID` of a window, when it advertises one.
 ///
 /// Deliberately property-only: input paths walk this up through child and

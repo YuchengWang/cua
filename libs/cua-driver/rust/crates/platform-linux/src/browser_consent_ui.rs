@@ -11,6 +11,10 @@ use cua_driver_core::browser::{
 };
 
 use crate::atspi::AtspiNode;
+use crate::dialog_matcher::{
+    exact_button_center, has_nonempty_accessible_text, is_descendant_of, role_is,
+    trusted_prompt_nodes,
+};
 use crate::interaction::{session_policy, with_target_foreground};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -20,70 +24,6 @@ struct ConsentButtonCandidate {
     rect: (i32, i32, i32, i32),
     focused: bool,
     depth: usize,
-}
-
-fn role_is(node: &AtspiNode, accepted: &[&str]) -> bool {
-    let role = node.role.trim().to_ascii_lowercase();
-    accepted.iter().any(|candidate| role == *candidate)
-}
-
-fn is_in_web_content(nodes: &[AtspiNode], node: &AtspiNode) -> bool {
-    let mut parent = node.parent_element_index;
-    for _ in 0..nodes.len() {
-        let Some(parent_index) = parent else {
-            return false;
-        };
-        let Some(parent_node) = nodes
-            .iter()
-            .find(|candidate| candidate.element_index == Some(parent_index))
-        else {
-            return false;
-        };
-        if role_is(parent_node, &["document web", "document frame", "document"]) {
-            return true;
-        }
-        parent = parent_node.parent_element_index;
-    }
-    true
-}
-
-fn trusted_prompt_nodes(nodes: &[AtspiNode]) -> impl DoubleEndedIterator<Item = &AtspiNode> {
-    nodes.iter().filter(|node| {
-        !node.in_web_content
-            && !role_is(node, &["document web", "document frame", "document"])
-            && !is_in_web_content(nodes, node)
-    })
-}
-
-fn has_nonempty_accessible_text(node: &AtspiNode) -> bool {
-    [
-        node.name.as_deref(),
-        node.value.as_deref(),
-        node.description.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .any(|value| !value.trim().is_empty())
-}
-
-fn is_descendant_of(nodes: &[AtspiNode], node: &AtspiNode, ancestor_index: usize) -> bool {
-    let mut parent = node.parent_element_index;
-    for _ in 0..nodes.len() {
-        let Some(parent_index) = parent else {
-            return false;
-        };
-        if parent_index == ancestor_index {
-            return true;
-        }
-        let Some(parent_node) = nodes
-            .iter()
-            .find(|candidate| candidate.element_index == Some(parent_index))
-        else {
-            return false;
-        };
-        parent = parent_node.parent_element_index;
-    }
-    false
 }
 
 fn exact_native_prompt_root(nodes: &[AtspiNode]) -> Result<Option<usize>, BrowserRefusal> {
@@ -349,23 +289,6 @@ fn prove_window_owner(pid: u32, window_id: u64) -> Result<(), BrowserRefusal> {
         ));
     }
     Ok(())
-}
-
-fn exact_button_center(
-    bounds: &[(usize, i32, i32, u32, u32)],
-    element_index: usize,
-) -> anyhow::Result<(i32, i32)> {
-    let (_, x, y, width, height) = bounds
-        .iter()
-        .find(|(index, _, _, width, height)| *index == element_index && *width > 1 && *height > 1)
-        .ok_or_else(|| anyhow::anyhow!("the exact Allow action had empty screen bounds"))?;
-    let center_x = x
-        .checked_add(i32::try_from(width / 2)?)
-        .ok_or_else(|| anyhow::anyhow!("Allow button center x overflowed"))?;
-    let center_y = y
-        .checked_add(i32::try_from(height / 2)?)
-        .ok_or_else(|| anyhow::anyhow!("Allow button center y overflowed"))?;
-    Ok((center_x, center_y))
 }
 
 fn trusted_allow_click(pid: u32, window_id: u64) -> anyhow::Result<()> {

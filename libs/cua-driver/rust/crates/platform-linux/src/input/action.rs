@@ -182,10 +182,12 @@ pub async fn spawn_blocking_bounded<T: Send + 'static>(
     let action = outer.clone().unwrap_or_else(|| Action::new(budget));
     let budget = budget.min(action.deadline.saturating_duration_since(Instant::now()));
     let _abandon = outer.is_none().then(|| action.abandon_on_drop());
+    let batch_fg = cua_driver_core::batch_foreground::current();
     let worker = {
         let action = action.clone();
         move || {
             let _bound = bind(action);
+            let _batch_bound = cua_driver_core::batch_foreground::bind_blocking(batch_fg);
             f()
         }
     };

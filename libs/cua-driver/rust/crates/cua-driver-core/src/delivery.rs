@@ -69,6 +69,53 @@ impl DeliveryMode {
     }
 }
 
+/// Focus-management policy for desktop/popup actions and dialog matchers.
+///
+/// - `Default`: standard delivery / `FocusGuard` / foreground activation.
+/// - `PreserveHost` (`"preserve_host"`, alias `"no_activate"`): bypass
+///   `_NET_ACTIVE_WINDOW` activation, `FocusGuard` focus restoration, and
+///   `Component.GrabFocus` so override-redirect popups (menus, Chrome
+///   Autofill dropdowns) stay open and the host window keeps its focus.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FocusPolicy {
+    #[default]
+    Default,
+    #[serde(alias = "no_activate")]
+    PreserveHost,
+}
+
+impl FocusPolicy {
+    pub fn parse(arg: Option<&str>) -> Result<Self, String> {
+        match arg.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("") | Some("default") => Ok(Self::Default),
+            Some("preserve_host" | "no_activate") => Ok(Self::PreserveHost),
+            Some(other) => Err(format!(
+                "invalid focus_policy '{other}'; expected \"default\", \"preserve_host\", or \"no_activate\""
+            )),
+        }
+    }
+
+    pub fn from_args(args: &Value) -> Result<Self, String> {
+        match args.get("focus_policy") {
+            None | Some(Value::Null) => Ok(Self::Default),
+            Some(Value::String(s)) => Self::parse(Some(s.as_str())),
+            Some(_) => Err("focus_policy must be a string (\"default\" or \"preserve_host\")".into()),
+        }
+    }
+
+    pub const fn is_preserve_host(self) -> bool {
+        matches!(self, Self::PreserveHost)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::PreserveHost => "preserve_host",
+        }
+    }
+}
+
 /// Environment variable an operator sets when starting the daemon to allow a
 /// brief foreground step (trycua/cua#5478). Off by default.
 pub const BRIEF_FOREGROUND_ENV: &str = "CUA_DRIVER_ALLOW_BRIEF_FOREGROUND";
@@ -280,5 +327,28 @@ mod tests {
             }
             _ => panic!("expected text content"),
         }
+    }
+
+    #[test]
+    fn focus_policy_parses_default_preserve_host_and_no_activate_alias() {
+        assert_eq!(super::FocusPolicy::parse(None).unwrap(), super::FocusPolicy::Default);
+        assert_eq!(
+            super::FocusPolicy::parse(Some("default")).unwrap(),
+            super::FocusPolicy::Default
+        );
+        assert_eq!(
+            super::FocusPolicy::parse(Some("preserve_host")).unwrap(),
+            super::FocusPolicy::PreserveHost
+        );
+        assert_eq!(
+            super::FocusPolicy::parse(Some("no_activate")).unwrap(),
+            super::FocusPolicy::PreserveHost
+        );
+        assert!(super::FocusPolicy::parse(Some("steal_all")).is_err());
+        assert!(
+            super::FocusPolicy::from_args(&json!({"focus_policy": "preserve_host"}))
+                .unwrap()
+                .is_preserve_host()
+        );
     }
 }

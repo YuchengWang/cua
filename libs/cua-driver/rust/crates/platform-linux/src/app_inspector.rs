@@ -321,6 +321,32 @@ pub fn inspect_app_flow(req: InspectAppFlowRequest) -> Result<AppFlowInspection>
         "atspi_semantic".to_owned()
     };
 
+    if let Some(live_pid) = pid {
+        if let Some(wv) = crate::webview_probe::detect_webview_summary(live_pid) {
+            if !wv.engines.is_empty() {
+                notes.push(format!(
+                    "Detected WebView stack(s) {:?}; run probe_webview_targets(pid={live_pid}) for live CDP/Inspector targets.",
+                    wv.engines
+                ));
+            }
+            if !wv.listening_ports.is_empty() {
+                notes.push(format!(
+                    "Detected WebView debug port(s) {:?} on pid {live_pid}.",
+                    wv.listening_ports
+                ));
+            }
+            if !wv.unix_sockets.is_empty() {
+                notes.push(format!(
+                    "Detected WebView Inspector Unix socket(s): {:?}.",
+                    wv.unix_sockets
+                ));
+            }
+            for h in wv.hints {
+                remediation_hints.push(h);
+            }
+        }
+    }
+
     let visual_hotspots = if atspi_blind {
         extract_visual_hotspots(req.window_id, pid, req.display_id.as_deref())
     } else {

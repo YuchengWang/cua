@@ -228,6 +228,51 @@ async fn shared_connection() -> Result<&'static AccessibilityConnection> {
             {
                 dlog!("AT-SPI active-descendant subscription failed: {error}");
             }
+            if let Err(error) = conn
+                .register_event::<atspi::events::object::ChildrenChangedEvent>()
+                .await
+            {
+                dlog!("AT-SPI children-changed subscription failed: {error}");
+            }
+            if let Err(error) = conn
+                .register_event::<atspi::events::window::CreateEvent>()
+                .await
+            {
+                dlog!("AT-SPI window:create subscription failed: {error}");
+            }
+            if let Err(error) = conn
+                .register_event::<atspi::events::window::ActivateEvent>()
+                .await
+            {
+                dlog!("AT-SPI window:activate subscription failed: {error}");
+            }
+            if let Err(error) = conn
+                .register_event::<atspi::events::window::DestroyEvent>()
+                .await
+            {
+                dlog!("AT-SPI window:destroy subscription failed: {error}");
+            }
+            if let Err(error) = conn
+                .register_event::<atspi::events::document::LoadCompleteEvent>()
+                .await
+            {
+                dlog!("AT-SPI document:load-complete subscription failed: {error}");
+            }
+            if let Err(error) = conn
+                .add_registry_event::<atspi::events::document::ReloadEvent>()
+                .await
+            {
+                dlog!("AT-SPI document:reload registry subscription failed: {error}");
+            }
+            if let Ok(dbus) = atspi::zbus::fdo::DBusProxy::new(conn.connection()).await {
+                if let Ok(rule) = atspi::zbus::MatchRule::try_from(
+                    "type='signal',interface='org.a11y.atspi.Event.Document',member='Reload'",
+                ) {
+                    if let Err(error) = dbus.add_match_rule(rule).await {
+                        dlog!("AT-SPI document:reload match rule failed: {error}");
+                    }
+                }
+            }
             Ok(conn)
         })
         .await
@@ -312,35 +357,227 @@ fn note_focus_event(bus: &str, path: &str, enabled: bool) {
     }
 }
 
+struct OsEventEnrichJob {
+    seq: u64,
+    bus_name: String,
+    object_path: String,
+    query_accessible: bool,
+}
+
+fn spawn_os_event_enricher(
+    conn: &'static AccessibilityConnection,
+    mut rx: tokio::sync::mpsc::Receiver<OsEventEnrichJob>,
+) {
+    runtime().spawn(async move {
+        let bus = crate::os_events::global_os_event_bus();
+        let dbus = atspi::zbus::fdo::DBusProxy::new(conn.connection()).await.ok();
+        while let Some(job) = rx.recv().await {
+            let pid = match bus.cached_bus_pid(&job.bus_name) {
+                Some(cached) => cached,
+                None => {
+                    let resolved = if let Some(ref dbus_proxy) = dbus {
+                        if let Ok(bus_name) =
+                            atspi::zbus::names::BusName::try_from(job.bus_name.as_str())
+                        {
+                            tokio::time::timeout(
+                                Duration::from_millis(100),
+                                dbus_proxy.get_connection_unix_process_id(bus_name),
+                            )
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    bus.record_bus_pid(&job.bus_name, resolved);
+                    resolved
+                }
+            };
+
+            let (mut role, mut name) = (None, None);
+            if job.query_accessible && !job.object_path.is_empty() {
+                let oref = RawObjectRef {
+                    name: job.bus_name.clone(),
+                    path: job.object_path.clone(),
+                };
+                if let Ok(acc) = accessible_via_bus(conn, &oref).await {
+                    if let Ok(Ok(r)) =
+                        tokio::time::timeout(Duration::from_millis(100), acc.get_role_name()).await
+                    {
+                        let trimmed = r.trim().to_owned();
+                        if !trimmed.is_empty() {
+                            role = Some(trimmed);
+                        }
+                    }
+                    if let Ok(Ok(n)) =
+                        tokio::time::timeout(Duration::from_millis(100), acc.name()).await
+                    {
+                        let trimmed = n.trim().to_owned();
+                        if !trimmed.is_empty() {
+                            name = Some(trimmed);
+                        }
+                    }
+                }
+            }
+            bus.patch_event_metadata(job.seq, pid, role, name);
+        }
+    });
+}
+
+fn push_atspi_os_event(
+    enrich_tx: &tokio::sync::mpsc::Sender<OsEventEnrichJob>,
+    kind: &str,
+    bus_name: Option<&str>,
+    object_path: Option<&str>,
+    showing: Option<bool>,
+    detail: Option<serde_json::Value>,
+    query_accessible: bool,
+) {
+    let bus_owned = bus_name.map(str::to_owned);
+    let path_owned = object_path.map(str::to_owned);
+    let seq = crate::os_events::global_os_event_bus().push(crate::os_events::OsEventDraft {
+        source: "atspi".into(),
+        kind: kind.into(),
+        bus_name: bus_owned.clone(),
+        object_path: path_owned.clone(),
+        showing,
+        detail,
+        ..Default::default()
+    });
+    if let (Some(bus), Some(path)) = (bus_owned, path_owned) {
+        let _ = enrich_tx.try_send(OsEventEnrichJob {
+            seq,
+            bus_name: bus,
+            object_path: path,
+            query_accessible,
+        });
+    }
+}
+
 /// Consume the shared connection's event stream for the daemon lifetime,
-/// remembering the last focused accessible per application bus.
+/// remembering the last focused accessible per application bus and feeding
+/// the bounded OS event ring buffer.
 fn spawn_focus_tracker(conn: &'static AccessibilityConnection) {
+    let (enrich_tx, enrich_rx) = tokio::sync::mpsc::channel::<OsEventEnrichJob>(128);
+    spawn_os_event_enricher(conn, enrich_rx);
     runtime().spawn(async move {
         use futures_util::StreamExt;
         let stream = conn.event_stream();
         futures_util::pin_mut!(stream);
         while let Some(event) = stream.next().await {
-            if let Ok(atspi::Event::Object(atspi::ObjectEvents::ActiveDescendantChanged(active))) =
-                &event
-            {
-                if let Some(bus) = active.item.name_as_str() {
-                    active_descendant_map()
-                        .lock()
-                        .unwrap()
-                        .insert(bus.to_owned(), active.descendant.path_as_str().to_owned());
+            let Ok(event) = event else {
+                continue;
+            };
+            match event {
+                atspi::Event::Object(atspi::ObjectEvents::ActiveDescendantChanged(active)) => {
+                    if let Some(bus) = active.item.name_as_str() {
+                        active_descendant_map()
+                            .lock()
+                            .unwrap()
+                            .insert(bus.to_owned(), active.descendant.path_as_str().to_owned());
+                    }
                 }
-                continue;
+                atspi::Event::Object(atspi::ObjectEvents::StateChanged(changed)) => {
+                    if changed.state == State::Focused {
+                        if let Some(bus) = changed.item.name_as_str() {
+                            note_focus_event(bus, changed.item.path_as_str(), changed.enabled);
+                        }
+                    } else if changed.state == State::Showing {
+                        push_atspi_os_event(
+                            &enrich_tx,
+                            "object.state_changed.showing",
+                            changed.item.name_as_str(),
+                            Some(changed.item.path_as_str()),
+                            Some(changed.enabled),
+                            None,
+                            changed.enabled,
+                        );
+                    }
+                }
+                atspi::Event::Object(atspi::ObjectEvents::ChildrenChanged(changed)) => {
+                    let kind = match changed.operation {
+                        atspi::Operation::Insert => "object.children_changed.add",
+                        atspi::Operation::Delete => "object.children_changed.remove",
+                    };
+                    let detail = serde_json::json!({
+                        "index_in_parent": changed.index_in_parent,
+                        "child_path": changed.child.path_as_str(),
+                    });
+                    let target_bus = changed
+                        .child
+                        .name_as_str()
+                        .or_else(|| changed.item.name_as_str());
+                    let target_path = if changed.operation == atspi::Operation::Insert {
+                        changed.child.path_as_str()
+                    } else {
+                        changed.item.path_as_str()
+                    };
+                    push_atspi_os_event(
+                        &enrich_tx,
+                        kind,
+                        target_bus,
+                        Some(target_path),
+                        None,
+                        Some(detail),
+                        changed.operation == atspi::Operation::Insert,
+                    );
+                }
+                atspi::Event::Window(win_ev) => match win_ev {
+                    atspi::WindowEvents::Create(ev) => push_atspi_os_event(
+                        &enrich_tx,
+                        "window.create",
+                        ev.item.name_as_str(),
+                        Some(ev.item.path_as_str()),
+                        None,
+                        None,
+                        true,
+                    ),
+                    atspi::WindowEvents::Activate(ev) => push_atspi_os_event(
+                        &enrich_tx,
+                        "window.activate",
+                        ev.item.name_as_str(),
+                        Some(ev.item.path_as_str()),
+                        None,
+                        None,
+                        true,
+                    ),
+                    atspi::WindowEvents::Destroy(ev) => push_atspi_os_event(
+                        &enrich_tx,
+                        "window.destroy",
+                        ev.item.name_as_str(),
+                        Some(ev.item.path_as_str()),
+                        None,
+                        None,
+                        false,
+                    ),
+                    _ => {}
+                },
+                atspi::Event::Document(doc_ev) => match doc_ev {
+                    atspi::DocumentEvents::LoadComplete(ev) => push_atspi_os_event(
+                        &enrich_tx,
+                        "document.load_complete",
+                        ev.item.name_as_str(),
+                        Some(ev.item.path_as_str()),
+                        None,
+                        None,
+                        true,
+                    ),
+                    atspi::DocumentEvents::Reload(ev) => push_atspi_os_event(
+                        &enrich_tx,
+                        "document.reload",
+                        ev.item.name_as_str(),
+                        Some(ev.item.path_as_str()),
+                        None,
+                        None,
+                        true,
+                    ),
+                    _ => {}
+                },
+                _ => {}
             }
-            let Ok(atspi::Event::Object(atspi::ObjectEvents::StateChanged(changed))) = event else {
-                continue;
-            };
-            if changed.state != State::Focused {
-                continue;
-            }
-            let Some(bus) = changed.item.name_as_str() else {
-                continue;
-            };
-            note_focus_event(bus, changed.item.path_as_str(), changed.enabled);
         }
         dlog!("AT-SPI focus tracker stream ended");
     });
@@ -373,6 +610,7 @@ async fn focused_accessible_via_events<'a>(
 /// Establish the process-lifetime listener before accessibility-aware apps are
 /// launched. Idempotent; later calls reuse the same connection.
 pub fn ensure_listener_active() -> Result<()> {
+    crate::os_events::ensure_x11_popup_watcher();
     wait_for_listener_startup(LISTENER_STARTUP_TIMEOUT, || {
         runtime().block_on(async { shared_connection().await.map(|_| ()) })
     })
@@ -6528,6 +6766,12 @@ async fn commit_editable_write(proxies: &atspi::proxy::proxy_ext::Proxies<'_>) {
     }
 }
 
+fn parse_numeric_value(value: &str) -> Result<f64> {
+    value
+        .parse()
+        .map_err(|_| anyhow!("provided value (len={}) is not numeric for a Value element", value.len()))
+}
+
 /// The focus-free write shared by the index and cached-ref entry points.
 /// SetValue never calls Component.GrabFocus: GTK may activate and raise the
 /// toplevel in response, violating the background contract. Toolkits that
@@ -6565,9 +6809,7 @@ async fn set_value_on(
         }
     }
     if has_value {
-        let v: f64 = value
-            .parse()
-            .map_err(|_| anyhow!("value '{value}' is not numeric for a Value element"))?;
+        let v: f64 = parse_numeric_value(value)?;
         proxies
             .value()
             .await
@@ -10277,5 +10519,20 @@ mod skip_web_content_tests {
         assert!(!should_prune_web_subtree(true, false, "push button"));
         assert!(!should_prune_web_subtree(false, false, "document web"));
         assert!(!should_prune_web_subtree(false, true, "push button"));
+    }
+}
+
+#[cfg(test)]
+mod numeric_value_error_tests {
+    use super::parse_numeric_value;
+
+    #[test]
+    fn non_numeric_value_error_does_not_echo_plaintext() {
+        let secret = "s3cr3t-password-token";
+        let err = parse_numeric_value(secret).unwrap_err();
+        let msg = err.to_string();
+        assert!(!msg.contains(secret), "error must not echo plaintext value: {msg}");
+        assert!(msg.contains("not numeric for a Value element"));
+        assert_eq!(parse_numeric_value("42.5").unwrap(), 42.5);
     }
 }

@@ -45,11 +45,14 @@ use super::{
         AcquireAppDataTool, GenerateAppRecipeTool, InspectAppFlowTool, RunAppRecipeTool,
     },
     mcp_clipboard::{GetClipboardTool, SetClipboardTool, SyncClipboardTool},
+    mcp_dialog_matcher::MatchAndActDialogTool,
+    mcp_os_events::{PollOsEventsTool, WaitForOsEventTool},
     mcp_type_secret::{SudoInTerminalTool, TypeSecretFromEnvTool, TypeTotpFromEnvTool},
     mcp_virtual_screen::{
         CreateVirtualScreenTool, DestroyVirtualScreenTool, LaunchInVirtualScreenTool,
         ListVirtualScreensTool,
     },
+    mcp_webview_probe::ProbeWebviewTargetsTool,
     mouse_button_down::MouseButtonDownTool,
     mouse_button_up::MouseButtonUpTool,
     mouse_drag::MouseDragTool,
@@ -1984,7 +1987,7 @@ pub(crate) fn synthetic_pointer_is_dropped(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
-fn is_gtk_process(pid: u32) -> bool {
+pub(crate) fn is_gtk_process(pid: u32) -> bool {
     fs::read_to_string(format!("/proc/{pid}/maps"))
         .map(|maps| maps_indicate_gtk(&maps))
         .unwrap_or(false)
@@ -2248,6 +2251,8 @@ mod qt_shortcut_tests {
 pub(crate) enum KeyRoute {
     /// Activated the window and injected via XTest.
     Foreground(crate::input::ForegroundReport),
+    /// Direct delivery under `focus_policy = "preserve_host"` (skipped activation and FocusGuard).
+    PreserveHost,
     /// Real key events through the session's XI2 virtual master keyboard.
     Mpx(crate::input::KeyboardDeliveryReport),
     /// Legacy synthetic XSendEvent (core-only toolkits, Tk, xterm).
@@ -2322,14 +2327,34 @@ pub(crate) fn background_key_route(
     modifiers: &[&str],
     element: Option<&crate::atspi::TokenElement>,
 ) -> anyhow::Result<KeyRoute> {
+    background_key_route_with_policy(
+        cursor_id, pid, xid, px_target, key, modifiers, element, false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn background_key_route_with_policy(
+    cursor_id: &str,
+    pid: u32,
+    xid: u64,
+    px_target: Option<(i32, i32)>,
+    key: &str,
+    modifiers: &[&str],
+    element: Option<&crate::atspi::TokenElement>,
+    preserve_host: bool,
+) -> anyhow::Result<KeyRoute> {
     if crate::input::real_keyboard_input_available() {
-        // The element GrabFocus and the delivery run under one focus guard:
-        // GTK can raise/activate the toplevel for either, and the guard
-        // restores the user's focus and reports it (see `focus_guard`).
-        let delivered = crate::input::focus_guard::guarded(Some(pid), || {
-            grab_focus_for_background(pid, element)?;
-            background_virtual_key(cursor_id, pid, xid, key, modifiers)
-        });
+        // The element GrabFocus and the delivery run under one focus guard
+        // unless `preserve_host` is active (for override-redirect popups/menus,
+        // where FocusGuard or GrabFocus would dismiss the popup).
+        let delivered = if preserve_host {
+            background_virtual_key(cursor_id, pid, xid, key, modifiers).map(|r| (r, None))
+        } else {
+            crate::input::focus_guard::guarded(Some(pid), || {
+                grab_focus_for_background(pid, element)?;
+                background_virtual_key(cursor_id, pid, xid, key, modifiers)
+            })
+        };
         match delivered {
             Ok((mut report, guard)) => {
                 report.focus_guard = guard;
@@ -2353,12 +2378,14 @@ pub(crate) fn background_key_route(
             Err(error) => tracing::warn!("MPX keyboard fell back to XSendEvent: {error}"),
         }
     }
-    if let Some(element) = element {
-        if !crate::atspi::focus_token(pid, element)? {
-            anyhow::bail!(
-                "AT-SPI Component.GrabFocus returned false for element {}",
-                element.index
-            );
+    if !preserve_host {
+        if let Some(element) = element {
+            if !crate::atspi::focus_token(pid, element)? {
+                anyhow::bail!(
+                    "AT-SPI Component.GrabFocus returned false for element {}",
+                    element.index
+                );
+            }
         }
     }
     match px_target {
@@ -2511,6 +2538,15 @@ pub(crate) fn key_route_result(action: &str, route: KeyRoute, mode_label: &str) 
             ToolResult::text(format!("{action} (delivery_mode={mode_label})."))
                 .with_structured(json!({ "verified": false, "delivery_mode": mode_label }))
         }
+        KeyRoute::PreserveHost => ToolResult::text(format!(
+            "{action} with preserve_host (delivery_mode={mode_label}, no window activation/focus restore)."
+        ))
+        .with_structured(json!({
+            "verified": false,
+            "delivery_mode": mode_label,
+            "focus_policy": "preserve_host",
+            "effect": "unverifiable",
+        })),
     }
 }
 
@@ -2991,24 +3027,49 @@ pub(crate) fn x11_pixel_click_no_focus_steal(
     button: u8,
     count: usize,
 ) -> anyhow::Result<PointerRoute> {
+    x11_pixel_click_no_focus_steal_with_policy(cursor_id, xid, lx, ly, button, count, false)
+}
+
+pub(crate) fn x11_pixel_click_no_focus_steal_with_policy(
+    cursor_id: &str,
+    xid: u64,
+    lx: i32,
+    ly: i32,
+    button: u8,
+    count: usize,
+    preserve_host: bool,
+) -> anyhow::Result<PointerRoute> {
     if crate::input::real_pointer_input_available() {
         if let Ok((sx, sy)) = window_local_to_screen(xid, lx as f64, ly as f64) {
             // The press train has its own save/restore fast path; the focus
             // guard around it catches what the application does afterwards
-            // (a menu grab, a dialog it maps) and reports it.
+            // (a menu grab, a dialog it maps) and reports it. Under
+            // `preserve_host`, skip FocusGuard and focus restoration so
+            // override-redirect popups stay open.
             let target_pid = crate::x11::window_pid(xid);
-            let (outcome, guard) = crate::input::focus_guard::guarded_settled(target_pid, || {
-                Ok(crate::input::send_virtual_pointer_click(
-                    cursor_id,
-                    &crate::input::VirtualPointerClick {
-                        target_window: xid,
-                        x: sx.round() as i32,
-                        y: sy.round() as i32,
-                        button,
-                        count,
-                    },
-                ))
-            })?;
+            let click_req = crate::input::VirtualPointerClick {
+                target_window: xid,
+                x: sx.round() as i32,
+                y: sy.round() as i32,
+                button,
+                count,
+            };
+            let (outcome, guard) = if preserve_host {
+                (
+                    crate::input::send_virtual_pointer_click_with_policy(
+                        cursor_id,
+                        &click_req,
+                        true,
+                    ),
+                    None,
+                )
+            } else {
+                crate::input::focus_guard::guarded_settled(target_pid, || {
+                    Ok(crate::input::send_virtual_pointer_click(
+                        cursor_id, &click_req,
+                    ))
+                })?
+            };
             match outcome {
                 Ok(mut effect) => {
                     effect.focus_guard = guard;
@@ -4958,6 +5019,7 @@ pub(crate) async fn focus_by_pixel(
         "cursor_id",
         "scope",
         "coordinate_frame",
+        "focus_policy",
     ] {
         if let Some(value) = parent_args.get(field) {
             click_args[field] = value.clone();
@@ -5297,6 +5359,10 @@ pub fn build_registry_with_provider(
     r.register(Box::new(GenerateAppRecipeTool));
     r.register(Box::new(RunAppRecipeTool));
     r.register(Box::new(AcquireAppDataTool));
+    r.register(Box::new(PollOsEventsTool));
+    r.register(Box::new(WaitForOsEventTool));
+    r.register(Box::new(MatchAndActDialogTool));
+    r.register(Box::new(ProbeWebviewTargetsTool));
     r.register(Box::new(TypeSecretFromEnvTool));
     r.register(Box::new(TypeTotpFromEnvTool));
     r.register(Box::new(SudoInTerminalTool));

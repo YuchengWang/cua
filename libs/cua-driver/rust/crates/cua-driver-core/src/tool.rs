@@ -47,7 +47,7 @@ tokio::task_local! {
 /// Resource adapters use this instead of consulting process-global
 /// compatibility configuration. The value exists only while the canonical
 /// registry chokepoint is executing a tool, including nested dispatch.
-pub(crate) fn current_dispatch_authorization_context(
+pub fn current_dispatch_authorization_context(
 ) -> Option<Arc<crate::session_authorization::EffectiveAuthorizationContext>> {
     DISPATCH_AUTHORIZATION_CONTEXT.try_with(Arc::clone).ok()
 }
@@ -1043,6 +1043,10 @@ pub fn default_capabilities_for(tool_name: &str) -> Vec<String> {
         "run_app_recipe" => &["app.recipe.run"],
         "acquire_app_data" => &["app.data.acquire"],
         "resolve_auth_site" => &["auth.site.resolve"],
+        "poll_os_events" => &["os.events.poll"],
+        "wait_for_os_event" => &["os.events.wait"],
+        "match_and_act_dialog" => &["os.dialog.act"],
+        "probe_webview_targets" => &["webview.probe"],
         "kill_app" => &["app.kill"],
         "agent_display"
         | "create_virtual_screen"
@@ -7983,6 +7987,10 @@ mod capability_tests {
         "parse_visual_regions",
         "agent_display",
         "resolve_auth_site",
+        "poll_os_events",
+        "wait_for_os_event",
+        "match_and_act_dialog",
+        "probe_webview_targets",
     ];
 
     /// All capability tokens in the canonical vocabulary. Any token
@@ -8083,6 +8091,11 @@ mod capability_tests {
         "history.query",
         // auth site metadata discovery
         "auth.site.resolve",
+        // OS events, generic dialog matcher, and WebView probes
+        "os.events.poll",
+        "os.events.wait",
+        "os.dialog.act",
+        "webview.probe",
     ];
 
     #[test]

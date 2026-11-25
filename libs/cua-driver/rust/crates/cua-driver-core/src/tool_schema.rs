@@ -62,6 +62,20 @@ pub fn delivery_mode_schema() -> Value {
     )
 }
 
+/// `focus_policy` — controls whether `_NET_ACTIVE_WINDOW` / `FocusGuard`
+/// activation & focus restoration are skipped (`"preserve_host"` / `"no_activate"`).
+pub fn focus_policy_schema() -> Value {
+    json!({
+        "type": "string",
+        "enum": ["default", "preserve_host", "no_activate"],
+        "default": "default",
+        "description": "Focus policy. \"default\" uses standard FocusGuard/foreground \
+            activation. \"preserve_host\" (or \"no_activate\") bypasses _NET_ACTIVE_WINDOW \
+            activation and FocusGuard focus restoration so override-redirect popups \
+            (menus, Autofill dropdowns) keep host focus without dismissing."
+    })
+}
+
 /// `modifier` — held modifier keys for a pointer action.
 pub fn modifier_schema() -> Value {
     json!({
@@ -177,6 +191,7 @@ fn shared_param_canonical(name: &str) -> Option<Value> {
     let v = match name {
         "session" => session_schema(),
         "delivery_mode" => delivery_mode_schema(),
+        "focus_policy" => focus_policy_schema(),
         "modifier" => modifier_schema(),
         "button" => button_schema(),
         "scope" => scope_schema(),

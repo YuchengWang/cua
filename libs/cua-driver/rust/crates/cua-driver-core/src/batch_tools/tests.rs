@@ -910,3 +910,301 @@ async fn args_mixed_with_a_stray_field_is_still_refused() {
     );
     assert_eq!(harness.hits("press_key"), 0);
 }
+
+#[tokio::test]
+async fn batch_foreground_stays_open_across_steps_and_observe_and_finishes_last() {
+    use std::any::Any;
+
+    struct EventHandle(Arc<Mutex<Vec<String>>>);
+
+    impl crate::batch_foreground::BatchForegroundHandle for EventHandle {
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+
+        fn finish(self: Box<Self>) -> anyhow::Result<()> {
+            self.0.lock().unwrap().push("finish".into());
+            Ok(())
+        }
+    }
+
+    struct BatchTool {
+        def: ToolDef,
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl Tool for BatchTool {
+        fn def(&self) -> &ToolDef {
+            &self.def
+        }
+
+        async fn invoke(&self, _args: Value) -> ToolResult {
+            let ctx = crate::batch_foreground::current();
+            if self.def.name == "click" {
+                let ctx = ctx.expect("multi-step run_steps must bind BatchForegroundContext");
+                assert!(ctx.take_active().is_none());
+                ctx.store_or_finish(Box::new(EventHandle(self.events.clone())))
+                    .unwrap();
+                self.events.lock().unwrap().push("click:opened_batch".into());
+            } else if self.def.name == "press_key" {
+                let ctx = ctx.expect("batch context stays open on step 2");
+                let existing = ctx.take_active().expect("handle kept open from step 1");
+                ctx.store_or_finish(existing).unwrap();
+                self.events.lock().unwrap().push("press_key:reused_batch".into());
+            } else if self.def.name == "get_window_state" {
+                let ctx = ctx.expect("batch context stays open through observe");
+                let existing = ctx.take_active().expect("handle kept open before observe");
+                ctx.store_or_finish(existing).unwrap();
+                self.events.lock().unwrap().push("observe:saw_open_batch".into());
+            }
+            ToolResult::text(format!("{} ok", self.def.name))
+        }
+    }
+
+    let events = Arc::new(Mutex::new(Vec::<String>::new()));
+    let mut registry = ToolRegistry::new();
+    for name in ["click", "press_key", "get_window_state"] {
+        registry.register(Box::new(BatchTool {
+            def: ToolDef {
+                name: name.into(),
+                description: "batch probe".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "pid": {"type": "integer"},
+                        "window_id": {"type": "integer"},
+                        "x": {"type": "number"},
+                        "y": {"type": "number"},
+                        "key": {"type": "string"},
+                        "delivery_mode": {"type": "string"},
+                        "include_screenshot": {"type": "boolean"},
+                        "since": {"type": "string"},
+                        "max_elements": {"type": "integer"},
+                        "full_output": {"type": "boolean"}
+                    },
+                    "additionalProperties": false
+                }),
+                read_only: name == "get_window_state",
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            },
+            events: events.clone(),
+        }));
+    }
+    registry.register_session_tools();
+    let registry = Arc::new(registry);
+    registry.init_self_weak();
+
+    let result = registry
+        .invoke_with_context(
+            super::RUN_STEPS_TOOL,
+            json!({
+                "pid": 42,
+                "window_id": 9,
+                "delivery_mode": "foreground",
+                "delay_ms": 10,
+                "steps": [
+                    {"tool": "click", "args": {"x": 10, "y": 20}},
+                    {"tool": "press_key", "args": {"key": "down"}},
+                ],
+                "observe": {}
+            }),
+            context(None),
+        )
+        .await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![
+            "click:opened_batch",
+            "press_key:reused_batch",
+            "observe:saw_open_batch",
+            "finish",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn single_step_without_observe_or_expect_does_not_open_batch_foreground_scope() {
+    struct ScopeProbe(Arc<Mutex<Vec<bool>>>);
+
+    #[async_trait]
+    impl Tool for ScopeProbe {
+        fn def(&self) -> &ToolDef {
+            static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
+            DEF.get_or_init(|| ToolDef {
+                name: "click".into(),
+                description: "probe".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "pid": {"type": "integer"},
+                        "window_id": {"type": "integer"},
+                        "x": {"type": "number"},
+                        "y": {"type": "number"},
+                        "delivery_mode": {"type": "string"},
+                        "include_screenshot": {"type": "boolean"},
+                        "since": {"type": "string"},
+                        "max_elements": {"type": "integer"},
+                        "full_output": {"type": "boolean"}
+                    },
+                    "additionalProperties": false
+                }),
+                read_only: false,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            })
+        }
+
+        async fn invoke(&self, _args: Value) -> ToolResult {
+            self.0
+                .lock()
+                .unwrap()
+                .push(crate::batch_foreground::current().is_some());
+            ToolResult::text("ok")
+        }
+    }
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(ScopeProbe(seen.clone())));
+    registry.register(Box::new(Probe {
+        def: ToolDef {
+            name: "get_window_state".into(),
+            description: "gws".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "pid": {"type": "integer"},
+                    "window_id": {"type": "integer"},
+                    "include_screenshot": {"type": "boolean"},
+                    "since": {"type": "string"},
+                    "max_elements": {"type": "integer"},
+                    "full_output": {"type": "boolean"}
+                },
+                "additionalProperties": false
+            }),
+            read_only: true,
+            destructive: false,
+            idempotent: false,
+            open_world: false,
+        },
+        calls: Arc::default(),
+        pacings: Arc::default(),
+    }));
+    registry.register_session_tools();
+    let registry = Arc::new(registry);
+    registry.init_self_weak();
+
+    // Without observe/expect: single-step leaves BatchForegroundContext unset.
+    let res1 = registry
+        .invoke_with_context(
+            super::RUN_STEPS_TOOL,
+            json!({
+                "pid": 42,
+                "window_id": 9,
+                "delivery_mode": "foreground",
+                "steps": [{"tool": "click", "args": {"x": 10, "y": 20}}]
+            }),
+            context(None),
+        )
+        .await;
+    assert_ne!(res1.is_error, Some(true), "{}", text(&res1));
+
+    // With observe: single-step binds BatchForegroundContext so observe sees popup before restore.
+    let res2 = registry
+        .invoke_with_context(
+            super::RUN_STEPS_TOOL,
+            json!({
+                "pid": 42,
+                "window_id": 9,
+                "delivery_mode": "foreground",
+                "steps": [{"tool": "click", "args": {"x": 10, "y": 20}}],
+                "observe": {}
+            }),
+            context(None),
+        )
+        .await;
+    assert_ne!(res2.is_error, Some(true), "{}", text(&res2));
+
+    assert_eq!(*seen.lock().unwrap(), vec![false, true]);
+}
+
+#[tokio::test]
+async fn preserve_host_focus_policy_propagates_and_skips_batch_foreground() {
+    struct FocusProbe {
+        captured: Arc<Mutex<Vec<(Option<String>, bool)>>>,
+    }
+
+    #[async_trait]
+    impl Tool for FocusProbe {
+        fn def(&self) -> &ToolDef {
+            static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
+            DEF.get_or_init(|| ToolDef {
+                name: "click".into(),
+                description: "focus probe".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "pid": {"type": "integer"},
+                        "window_id": {"type": "integer"},
+                        "x": {"type": "number"},
+                        "y": {"type": "number"},
+                        "focus_policy": crate::tool_schema::focus_policy_schema(),
+                    },
+                    "additionalProperties": false
+                }),
+                read_only: false,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            })
+        }
+
+        async fn invoke(&self, args: Value) -> ToolResult {
+            self.captured.lock().unwrap().push((
+                args.get("focus_policy")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                crate::batch_foreground::current().is_some(),
+            ));
+            ToolResult::text("ok")
+        }
+    }
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(FocusProbe {
+        captured: captured.clone(),
+    }));
+    registry.register_session_tools();
+    let registry = Arc::new(registry);
+    registry.init_self_weak();
+
+    let res = registry
+        .invoke_with_context(
+            super::RUN_STEPS_TOOL,
+            json!({
+                "pid": 42,
+                "window_id": 9,
+                "focus_policy": "no_activate",
+                "steps": [
+                    {"tool": "click", "args": {"x": 10, "y": 20}},
+                    {"tool": "click", "args": {"x": 15, "y": 25}}
+                ]
+            }),
+            context(None),
+        )
+        .await;
+    assert_ne!(res.is_error, Some(true), "{}", text(&res));
+    assert_eq!(
+        *captured.lock().unwrap(),
+        vec![
+            (Some("preserve_host".to_owned()), false),
+            (Some("preserve_host".to_owned()), false),
+        ]
+    );
+}

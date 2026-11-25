@@ -3022,9 +3022,23 @@ pub fn send_virtual_pointer_click(
     cursor_id: &str,
     click: &VirtualPointerClick,
 ) -> Result<PointerEffect> {
+    send_virtual_pointer_click_with_policy(cursor_id, click, false)
+}
+
+/// [`send_virtual_pointer_click`] with explicit `preserve_host` control: when
+/// `preserve_host` is true (or `click.target_window` is `override_redirect`),
+/// host focus is left untouched (`restore_focus_state` is skipped) so open
+/// popups/dropdowns never dismiss on focus swap.
+pub fn send_virtual_pointer_click_with_policy(
+    cursor_id: &str,
+    click: &VirtualPointerClick,
+    preserve_host: bool,
+) -> Result<PointerEffect> {
     let _op = mpx_op_guard(cursor_id);
     let display = open_display()?;
     supports_parallel_pointer_injection(display)?;
+    let skip_restore =
+        preserve_host || is_override_redirect(display, click.target_window as x11::xlib::Window);
     let saved_focus = save_focus_state(display);
 
     let result = (|| -> Result<PointerEffect> {
@@ -3105,7 +3119,9 @@ pub fn send_virtual_pointer_click(
         Ok(effect)
     })();
 
-    restore_focus_state(display, &saved_focus);
+    if !skip_restore {
+        restore_focus_state(display, &saved_focus);
+    }
     unsafe {
         x11::xlib::XCloseDisplay(display);
     }
