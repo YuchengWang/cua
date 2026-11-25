@@ -523,6 +523,12 @@ impl Drop for ManagedBrowser {
 
 pub(crate) type ManagedBrowsers = Mutex<Vec<ManagedBrowser>>;
 
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedBrowserResult {
+    pub outcome: PrepareOutcome,
+    pub ws_endpoint: Option<String>,
+}
+
 fn profile_root() -> Result<PathBuf, BrowserRefusal> {
     if let Some(root) = std::env::var_os("CUA_DRIVER_BROWSER_PROFILE_ROOT") {
         return Ok(PathBuf::from(root));
@@ -691,6 +697,7 @@ fn driver_owned_browser_command(
     root: &Path,
     profile: &PreparedProfile,
     managed_extensions: bool,
+    incognito: bool,
 ) -> Result<Command, BrowserRefusal> {
     let under_root = profile.path.parent() == Some(root);
     if !under_root || !profile_matches_marker(&profile.path, &profile.marker) {
@@ -704,6 +711,7 @@ fn driver_owned_browser_command(
         executable,
         &profile.path,
         managed_extensions,
+        incognito,
     ))
 }
 
@@ -840,7 +848,12 @@ const EXTENSION_AND_BACKGROUND_SWITCHES: [&str; 3] = [
 
 /// `managed_extensions` is true when the administrator forces extensions on
 /// this browser ([`super::platform::BrowserPlatform::managed_extension_policy`]).
-fn isolated_browser_command(executable: &str, profile: &Path, managed_extensions: bool) -> Command {
+fn isolated_browser_command(
+    executable: &str,
+    profile: &Path,
+    managed_extensions: bool,
+    incognito: bool,
+) -> Command {
     let mut command = Command::new(executable);
     #[cfg(unix)]
     {
@@ -853,6 +866,9 @@ fn isolated_browser_command(executable: &str, profile: &Path, managed_extensions
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
         .arg("--disable-default-apps");
+    if incognito {
+        command.arg("--incognito");
+    }
     if !managed_extensions {
         command.args(EXTENSION_AND_BACKGROUND_SWITCHES);
     }
@@ -1227,6 +1243,7 @@ impl BrowserEngine {
             reaped
         };
         for browser in &reaped {
+            self.cdp_proxies.remove_pid(browser.owned_pid);
             let Some(fingerprint) = &browser.fingerprint else {
                 continue;
             };
@@ -1240,7 +1257,7 @@ impl BrowserEngine {
     pub(crate) async fn prepare_browser(
         &self,
         request: PrepareRequest,
-    ) -> Result<PrepareOutcome, BrowserRefusal> {
+    ) -> Result<PreparedBrowserResult, BrowserRefusal> {
         if request.strategy == Some(PrepareStrategy::ExistingProfile) {
             return self.attach_existing_profile(request).await;
         }
@@ -1260,7 +1277,10 @@ impl BrowserEngine {
                             .as_ref()
                             .map(|endpoint| endpoint.ownership.owner_pid);
                     }
-                    return Ok(outcome);
+                    return Ok(PreparedBrowserResult {
+                        outcome,
+                        ws_endpoint: None,
+                    });
                 }
                 Err(error) if error.code != BrowserRefusalCode::BrowserRequiresSetup => {
                     return Err(error)
@@ -1324,6 +1344,7 @@ impl BrowserEngine {
             &profile_root()?,
             &prepared_profile,
             managed_extension_policy.is_some(),
+            profile_request.incognito,
         ) {
             Ok(command) => command,
             Err(error) => {
@@ -1394,12 +1415,33 @@ impl BrowserEngine {
             }
         };
         let prepared_pid = endpoint.ownership.owner_pid;
-        let mut owner_sessions = vec![request.session];
+        let mut owner_sessions = vec![request.session.clone()];
         if let Some(transport_session) = request.transport_session {
             if !owner_sessions.contains(&transport_session) {
                 owner_sessions.push(transport_session);
             }
         }
+        let ws_endpoint = match self
+            .cdp_proxies
+            .ensure_isolated_proxy(
+                &request.session,
+                owner_sessions.clone(),
+                prepared_pid,
+                self.pool.clone(),
+                endpoint.ws_url.clone(),
+                None,
+            )
+            .await
+        {
+            Ok(ws_endpoint) => ws_endpoint,
+            Err(error) => {
+                cleanup_created_profile_as_browser(child.as_mut(), &prepared_profile);
+                return Err(BrowserRefusal::new(
+                    BrowserRefusalCode::BrowserRouteUnavailable,
+                    format!("could not start local CDP proxy for isolated browser: {error}"),
+                ));
+            }
+        };
         let fingerprint = self.platform.process_fingerprint(prepared_pid).await.ok();
         if let Some(fingerprint) = &fingerprint {
             for owner in &owner_sessions {
@@ -1416,18 +1458,21 @@ impl BrowserEngine {
             marker: prepared_profile.marker,
             owner_sessions,
         });
-        Ok(PrepareOutcome {
-            action: PrepareAction::LaunchedIsolatedBrowser,
-            endpoint: Some(endpoint),
-            message: "Launched a separate driver-owned isolated Chromium process; no existing browser process was modified or terminated.".to_owned(),
-            prepared_pid: Some(prepared_pid),
-            side_effects: PrepareSideEffects {
-                launched_browser: true,
-                created_profile: prepared_profile.created,
-                reused_driver_profile: !prepared_profile.created,
-                ..PrepareSideEffects::default()
+        Ok(PreparedBrowserResult {
+            outcome: PrepareOutcome {
+                action: PrepareAction::LaunchedIsolatedBrowser,
+                endpoint: Some(endpoint),
+                message: "Launched a separate driver-owned isolated Chromium process; no existing browser process was modified or terminated.".to_owned(),
+                prepared_pid: Some(prepared_pid),
+                side_effects: PrepareSideEffects {
+                    launched_browser: true,
+                    created_profile: prepared_profile.created,
+                    reused_driver_profile: !prepared_profile.created,
+                    ..PrepareSideEffects::default()
+                },
+                attachment: None,
             },
-            attachment: None,
+            ws_endpoint: Some(ws_endpoint),
         })
     }
 
@@ -1469,7 +1514,7 @@ impl BrowserEngine {
     async fn attach_existing_profile(
         &self,
         request: PrepareRequest,
-    ) -> Result<PrepareOutcome, BrowserRefusal> {
+    ) -> Result<PreparedBrowserResult, BrowserRefusal> {
         let browser_pid = request.pid;
         // Where the platform can guard it (macOS: the browser window is on
         // another Space), attach in the background under the guard instead of
@@ -1500,7 +1545,7 @@ impl BrowserEngine {
         if let (Some(previous), Some(pid)) = (previous_front, browser_pid) {
             let restored = self.platform.restore_frontmost_app(previous, pid);
             match &mut result {
-                Ok(outcome) => outcome.side_effects.restored_frontmost_app = restored,
+                Ok(res) => res.outcome.side_effects.restored_frontmost_app = restored,
                 Err(error) => {
                     if let Some(serde_json::Value::Object(detail)) = error.detail.as_mut() {
                         detail.insert(
@@ -1564,7 +1609,7 @@ impl BrowserEngine {
         &self,
         request: PrepareRequest,
         guarded: bool,
-    ) -> Result<PrepareOutcome, BrowserRefusal> {
+    ) -> Result<PreparedBrowserResult, BrowserRefusal> {
         enum ConsentPath {
             Protected,
             BoundedManifest,
@@ -1920,27 +1965,30 @@ impl BrowserEngine {
                 }
             };
         let displayed_consent_prompt = displayed_consent_prompt || fresh_consent_prompt;
-        if let Err(_final_claim_error) = claimed {
-            self.revoke_existing_profile_grant(
-                &request.session,
-                request.transport_session.as_deref(),
-                pid,
-            )
-            .await;
-            let error = with_prepare_side_effects(
-                BrowserRefusal::new(
-                    BrowserRefusalCode::BrowserReconnectExhausted,
-                    "the approved browser socket could not be claimed",
+        let claimed_conn = match claimed {
+            Ok(conn) => conn,
+            Err(_final_claim_error) => {
+                self.revoke_existing_profile_grant(
+                    &request.session,
+                    request.transport_session.as_deref(),
+                    pid,
                 )
-                .with_detail(serde_json::json!({
-                    "retried_after_consent": initial_claim_error.is_some(),
-                    "fresh_claim_failed": initial_claim_error.is_some(),
-                })),
-                &setup,
-                displayed_consent_prompt,
-            );
-            return Err(rollback_pending_setup(pending_setup, error).await);
-        }
+                .await;
+                let error = with_prepare_side_effects(
+                    BrowserRefusal::new(
+                        BrowserRefusalCode::BrowserReconnectExhausted,
+                        "the approved browser socket could not be claimed",
+                    )
+                    .with_detail(serde_json::json!({
+                        "retried_after_consent": initial_claim_error.is_some(),
+                        "fresh_claim_failed": initial_claim_error.is_some(),
+                    })),
+                    &setup,
+                    displayed_consent_prompt,
+                );
+                return Err(rollback_pending_setup(pending_setup, error).await);
+            }
+        };
         if let Some(pending_setup) = pending_setup {
             match pending_setup.commit().await {
                 Ok(closed) => setup.closed_setup_page = closed,
@@ -1962,29 +2010,78 @@ impl BrowserEngine {
         self.store
             .invalidate_endpoint_generation(pid, previous_generation);
 
-        Ok(PrepareOutcome {
-            action: PrepareAction::AttachedExistingProfile,
-            endpoint: Some(endpoint),
-            message: "Attached to the approved existing Chromium profile. Bind the native window again before using browser capabilities.".to_owned(),
-            prepared_pid: Some(pid),
-            side_effects: PrepareSideEffects {
-                displayed_consent_prompt,
-                changed_preferences: setup.enabled_remote_debugging,
-                opened_setup_page: setup.opened_setup_page,
-                closed_setup_page: setup.closed_setup_page,
-                enabled_remote_debugging: setup.enabled_remote_debugging,
-                used_bounded_pixel_fallback: setup.used_bounded_pixel_fallback,
-                focused_setup_address_field: setup.focused_setup_address_field,
-                foregrounded_window: setup.foregrounded_window,
-                injected_global_input: setup.injected_global_input,
-                ..PrepareSideEffects::default()
+        let mut owner_sessions = vec![request.session.clone()];
+        if let Some(transport_session) = request.transport_session.as_ref() {
+            if !owner_sessions.contains(transport_session) {
+                owner_sessions.push(transport_session.clone());
+            }
+        }
+        let grants = self.existing_profile_grants.clone();
+        let grant_public_session = request.session.clone();
+        let grant_transport_session = request.transport_session.clone();
+        let on_activity = Arc::new(move || {
+            grants.touch(
+                &grant_public_session,
+                grant_transport_session.as_deref(),
+                pid,
+            );
+        });
+        let proxy_ws_endpoint = match self
+            .cdp_proxies
+            .ensure_existing_profile_proxy(
+                &request.session,
+                owner_sessions,
+                pid,
+                claimed_conn,
+                Some(on_activity),
+            )
+            .await
+        {
+            Ok(url) => url,
+            Err(error) => {
+                self.revoke_existing_profile_grant(
+                    &request.session,
+                    request.transport_session.as_deref(),
+                    pid,
+                )
+                .await;
+                return Err(with_prepare_side_effects(
+                    BrowserRefusal::new(
+                        BrowserRefusalCode::BrowserRouteUnavailable,
+                        format!("could not start local CDP proxy for existing profile: {error}"),
+                    ),
+                    &setup,
+                    displayed_consent_prompt,
+                ));
+            }
+        };
+
+        Ok(PreparedBrowserResult {
+            outcome: PrepareOutcome {
+                action: PrepareAction::AttachedExistingProfile,
+                endpoint: Some(endpoint),
+                message: "Attached to the approved existing Chromium profile. Bind the native window again before using browser capabilities.".to_owned(),
+                prepared_pid: Some(pid),
+                side_effects: PrepareSideEffects {
+                    displayed_consent_prompt,
+                    changed_preferences: setup.enabled_remote_debugging,
+                    opened_setup_page: setup.opened_setup_page,
+                    closed_setup_page: setup.closed_setup_page,
+                    enabled_remote_debugging: setup.enabled_remote_debugging,
+                    used_bounded_pixel_fallback: setup.used_bounded_pixel_fallback,
+                    focused_setup_address_field: setup.focused_setup_address_field,
+                    foregrounded_window: setup.foregrounded_window,
+                    injected_global_input: setup.injected_global_input,
+                    ..PrepareSideEffects::default()
+                },
+                attachment: Some(PrepareAttachment {
+                    kind: PrepareAttachmentKind::ExistingProfile,
+                    browser: "chromium".to_owned(),
+                    capabilities_invalidated: true,
+                    next_action: "get_browser_state".to_owned(),
+                }),
             },
-            attachment: Some(PrepareAttachment {
-                kind: PrepareAttachmentKind::ExistingProfile,
-                browser: "chromium".to_owned(),
-                capabilities_invalidated: true,
-                next_action: "get_browser_state".to_owned(),
-            }),
+            ws_endpoint: Some(proxy_ws_endpoint),
         })
     }
 }
@@ -2661,11 +2758,19 @@ mod tests {
     #[test]
     fn isolated_launch_uses_a_deterministic_clean_profile() {
         let profile = Path::new("profile-under-test");
-        let command = isolated_browser_command("chromium-under-test", profile, false);
+        let command = isolated_browser_command("chromium-under-test", profile, false, false);
         let args = command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
+        assert!(!args.iter().any(|arg| arg == "--incognito"));
+
+        let incognito_command = isolated_browser_command("chromium-under-test", profile, false, true);
+        let incognito_args = incognito_command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(incognito_args.iter().any(|arg| arg == "--incognito"));
 
         for required in [
             "--remote-debugging-port=0",
@@ -2727,7 +2832,7 @@ mod tests {
         };
 
         let command =
-            driver_owned_browser_command("chromium-under-test", &root, &profile(&owned), false)
+            driver_owned_browser_command("chromium-under-test", &root, &profile(&owned), false, false)
                 .expect("a marked profile under the root launches");
         let args = command_args(&command);
         assert!(args.contains(&format!("--user-data-dir={}", owned.display())));
@@ -2750,6 +2855,7 @@ mod tests {
                 "chromium-under-test",
                 &root,
                 &profile(refused),
+                false,
                 false,
             )
             .expect_err("not a driver-owned profile");

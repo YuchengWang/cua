@@ -781,6 +781,24 @@ pub fn session_snapshot(
     })
 }
 
+/// Refreshes `last_activity` for a live, non-ending lifecycle record while
+/// external work (such as an attached CDP proxy client) is active without
+/// dispatching MCP tool calls.
+pub fn touch_session_activity(session_id: &str) -> bool {
+    if !is_trackable(session_id) {
+        return false;
+    }
+    let mut records = lifecycle_records().lock().unwrap();
+    let Some(record) = records.get_mut(session_id) else {
+        return false;
+    };
+    if record.pending_end.is_some() {
+        return false;
+    }
+    record.last_activity = Instant::now();
+    true
+}
+
 fn session_owner_matches(session_id: &str, owner_transport: &str) -> bool {
     if lifecycle_records()
         .lock()
@@ -3572,5 +3590,42 @@ mod tests {
         );
         assert_eq!(end_trusted_adapter_transport("default"), 0);
         end_session(&other_scoped);
+    }
+
+    #[test]
+    fn touch_session_activity_refreshes_live_record_and_ignores_ended() {
+        let session = "test-touch-session-activity-7f3a";
+        assert!(!touch_session_activity("default"));
+        assert!(!touch_session_activity(session));
+
+        drop(
+            begin_session_dispatch(
+                session,
+                Some("touch-label"),
+                session,
+                false,
+                SessionTransport::McpHttp,
+                SessionClientKind::Mcp,
+            )
+            .unwrap(),
+        );
+        let before = lifecycle_records()
+            .lock()
+            .unwrap()
+            .get(session)
+            .unwrap()
+            .last_activity;
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(touch_session_activity(session));
+        let after = lifecycle_records()
+            .lock()
+            .unwrap()
+            .get(session)
+            .unwrap()
+            .last_activity;
+        assert!(after > before);
+
+        end_session(session);
+        assert!(!touch_session_activity(session));
     }
 }

@@ -5585,3 +5585,90 @@ async fn a_failed_single_line_probe_refuses_before_typing() {
     assert!(recorded_calls(&f, "Input.insertText").is_empty());
     assert!(recorded_calls(&f, "Input.dispatchKeyEvent").is_empty());
 }
+
+#[tokio::test]
+async fn existing_profile_prepare_exposes_reusable_proxy_ws_endpoint_with_single_upstream() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let (f, _provider) = protected_existing_profile_fixture().await;
+    let first = BrowserPrepareTool::new(f.engine.clone())
+        .invoke(json!({
+            "pid": 1,
+            "window_id": 7,
+            "session": SESSION,
+            "_transport_session_id": "transport-v2-proxy",
+            "strategy": { "kind": "existing_profile" }
+        }))
+        .await;
+    let s1 = structured(&first);
+    assert_eq!(s1["status"], "ok", "{s1}");
+    assert_eq!(s1["action"], "attached_existing_profile");
+    let ws1 = s1["ws_endpoint"]
+        .as_str()
+        .expect("proxy ws_endpoint must be returned")
+        .to_owned();
+    assert!(ws1.starts_with("ws://127.0.0.1:"), "{ws1}");
+    assert_ne!(ws1, f._server.ws_url());
+    assert_eq!(f._server.accepted_connections(), 1);
+    assert_eq!(f.engine.cdp_proxies.active_count(), 1);
+
+    // Repeat prepare in the same session + pid reuses the same proxy endpoint and upstream WS.
+    let second = BrowserPrepareTool::new(f.engine.clone())
+        .invoke(json!({
+            "pid": 1,
+            "window_id": 7,
+            "session": SESSION,
+            "_transport_session_id": "transport-v2-proxy",
+            "strategy": { "kind": "existing_profile" }
+        }))
+        .await;
+    let s2 = structured(&second);
+    assert_eq!(s2["ws_endpoint"], ws1);
+    assert_eq!(f._server.accepted_connections(), 1);
+
+    // Downstream client connects, blocks Browser.close, sends Target.getTargets, and disconnects.
+    let (mut client1, _) = tokio_tungstenite::connect_async(&ws1).await.unwrap();
+    client1
+        .send(Message::Text(
+            json!({ "id": 1, "method": "Browser.close" }).to_string(),
+        ))
+        .await
+        .unwrap();
+    let close_reply: serde_json::Value =
+        serde_json::from_str(&client1.next().await.unwrap().unwrap().into_text().unwrap())
+            .unwrap();
+    assert!(close_reply["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("blocked"));
+
+    client1
+        .send(Message::Text(
+            json!({ "id": 2, "method": "Target.getTargets", "params": {} }).to_string(),
+        ))
+        .await
+        .unwrap();
+    let targets_reply: serde_json::Value =
+        serde_json::from_str(&client1.next().await.unwrap().unwrap().into_text().unwrap())
+            .unwrap();
+    assert_eq!(targets_reply["id"], 2);
+    drop(client1);
+
+    // Second downstream client reconnects cleanly with zero second upstream WS handshake.
+    let (mut client2, _) = tokio_tungstenite::connect_async(&ws1).await.unwrap();
+    client2
+        .send(Message::Text(
+            json!({ "id": 3, "method": "Target.getTargets", "params": {} }).to_string(),
+        ))
+        .await
+        .unwrap();
+    let reconnect_reply: serde_json::Value =
+        serde_json::from_str(&client2.next().await.unwrap().unwrap().into_text().unwrap())
+            .unwrap();
+    assert_eq!(reconnect_reply["id"], 3);
+    assert_eq!(f._server.accepted_connections(), 1);
+
+    crate::session::fire_session_end("transport-v2-proxy");
+    assert_eq!(f.engine.cdp_proxies.active_count(), 0);
+}

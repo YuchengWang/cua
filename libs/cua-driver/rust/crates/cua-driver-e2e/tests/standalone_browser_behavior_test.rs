@@ -3261,7 +3261,18 @@ fn run_existing_profile_attach(spec: &BrowserSpec) {
                     );
 
                     let public_result = prepared.raw.to_string();
-                    assert!(!public_result.contains("ws://"), "{}", prepared.raw);
+                    assert!(
+                        !public_result.contains(&format!(":{}/devtools/browser/", fixture.cdp_port)),
+                        "raw Chrome ws_url leaked: {}",
+                        prepared.raw
+                    );
+                    if let Some(proxy_ws) = prepared.structured()["ws_endpoint"].as_str() {
+                        assert!(proxy_ws.starts_with("ws://127.0.0.1:"), "{proxy_ws}");
+                        assert!(
+                            !proxy_ws.contains(&format!(":{}", fixture.cdp_port)),
+                            "proxy ws_endpoint must not equal raw Chrome port: {proxy_ws}"
+                        );
+                    }
                     assert!(
                         !public_result.contains("webSocketDebuggerUrl"),
                         "{}",
@@ -3430,7 +3441,18 @@ fn run_existing_profile_setup(spec: &BrowserSpec) {
             };
 
             let public_result = prepared.raw.to_string();
-            assert!(!public_result.contains("ws://"), "{}", prepared.raw);
+            assert!(
+                !public_result.contains(&format!(":{setup_port}/devtools/browser/")),
+                "raw Chrome ws_url leaked: {}",
+                prepared.raw
+            );
+            if let Some(proxy_ws) = prepared.structured()["ws_endpoint"].as_str() {
+                assert!(proxy_ws.starts_with("ws://127.0.0.1:"), "{proxy_ws}");
+                assert!(
+                    !proxy_ws.contains(&format!(":{setup_port}")),
+                    "proxy ws_endpoint must not equal raw Chrome port: {proxy_ws}"
+                );
+            }
             assert!(
                 !public_result.contains(&fixture._profile.path().display().to_string()),
                 "{}",

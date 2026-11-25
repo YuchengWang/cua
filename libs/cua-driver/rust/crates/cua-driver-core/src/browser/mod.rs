@@ -40,6 +40,7 @@
 
 mod adapter_support;
 pub mod binding;
+mod cdp_proxy;
 pub mod cdp_ws;
 pub mod download;
 pub mod engine;

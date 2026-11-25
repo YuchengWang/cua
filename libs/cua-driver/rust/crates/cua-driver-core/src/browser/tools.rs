@@ -988,7 +988,8 @@ impl BrowserPrepareTool {
                         "description": "Driver-owned isolated Chromium profile to launch with allow_launch=true. mode=isolated_new creates a fresh throwaway profile; mode=isolated_named reuses the named driver-owned profile. Never an existing user profile.",
                         "properties": {
                             "mode": { "type": "string", "enum": ["isolated_new", "isolated_named"] },
-                            "name": { "type": "string", "description": "Required only for isolated_named; 1-64 path-safe ASCII characters." }
+                            "name": { "type": "string", "description": "Required only for isolated_named; 1-64 path-safe ASCII characters." },
+                            "incognito": { "type": "boolean", "default": false, "description": "Optional. Launch the isolated profile browser window with --incognito." }
                         },
                         "required": ["mode"],
                         "additionalProperties": false
@@ -1094,12 +1095,14 @@ impl Tool for BrowserPrepareTool {
             foreground,
         };
         match self.engine.prepare_browser(request).await {
-            Ok(outcome) => {
+            Ok(prepared_result) => {
+                let outcome = prepared_result.outcome;
+                let proxy_ws_endpoint = prepared_result.ws_endpoint;
                 let prepared = outcome.endpoint.is_some();
                 let lifecycle = profile_mode
                     .filter(|_| outcome.action == PrepareAction::LaunchedIsolatedBrowser)
                     .and_then(|mode| isolated_session_lifecycle(&session, &owner_transport, mode));
-                let text = format!(
+                let mut text = format!(
                     "browser_prepare: {} — {}",
                     if prepared {
                         "endpoint available"
@@ -1108,17 +1111,26 @@ impl Tool for BrowserPrepareTool {
                     },
                     outcome.message
                 );
+                if let Some(ws_endpoint) = proxy_ws_endpoint.as_deref() {
+                    use std::fmt::Write as _;
+                    let _ = write!(&mut text, "\nws_endpoint: {ws_endpoint}");
+                }
                 let mut structured = json!({
                     "status": "ok",
                     "prepared": prepared,
                     "action": outcome.action,
                     "message": outcome.message,
-                    // The ws_url itself stays internal; expose only proof metadata.
+                    // The raw upstream ws_url stays internal; expose only proof metadata
+                    // and, for approved existing_profile/isolated launches, the restricted
+                    // loopback proxy ws_endpoint.
                     "endpoint_ownership": outcome.endpoint.map(|e| e.ownership),
                     "prepared_pid": outcome.prepared_pid,
                     "side_effects": outcome.side_effects,
                     "attachment": outcome.attachment,
                 });
+                if let Some(ws_endpoint) = proxy_ws_endpoint {
+                    structured["ws_endpoint"] = json!(ws_endpoint);
+                }
                 if let Some(lifecycle) = lifecycle {
                     structured["lifecycle"] = lifecycle;
                 }
@@ -5108,5 +5120,34 @@ mod tests {
                 .await;
             assert_eq!(err_res.is_error, Some(true));
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn browser_prepare_isolated_incognito_returns_restricted_proxy_ws_endpoint() {
+        let launches = Arc::new(LaunchSignals::default());
+        let engine = observed_launching_engine(std::time::Duration::ZERO, launches.clone());
+        let (session, owner) = start_lifecycle_session(None);
+        let prepared = prepare_isolated(
+            &engine,
+            &session,
+            &owner,
+            json!({ "mode": "isolated_new", "incognito": true }),
+        )
+        .await;
+        assert_eq!(prepared["status"], "ok", "{prepared}");
+        assert_eq!(prepared["action"], "launched_isolated_browser");
+        let ws_endpoint = prepared["ws_endpoint"].as_str().expect("proxy ws_endpoint");
+        assert!(ws_endpoint.starts_with("ws://127.0.0.1:"), "{ws_endpoint}");
+        assert!(ws_endpoint.contains("/devtools/browser/"), "{ws_endpoint}");
+        assert_eq!(engine.cdp_proxies.active_count(), 1);
+        let args = launches.launched_args.lock().unwrap();
+        assert!(
+            args.last().unwrap().iter().any(|arg| arg == "--incognito"),
+            "expected --incognito in isolated browser args: {args:?}"
+        );
+
+        crate::session::fire_session_end(&owner);
+        assert_eq!(engine.cdp_proxies.active_count(), 0);
     }
 }

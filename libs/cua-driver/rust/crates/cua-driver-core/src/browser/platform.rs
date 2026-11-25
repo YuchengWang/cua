@@ -122,11 +122,17 @@ pub enum PrepareProfileMode {
     IsolatedNamed,
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrepareProfile {
     pub mode: PrepareProfileMode,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub incognito: bool,
 }
 
 /// Acting strategy for browser preparation that is not a driver-owned profile

@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::refusal::{BrowserRefusal, BrowserRefusalCode};
@@ -74,14 +74,14 @@ impl ExistingProfileGrant {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct ExistingProfileGrants {
-    inner: Mutex<HashMap<GrantKey, ExistingProfileGrant>>,
+    inner: Arc<Mutex<HashMap<GrantKey, ExistingProfileGrant>>>,
     /// Connection generations are unique across every grant in this engine,
     /// not just per session. Sessions for the same browser share one socket,
     /// so a per-session counter would let one session's generation match,
     /// release, or invalidate another session's claim and targets.
-    last_generation: AtomicU64,
+    last_generation: Arc<AtomicU64>,
 }
 
 impl ExistingProfileGrants {
@@ -194,6 +194,20 @@ impl ExistingProfileGrants {
             transfer_cleanup_ownership(&mut grants, grant);
         }
         removed
+    }
+
+    pub fn touch(&self, public_session: &str, transport_session: Option<&str>, pid: i64) -> bool {
+        let key = Self::key(public_session, transport_session, pid);
+        let now = Instant::now();
+        let mut grants = self.inner.lock().unwrap();
+        let Some(grant) = grants.get_mut(&key) else {
+            return false;
+        };
+        if grant.expired(now) {
+            return false;
+        }
+        grant.last_used_at = now;
+        true
     }
 
     pub fn bump_generation(

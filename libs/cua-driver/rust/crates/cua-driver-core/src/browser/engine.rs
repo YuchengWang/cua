@@ -85,6 +85,7 @@ pub struct BrowserEngine {
     pub(crate) platform: Arc<dyn BrowserPlatform>,
     pub(crate) store: BrowserStore,
     pub(crate) pool: CdpPool,
+    pub(crate) cdp_proxies: super::cdp_proxy::CdpProxyManager,
     pub(crate) managed_browsers: ManagedBrowsers,
     pub(crate) isolated_launch_breaker: IsolatedLaunchBreaker,
     pub(crate) existing_profile_grants: ExistingProfileGrants,
@@ -718,6 +719,7 @@ impl BrowserEngine {
             platform,
             store: BrowserStore::new(),
             pool: CdpPool::new(),
+            cdp_proxies: super::cdp_proxy::CdpProxyManager::new(),
             managed_browsers: Default::default(),
             isolated_launch_breaker: Default::default(),
             existing_profile_grants: ExistingProfileGrants::new(),
@@ -733,6 +735,7 @@ impl BrowserEngine {
             register_scoped_fallible_session_end_hook("browser_state", move |session_id| {
                 let mut cleanup_errors = Vec::new();
                 if let Some(engine) = weak.upgrade() {
+                    engine.cdp_proxies.remove_session(session_id);
                     engine.store.remove_session(session_id);
                     engine.cleanup_prepared_session(session_id);
                     let pending = {
@@ -819,6 +822,8 @@ impl BrowserEngine {
             GrantLookup::Missing => Ok(None),
             GrantLookup::Live(grant) => Ok(Some(grant)),
             GrantLookup::Expired(grant) => {
+                self.cdp_proxies
+                    .remove_for_session_and_pid(&grant.public_session, grant.pid);
                 if grant.cleanup_remote_debugging {
                     let request = ExistingProfileSetupRequest {
                         pid: grant.pid,
@@ -866,6 +871,8 @@ impl BrowserEngine {
             .existing_profile_grants
             .revoke(session, transport_session, pid)
         {
+            self.cdp_proxies
+                .remove_for_session_and_pid(&grant.public_session, grant.pid);
             if grant.cleanup_remote_debugging {
                 let request = ExistingProfileSetupRequest {
                     pid: grant.pid,

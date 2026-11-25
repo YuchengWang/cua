@@ -24,7 +24,7 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
@@ -139,6 +139,222 @@ enum CallOutcome {
     Error { code: Option<i64>, message: String },
 }
 
+/// In-flight command submitted through an attached local CDP proxy client.
+struct ProxyPendingEntry {
+    client_id: u64,
+    original_id: Value,
+    method: String,
+    request_session_id: Option<String>,
+    enable_flag: Option<bool>,
+    previous_flag: bool,
+}
+
+struct ProxyClientState {
+    tx: mpsc::UnboundedSender<String>,
+    wants_discover: bool,
+    wants_auto_attach: bool,
+    owned_sessions: HashSet<String>,
+}
+
+struct ProxyCleanupPlan {
+    sessions_to_detach: Vec<String>,
+    disable_auto_attach: bool,
+    disable_discover: bool,
+}
+
+#[derive(Default)]
+struct ProxyRouter {
+    next_client_id: u64,
+    clients: HashMap<u64, ProxyClientState>,
+    pending: HashMap<u64, ProxyPendingEntry>,
+    session_owners: HashMap<String, HashSet<u64>>,
+}
+
+impl ProxyRouter {
+    fn register_client(&mut self, tx: mpsc::UnboundedSender<String>) -> u64 {
+        self.next_client_id = self.next_client_id.wrapping_add(1).max(1);
+        let client_id = self.next_client_id;
+        self.clients.insert(
+            client_id,
+            ProxyClientState {
+                tx,
+                wants_discover: false,
+                wants_auto_attach: false,
+                owned_sessions: HashSet::new(),
+            },
+        );
+        client_id
+    }
+
+    fn add_session_owner(&mut self, session_id: &str, client_id: u64) {
+        if let Some(client) = self.clients.get_mut(&client_id) {
+            client.owned_sessions.insert(session_id.to_owned());
+            self.session_owners
+                .entry(session_id.to_owned())
+                .or_default()
+                .insert(client_id);
+        }
+    }
+
+    fn remove_session_everywhere(&mut self, session_id: &str) -> Option<HashSet<u64>> {
+        let owners = self.session_owners.remove(session_id);
+        for client in self.clients.values_mut() {
+            client.owned_sessions.remove(session_id);
+        }
+        owners
+    }
+
+    fn deliver_to_clients(&self, client_ids: impl IntoIterator<Item = u64>, raw: &str) {
+        for cid in client_ids {
+            if let Some(client) = self.clients.get(&cid) {
+                let _ = client.tx.send(raw.to_owned());
+            }
+        }
+    }
+
+    fn route_reply(&mut self, upstream_id: u64, mut v: Value) -> bool {
+        let Some(entry) = self.pending.remove(&upstream_id) else {
+            return false;
+        };
+        let has_error = v.get("error").is_some();
+        if !has_error {
+            if entry.method == "Target.attachToTarget" {
+                if let Some(sid) = v.pointer("/result/sessionId").and_then(Value::as_str) {
+                    self.add_session_owner(sid, entry.client_id);
+                }
+            }
+            if entry.request_session_id.is_none() && entry.enable_flag == Some(false) {
+                if let Some(client) = self.clients.get_mut(&entry.client_id) {
+                    match entry.method.as_str() {
+                        "Target.setDiscoverTargets" => client.wants_discover = false,
+                        "Target.setAutoAttach" => client.wants_auto_attach = false,
+                        _ => {}
+                    }
+                }
+            }
+        } else if entry.request_session_id.is_none() && entry.enable_flag == Some(true) {
+            if let Some(client) = self.clients.get_mut(&entry.client_id) {
+                match entry.method.as_str() {
+                    "Target.setDiscoverTargets" => client.wants_discover = entry.previous_flag,
+                    "Target.setAutoAttach" => client.wants_auto_attach = entry.previous_flag,
+                    _ => {}
+                }
+            }
+        }
+        v["id"] = entry.original_id;
+        if let Some(client) = self.clients.get(&entry.client_id) {
+            let _ = client.tx.send(v.to_string());
+        }
+        true
+    }
+
+    fn route_event(&mut self, v: &Value, method: &str, raw_text: &str) {
+        if self.clients.is_empty() {
+            return;
+        }
+        if let Some(parent_sid) = v.get("sessionId").and_then(Value::as_str) {
+            let Some(owners) = self.session_owners.get(parent_sid).cloned() else {
+                // Target session belongs to driver-internal calls; never leak to proxies.
+                return;
+            };
+            if method == "Target.attachedToTarget" {
+                if let Some(child_sid) = v.pointer("/params/sessionId").and_then(Value::as_str) {
+                    for &cid in &owners {
+                        self.add_session_owner(child_sid, cid);
+                    }
+                }
+            } else if method == "Target.detachedFromTarget" {
+                if let Some(detached_sid) = v.pointer("/params/sessionId").and_then(Value::as_str) {
+                    self.remove_session_everywhere(detached_sid);
+                }
+            }
+            self.deliver_to_clients(owners, raw_text);
+            return;
+        }
+
+        match method {
+            "Target.attachedToTarget" => {
+                let targets: Vec<u64> = self
+                    .clients
+                    .iter()
+                    .filter(|(_, c)| c.wants_auto_attach)
+                    .map(|(&cid, _)| cid)
+                    .collect();
+                if let Some(child_sid) = v.pointer("/params/sessionId").and_then(Value::as_str) {
+                    for &cid in &targets {
+                        self.add_session_owner(child_sid, cid);
+                    }
+                }
+                self.deliver_to_clients(targets, raw_text);
+            }
+            "Target.detachedFromTarget" => {
+                if let Some(detached_sid) = v.pointer("/params/sessionId").and_then(Value::as_str) {
+                    if let Some(owners) = self.remove_session_everywhere(detached_sid) {
+                        self.deliver_to_clients(owners, raw_text);
+                    }
+                }
+            }
+            "Target.targetCreated"
+            | "Target.targetInfoChanged"
+            | "Target.targetDestroyed"
+            | "Target.targetCrashed" => {
+                let targets: Vec<u64> = self
+                    .clients
+                    .iter()
+                    .filter(|(_, c)| c.wants_discover)
+                    .map(|(&cid, _)| cid)
+                    .collect();
+                self.deliver_to_clients(targets, raw_text);
+            }
+            _ => {
+                let targets: Vec<u64> = self.clients.keys().copied().collect();
+                self.deliver_to_clients(targets, raw_text);
+            }
+        }
+    }
+
+    fn unregister_client(&mut self, client_id: u64) -> ProxyCleanupPlan {
+        self.pending
+            .retain(|_, entry| entry.client_id != client_id);
+        let Some(removed) = self.clients.remove(&client_id) else {
+            return ProxyCleanupPlan {
+                sessions_to_detach: Vec::new(),
+                disable_auto_attach: false,
+                disable_discover: false,
+            };
+        };
+        let mut sessions_to_detach = Vec::new();
+        for sid in removed.owned_sessions {
+            let empty_after = match self.session_owners.get_mut(&sid) {
+                Some(owners) => {
+                    owners.remove(&client_id);
+                    owners.is_empty()
+                }
+                None => false,
+            };
+            if empty_after {
+                self.session_owners.remove(&sid);
+                sessions_to_detach.push(sid);
+            }
+        }
+        let disable_auto_attach = removed.wants_auto_attach
+            && !self.clients.values().any(|c| c.wants_auto_attach);
+        let disable_discover =
+            removed.wants_discover && !self.clients.values().any(|c| c.wants_discover);
+        ProxyCleanupPlan {
+            sessions_to_detach,
+            disable_auto_attach,
+            disable_discover,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.clients.clear();
+        self.pending.clear();
+        self.session_owners.clear();
+    }
+}
+
 /// State shared between the caller side and the reader task.
 struct Demux {
     pending: StdMutex<HashMap<u64, oneshot::Sender<CallOutcome>>>,
@@ -149,8 +365,10 @@ struct Demux {
     /// keeps an `Emulation.*` override only while the session that set it
     /// stays attached, so clearing it must reuse that session.
     media_override_sessions: StdMutex<HashMap<String, String>>,
+    proxy: StdMutex<ProxyRouter>,
     next_dialog_generation: AtomicU64,
     closed: AtomicBool,
+    close_tx: watch::Sender<bool>,
 }
 
 impl Demux {
@@ -163,6 +381,8 @@ impl Demux {
         self.session_targets.lock().unwrap().clear();
         self.dialogs.lock().unwrap().clear();
         self.media_override_sessions.lock().unwrap().clear();
+        self.proxy.lock().unwrap().clear();
+        let _ = self.close_tx.send(true);
     }
 }
 
@@ -184,22 +404,25 @@ async fn read_loop(mut read: SplitStream<WsStream>, demux: Arc<Demux>) {
             Err(_) => continue,
         };
         if let Some(id) = v.get("id").and_then(Value::as_u64) {
-            let Some(tx) = demux.pending.lock().unwrap().remove(&id) else {
-                continue; // reply to a timed-out or unknown call
-            };
-            let outcome = match v.get("error") {
-                Some(err) => CallOutcome::Error {
-                    code: err.get("code").and_then(Value::as_i64),
-                    message: err
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown CDP error")
-                        .to_owned(),
-                },
-                None => CallOutcome::Result(v.get("result").cloned().unwrap_or(Value::Null)),
-            };
-            let _ = tx.send(outcome);
+            let pending_tx = demux.pending.lock().unwrap().remove(&id);
+            if let Some(tx) = pending_tx {
+                let outcome = match v.get("error") {
+                    Some(err) => CallOutcome::Error {
+                        code: err.get("code").and_then(Value::as_i64),
+                        message: err
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown CDP error")
+                            .to_owned(),
+                    },
+                    None => CallOutcome::Result(v.get("result").cloned().unwrap_or(Value::Null)),
+                };
+                let _ = tx.send(outcome);
+            } else {
+                demux.proxy.lock().unwrap().route_reply(id, v);
+            }
         } else if let Some(method) = v.get("method").and_then(Value::as_str) {
+            demux.proxy.lock().unwrap().route_event(&v, method, &text);
             let event = CdpEvent {
                 method: method.to_owned(),
                 session_id: v
@@ -277,6 +500,7 @@ async fn read_loop(mut read: SplitStream<WsStream>, demux: Arc<Demux>) {
 /// A single browser-endpoint connection.
 pub struct CdpConnection {
     writer: Mutex<SplitSink<WsStream, Message>>,
+    proxy_control: Mutex<()>,
     demux: Arc<Demux>,
     next_id: AtomicU64,
     existing_profile_policy: AtomicBool,
@@ -301,18 +525,22 @@ impl CdpConnection {
             .await
             .map_err(|_| anyhow::anyhow!("CDP connect to {ws_url} timed out"))??;
         let (write, read) = ws.split();
+        let (close_tx, _close_rx) = watch::channel(false);
         let demux = Arc::new(Demux {
             pending: StdMutex::new(HashMap::new()),
             subscribers: StdMutex::new(Vec::new()),
             session_targets: StdMutex::new(HashMap::new()),
             dialogs: StdMutex::new(HashMap::new()),
             media_override_sessions: StdMutex::new(HashMap::new()),
+            proxy: StdMutex::new(ProxyRouter::default()),
             next_dialog_generation: AtomicU64::new(1),
             closed: AtomicBool::new(false),
+            close_tx,
         });
         let reader = tokio::spawn(read_loop(read, demux.clone()));
         Ok(Self {
             writer: Mutex::new(write),
+            proxy_control: Mutex::new(()),
             demux,
             next_id: AtomicU64::new(1),
             existing_profile_policy: AtomicBool::new(false),
@@ -338,6 +566,173 @@ impl CdpConnection {
     /// never recovers; the pool redials.
     pub fn is_closed(&self) -> bool {
         self.demux.closed.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn subscribe_close(&self) -> watch::Receiver<bool> {
+        self.demux.close_tx.subscribe()
+    }
+
+    pub(crate) fn register_proxy_client(
+        &self,
+    ) -> Result<(u64, mpsc::UnboundedReceiver<String>), String> {
+        if self.is_closed() {
+            return Err("CDP socket closed".to_owned());
+        }
+        let (tx, rx) = mpsc::unbounded_channel();
+        let client_id = self.demux.proxy.lock().unwrap().register_client(tx);
+        if self.is_closed() {
+            self.demux.proxy.lock().unwrap().unregister_client(client_id);
+            return Err("CDP socket closed".to_owned());
+        }
+        Ok((client_id, rx))
+    }
+
+    pub(crate) async fn forward_proxy_request(
+        &self,
+        client_id: u64,
+        mut obj: serde_json::Map<String, Value>,
+    ) -> Result<(), String> {
+        let original_id = obj
+            .get("id")
+            .cloned()
+            .filter(|v| !v.is_null())
+            .ok_or_else(|| "missing CDP id".to_owned())?;
+        let method = obj
+            .get("method")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| "missing CDP method".to_owned())?;
+        if self.method_policy() == CdpMethodPolicy::ExistingProfile
+            && matches!(
+                method.as_str(),
+                "Browser.close" | "Browser.crash" | "Browser.crashGpuProcess"
+            )
+        {
+            return Err(format!(
+                "{method} is blocked on existing-profile CDP proxy; disconnect instead"
+            ));
+        }
+        let request_session_id = obj
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let enable_flag = if request_session_id.is_none() {
+            match method.as_str() {
+                "Target.setDiscoverTargets" => {
+                    obj.get("params").and_then(|p| p.get("discover")).and_then(Value::as_bool)
+                }
+                "Target.setAutoAttach" => {
+                    obj.get("params").and_then(|p| p.get("autoAttach")).and_then(Value::as_bool)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let _gate = self.proxy_control.lock().await;
+        if self.is_closed() {
+            return Err("CDP socket closed".to_owned());
+        }
+        let upstream_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut proxy = self.demux.proxy.lock().unwrap();
+            let Some(client) = proxy.clients.get_mut(&client_id) else {
+                return Err("proxy client unregistered".to_owned());
+            };
+            let previous_flag = match method.as_str() {
+                "Target.setDiscoverTargets" => client.wants_discover,
+                "Target.setAutoAttach" => client.wants_auto_attach,
+                _ => false,
+            };
+            if request_session_id.is_none() && enable_flag == Some(true) {
+                match method.as_str() {
+                    "Target.setDiscoverTargets" => client.wants_discover = true,
+                    "Target.setAutoAttach" => client.wants_auto_attach = true,
+                    _ => {}
+                }
+            }
+            proxy.pending.insert(
+                upstream_id,
+                ProxyPendingEntry {
+                    client_id,
+                    original_id,
+                    method: method.clone(),
+                    request_session_id,
+                    enable_flag,
+                    previous_flag,
+                },
+            );
+        }
+        if self.is_closed() {
+            self.demux.proxy.lock().unwrap().pending.remove(&upstream_id);
+            return Err("CDP socket closed".to_owned());
+        }
+        obj.insert("id".to_owned(), Value::from(upstream_id));
+        let text = Value::Object(obj).to_string();
+        let sent = {
+            let mut writer = self.writer.lock().await;
+            writer.send(Message::Text(text)).await
+        };
+        if let Err(e) = sent {
+            self.demux.proxy.lock().unwrap().pending.remove(&upstream_id);
+            return Err(format!("CDP send failed during {method}: {e}"));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn unregister_proxy_client(&self, client_id: u64) {
+        let _gate = self.proxy_control.lock().await;
+        let plan = self.demux.proxy.lock().unwrap().unregister_client(client_id);
+        if self.is_closed() {
+            return;
+        }
+        let mut cleanup_frames = Vec::new();
+        for sid in plan.sessions_to_detach {
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            cleanup_frames.push(
+                serde_json::json!({
+                    "id": id,
+                    "method": "Target.detachFromTarget",
+                    "params": { "sessionId": sid }
+                })
+                .to_string(),
+            );
+        }
+        if plan.disable_auto_attach {
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            cleanup_frames.push(
+                serde_json::json!({
+                    "id": id,
+                    "method": "Target.setAutoAttach",
+                    "params": {
+                        "autoAttach": false,
+                        "waitForDebuggerOnStart": false,
+                        "flatten": true
+                    }
+                })
+                .to_string(),
+            );
+        }
+        if plan.disable_discover {
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            cleanup_frames.push(
+                serde_json::json!({
+                    "id": id,
+                    "method": "Target.setDiscoverTargets",
+                    "params": { "discover": false }
+                })
+                .to_string(),
+            );
+        }
+        if !cleanup_frames.is_empty() {
+            let mut writer = self.writer.lock().await;
+            for frame in cleanup_frames {
+                if writer.send(Message::Text(frame)).await.is_err() {
+                    break;
+                }
+            }
+        }
     }
 
     /// Subscribe to unsolicited CDP events. Delivery is in socket
@@ -706,6 +1101,7 @@ impl Drop for PoolInner {
 /// entries are shared by every grant for that browser instance: each grant
 /// generation is a refcounted holder, and the socket outlives individual
 /// sessions only within the bounded parking window.
+#[derive(Clone)]
 pub struct CdpPool {
     inner: Arc<PoolInner>,
 }
@@ -1701,5 +2097,136 @@ mod tests {
         pool.release_existing(&url, 3, SharedSocketRelease::Close)
             .await;
         log("session C: ended; socket closed");
+    }
+
+    #[tokio::test]
+    async fn proxy_multiplexes_id_remapping_session_events_and_disconnect_cleanup() {
+        let recorded = StdArc::new(StdMutex::new(Vec::<(String, Value)>::new()));
+        let rec = recorded.clone();
+        let server = MockCdpServer::start(StdArc::new(move |call| {
+            rec.lock()
+                .unwrap()
+                .push((call.method.clone(), call.params.clone()));
+            match call.method.as_str() {
+                "Target.setDiscoverTargets" => MockReply::ok(json!({})).with_events(vec![
+                    MockEvent {
+                        method: "Target.targetCreated".to_owned(),
+                        params: json!({ "targetInfo": { "targetId": "t1", "type": "page" } }),
+                        session_id: None,
+                    },
+                ]),
+                "Target.setAutoAttach" => MockReply::ok(json!({})).with_events(vec![MockEvent {
+                    method: "Target.attachedToTarget".to_owned(),
+                    params: json!({ "sessionId": "proxy-s1", "targetInfo": { "targetId": "t1" } }),
+                    session_id: None,
+                }]),
+                "Target.attachToTarget" => MockReply::ok(json!({ "sessionId": "driver-s1" })),
+                "Runtime.evaluate" => MockReply::ok(json!({ "result": { "value": 42 } })).with_events(
+                    vec![MockEvent {
+                        method: "Runtime.consoleAPICalled".to_owned(),
+                        params: json!({ "type": "log" }),
+                        session_id: call.session_id.clone(),
+                    }],
+                ),
+                "Target.detachFromTarget" => MockReply::ok(json!({})),
+                _ => MockReply::ok(json!({})),
+            }
+        }))
+        .await;
+
+        let conn = CdpConnection::connect(&server.ws_url()).await.unwrap();
+        conn.restrict_to_existing_profile();
+        assert_eq!(server.accepted_connections(), 1);
+
+        // Driver call policy remains enforced while proxy can use discovery methods.
+        assert!(conn
+            .call(None, "Target.setDiscoverTargets", json!({ "discover": true }))
+            .await
+            .is_err());
+
+        let (cid, mut rx) = conn.register_proxy_client().unwrap();
+
+        // Proxy cannot terminate personal browser via Browser.close.
+        let close_err = conn
+            .forward_proxy_request(
+                cid,
+                serde_json::from_value(json!({ "id": 99, "method": "Browser.close" })).unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(close_err.contains("blocked"));
+
+        // Proxy uses arbitrary client id (including string id) and gets exact id back.
+        conn.forward_proxy_request(
+            cid,
+            serde_json::from_value(json!({
+                "id": "client-1",
+                "method": "Target.setDiscoverTargets",
+                "params": { "discover": true }
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let ev1: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(ev1["method"], "Target.targetCreated");
+        let rep1: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(rep1["id"], "client-1");
+
+        conn.forward_proxy_request(
+            cid,
+            serde_json::from_value(json!({
+                "id": 7,
+                "method": "Target.setAutoAttach",
+                "params": { "autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true }
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let ev2: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(ev2["method"], "Target.attachedToTarget");
+        assert_eq!(ev2["params"]["sessionId"], "proxy-s1");
+        let rep2: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(rep2["id"], 7);
+
+        // Driver-internal attached session events never leak to proxy clients.
+        let driver_attach = conn
+            .call(
+                None,
+                "Target.attachToTarget",
+                json!({ "targetId": "t1", "flatten": true }),
+            )
+            .await
+            .unwrap();
+        let driver_sid = driver_attach["sessionId"].as_str().unwrap();
+        conn.call(
+            Some(driver_sid),
+            "Runtime.evaluate",
+            json!({ "expression": "1" }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "driver-owned session events must not leak to proxy clients"
+        );
+
+        // Unregistering proxy client detaches proxy-owned sessions and disables discovery/autoAttach.
+        conn.unregister_proxy_client(cid).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let methods: Vec<(String, Value)> = recorded.lock().unwrap().clone();
+        assert!(methods
+            .iter()
+            .any(|(m, p)| m == "Target.detachFromTarget" && p["sessionId"] == "proxy-s1"));
+        assert!(methods
+            .iter()
+            .any(|(m, p)| m == "Target.setAutoAttach" && p["autoAttach"] == false));
+        assert!(methods
+            .iter()
+            .any(|(m, p)| m == "Target.setDiscoverTargets" && p["discover"] == false));
+        assert_eq!(server.accepted_connections(), 1, "still only one upstream handshake");
     }
 }
