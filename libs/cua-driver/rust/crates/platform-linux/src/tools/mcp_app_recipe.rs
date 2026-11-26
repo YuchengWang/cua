@@ -17,10 +17,10 @@ use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use cua_driver_core::{
     app_recipe::{
-        find_best_recipe_with_path, global_recipe_cache, load_recipe, recipes_dir,
-        resolve_relative_anchor_xy, save_recipe_to_dir, AppRecipe, AuthGate, CapabilitySpec,
-        DataChannel, ModalHandler, RecipeState, RecipeStep, RecipeTransition, RelativeAnchor,
-        SafetyLevel, StateMachine, VerifyResult, VersionGate,
+        auto_upgrade_recipe_version, find_best_recipe_with_path, global_recipe_cache, load_recipe,
+        recipes_dir, resolve_relative_anchor_xy, save_recipe_to_dir, AppRecipe, AuthGate,
+        CapabilitySpec, DataChannel, ModalHandler, RecipeState, RecipeStep, RecipeTransition,
+        RelativeAnchor, SafetyLevel, StateMachine, VerifyResult, VersionGate,
     },
     authorization::{configured_permission_mode, launch_grant_enabled, PermissionMode},
     browser::{
@@ -396,212 +396,175 @@ impl Tool for RunAppRecipeTool {
             let target_pid = req.pid;
             let inspection = inspect_app_flow(req)?;
 
-            let recipe = resolve_recipe_for_invocation(recipe_path.as_deref(), &app_id, &inspection)?;
+            let (mut recipe, resolved_recipe_path) = resolve_recipe_with_path_for_invocation(
+                recipe_path.as_deref(),
+                &app_id,
+                &inspection,
+            )?;
 
-            // Mandatory VersionGate verification (unless explicitly seeded template).
+            // Check VersionGate (unless explicitly seeded template).
+            // On VersionMismatch, keep compatibility and run the existing flows/state_machine
+            // first: auto-upgrade on success, or preserve original version + report on failure.
             let is_seeded =
                 recipe.app_version == "seeded" || recipe.fingerprint_sha256 == "seeded";
-            if !is_seeded {
-                let verify = VersionGate::verify(
+            let version_mismatch = if !is_seeded {
+                match VersionGate::verify(
                     &recipe,
                     &inspection.app_version,
                     &inspection.fingerprint_sha256,
-                );
-                if let VerifyResult::VersionMismatch { ref reason, .. } = verify {
-                    return Ok(ToolResult::error(reason.clone())
-                        .with_structured(serde_json::to_value(&verify)?));
+                ) {
+                    VerifyResult::Matched { .. } => None,
+                    mismatch @ VerifyResult::VersionMismatch { .. } => {
+                        tracing::info!(
+                            app_id = %recipe.app_id,
+                            expected_version = %recipe.app_version,
+                            actual_version = %inspection.app_version,
+                            "VersionGate mismatch detected; attempting compatible execution with existing recipe"
+                        );
+                        Some(mismatch)
+                    }
                 }
-            }
+            } else {
+                None
+            };
 
             let target = DisplayTarget::from_display_id(display_id.as_deref())?;
             let ctx = global_screen_pool().get_or_connect(&target).ok();
 
-            if let Some(ref flow) = flow_name {
-                let steps = recipe.flows.get(flow).ok_or_else(|| {
-                    let available: Vec<&str> = recipe.flows.keys().map(String::as_str).collect();
-                    anyhow::anyhow!(
-                        "flow '{flow}' not found in recipe {} (available: {:?})",
-                        recipe.canonical_filename(),
-                        available
-                    )
-                })?;
-                if let Err(blocked) = check_safety_gate(
-                    &recipe,
-                    Some(flow),
-                    steps,
-                    SafetyLevel::ReadOnly,
-                    allow_safety_level,
-                ) {
-                    return Ok(blocked);
-                }
-                let FlowExecutionResult {
-                    steps: executed_steps,
-                    artifacts,
-                    error: step_err,
-                } = execute_flow_steps_with_auth(
-                    ctx.as_deref(),
-                    &recipe,
-                    target_window_id,
-                    target_pid,
-                    steps,
-                    auth_ctx.as_deref(),
-                );
-                if let Some((idx, action, err)) = step_err {
-                    return Ok(ToolResult::error(format!(
-                        "flow '{flow}' failed at step {idx} ({action}): {err:#}"
-                    ))
-                    .with_structured(json!({
-                        "status": "failed",
-                        "app_id": recipe.app_id,
-                        "app_version": recipe.app_version,
-                        "fp8": recipe.fp8(),
-                        "flow": flow,
-                        "steps": executed_steps,
-                        "artifacts": artifacts,
-                    })));
-                }
-                let summary = format_artifacts_summary(&artifacts);
-                let msg = if summary.is_empty() {
-                    format!(
-                        "Completed flow '{}' of {} ({} steps, non-screenshot verified)",
-                        flow,
-                        recipe.canonical_filename(),
-                        executed_steps.len()
-                    )
-                } else {
-                    format!(
-                        "Completed flow '{}' of {} ({} steps, non-screenshot verified)\n\n{}",
-                        flow,
-                        recipe.canonical_filename(),
-                        executed_steps.len(),
-                        summary
-                    )
-                };
-                return Ok(ToolResult::text(msg)
-                .with_structured(json!({
-                    "status": "completed",
-                    "app_id": recipe.app_id,
-                    "app_version": recipe.app_version,
-                    "fp8": recipe.fp8(),
-                    "flow": flow,
-                    "steps": executed_steps,
-                    "artifacts": artifacts,
-                })));
-            }
+            let exec_result = execute_run_app_recipe_body(
+                ctx.as_deref(),
+                &recipe,
+                &inspection,
+                flow_name.as_deref(),
+                target_window_id,
+                target_pid,
+                allow_safety_level,
+                auth_ctx.as_deref(),
+            );
 
-            let mut executed_steps = Vec::new();
-            let mut current_state_id = recipe.state_machine.initial_state.clone();
-
-            for _ in 0..=recipe.state_machine.transitions.len() {
-                if let Some(state) = recipe
-                    .state_machine
-                    .states
-                    .iter()
-                    .find(|s| s.id == current_state_id)
-                {
-                    // Check CAPTCHA / human verification boundary.
-                    if let Some(ref title) = inspection.window_title {
-                        for pat in &state.captcha_patterns {
-                            if title.to_ascii_lowercase().contains(&pat.to_ascii_lowercase()) {
-                                return Ok(ToolResult::error(format!(
-                                    "human verification required: matched '{pat}'"
-                                ))
-                                .with_structured(json!({
-                                    "status": "human_verification_required",
-                                    "state": state.id,
-                                    "pattern": pat,
-                                })));
+            match exec_result {
+                Ok(RecipeRunOutcome::Completed {
+                    mut message,
+                    mut structured,
+                }) => {
+                    if let Some(VerifyResult::VersionMismatch {
+                        expected_version,
+                        actual_version,
+                        expected_fp8,
+                        actual_fp8,
+                        ..
+                    }) = version_mismatch
+                    {
+                        match auto_upgrade_recipe_version(
+                            global_recipe_cache(),
+                            &mut recipe,
+                            resolved_recipe_path.as_deref(),
+                            &actual_version,
+                            &inspection.fingerprint_sha256,
+                        ) {
+                            Ok(()) => {
+                                if let Some(obj) = structured.as_object_mut() {
+                                    obj.insert("app_version".into(), json!(recipe.app_version));
+                                    obj.insert("fp8".into(), json!(recipe.fp8()));
+                                    obj.insert("version_upgraded".into(), json!(true));
+                                    obj.insert("previous_version".into(), json!(expected_version));
+                                    obj.insert("previous_fp8".into(), json!(expected_fp8));
+                                }
+                                message.push_str(&format!(
+                                    "\n\n[VersionGate] Auto-upgraded recipe {} from v{} ({}) to v{} ({}) and persisted to disk & hot cache.",
+                                    recipe.app_id,
+                                    expected_version,
+                                    expected_fp8,
+                                    recipe.app_version,
+                                    recipe.fp8()
+                                ));
+                            }
+                            Err(upgrade_err) => {
+                                tracing::warn!(
+                                    app_id = %recipe.app_id,
+                                    error = %upgrade_err,
+                                    "failed to persist auto-upgraded recipe version"
+                                );
+                                if let Some(obj) = structured.as_object_mut() {
+                                    obj.insert("version_upgraded".into(), json!(false));
+                                    obj.insert(
+                                        "version_upgrade_error".into(),
+                                        json!(upgrade_err),
+                                    );
+                                    obj.insert("actual_version".into(), json!(actual_version));
+                                    obj.insert("actual_fp8".into(), json!(actual_fp8));
+                                }
+                                message.push_str(&format!(
+                                    "\n\n[VersionGate] Warning: flow succeeded on v{actual_version} ({actual_fp8}), but failed to persist version upgrade: {upgrade_err}"
+                                ));
                             }
                         }
                     }
-
-                    // Out-of-band auth_gate handling (never logs or returns plaintext).
-                    if let Some(ref gate) = state.auth_gate {
-                        if allow_safety_level < SafetyLevel::AuthOnly {
-                            return Ok(ToolResult::error(
-                                "safety_gate_blocked: auth_gate requires 'auth_only' or higher",
-                            )
-                            .with_structured(json!({
-                                "status": "safety_gate_blocked",
-                                "code": "safety_gate_blocked",
-                                "app_id": recipe.app_id,
-                                "state": state.id,
-                                "required_level": SafetyLevel::AuthOnly.as_str(),
-                                "allowed_level": allow_safety_level.as_str(),
-                            })));
+                    Ok(ToolResult::text(message).with_structured(structured))
+                }
+                Ok(RecipeRunOutcome::EarlyToolResult(mut res)) => {
+                    if let Some(VerifyResult::VersionMismatch {
+                        expected_version,
+                        actual_version,
+                        expected_fp8,
+                        actual_fp8,
+                        ..
+                    }) = version_mismatch
+                    {
+                        if res.is_error == Some(true) {
+                            let orig_text = res
+                                .content
+                                .iter()
+                                .filter_map(|c| match c {
+                                    cua_driver_core::protocol::Content::Text { text, .. } => {
+                                        Some(text.as_str())
+                                    }
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            let enriched = format!(
+                                "VersionGate mismatch (recipe v{expected_version} ({expected_fp8}) vs live v{actual_version} ({actual_fp8})), and compatible execution failed: {orig_text}. Recipe was NOT updated; please update the recipe JSON flows/state_machine for the new version."
+                            );
+                            let mut structured = res.structured_content.take().unwrap_or_else(|| json!({}));
+                            if let Some(obj) = structured.as_object_mut() {
+                                obj.insert("expected_version".into(), json!(expected_version));
+                                obj.insert("actual_version".into(), json!(actual_version));
+                                obj.insert("expected_fp8".into(), json!(expected_fp8));
+                                obj.insert("actual_fp8".into(), json!(actual_fp8));
+                                obj.insert("version_upgraded".into(), json!(false));
+                            }
+                            return Ok(ToolResult::error(enriched).with_structured(structured));
                         }
-                        let details = execute_auth_gate(ctx.as_deref(), target_window_id, gate)?;
-                        executed_steps.push(json!({
-                            "state": state.id,
-                            "status": "auth_step_completed",
-                            "details": details,
-                        }));
                     }
+                    Ok(res)
                 }
-
-                let Some(tx) = recipe
-                    .state_machine
-                    .transitions
-                    .iter()
-                    .find(|t| t.from_state == current_state_id)
-                else {
-                    break;
-                };
-
-                if let Some(ms) = tx.wait_for_stable_frame_ms {
-                    std::thread::sleep(std::time::Duration::from_millis(ms.min(5_000)));
+                Err(err) => {
+                    if let Some(VerifyResult::VersionMismatch {
+                        expected_version,
+                        actual_version,
+                        expected_fp8,
+                        actual_fp8,
+                        ..
+                    }) = version_mismatch
+                    {
+                        return Ok(ToolResult::error(format!(
+                            "VersionGate mismatch (recipe v{expected_version} ({expected_fp8}) vs live v{actual_version} ({actual_fp8})), and existing recipe execution failed: {err:#}. Recipe was NOT updated; please update the recipe JSON flows/state_machine for the new version."
+                        ))
+                        .with_structured(json!({
+                            "status": "failed",
+                            "app_id": recipe.app_id,
+                            "expected_version": expected_version,
+                            "actual_version": actual_version,
+                            "expected_fp8": expected_fp8,
+                            "actual_fp8": actual_fp8,
+                            "version_upgraded": false,
+                            "error": format!("{err:#}"),
+                        })));
+                    }
+                    Err(err)
                 }
-                let tx_step = RecipeStep {
-                    action: tx.action.clone(),
-                    args: tx.args.clone(),
-                    wait_for_stable_frame_ms: tx.wait_for_stable_frame_ms,
-                    description: None,
-                    method: None,
-                    safety_level: None,
-                    latency_ms_est: None,
-                    fallback_method: None,
-                };
-                if let Err(blocked) = check_safety_gate(
-                    &recipe,
-                    None,
-                    std::slice::from_ref(&tx_step),
-                    SafetyLevel::ReadOnly,
-                    allow_safety_level,
-                ) {
-                    return Ok(blocked);
-                }
-                let details = execute_recipe_step_with_auth(
-                    ctx.as_deref(),
-                    &recipe,
-                    target_window_id,
-                    target_pid,
-                    &tx.action,
-                    &tx.args,
-                    auth_ctx.as_deref(),
-                )?;
-                executed_steps.push(json!({
-                    "from": tx.from_state,
-                    "to": tx.to_state,
-                    "action": tx.action,
-                    "ok": true,
-                    "details": details,
-                }));
-                current_state_id = tx.to_state.clone();
             }
-
-            Ok(ToolResult::text(format!(
-                "Completed recipe {} ({} steps)",
-                recipe.canonical_filename(),
-                executed_steps.len()
-            ))
-            .with_structured(json!({
-                "status": "completed",
-                "app_id": recipe.app_id,
-                "app_version": recipe.app_version,
-                "fp8": recipe.fp8(),
-                "final_state": current_state_id,
-                "steps": executed_steps,
-            })))
         })
         .await
         {
@@ -610,6 +573,223 @@ impl Tool for RunAppRecipeTool {
             Err(e) => ToolResult::error(format!("run_app_recipe panicked: {e}")),
         }
     }
+}
+
+enum RecipeRunOutcome {
+    Completed {
+        message: String,
+        structured: Value,
+    },
+    EarlyToolResult(ToolResult),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_run_app_recipe_body(
+    ctx: Option<&X11ScreenContext>,
+    recipe: &AppRecipe,
+    inspection: &crate::app_inspector::AppFlowInspection,
+    flow_name: Option<&str>,
+    target_window_id: Option<u64>,
+    target_pid: Option<u32>,
+    allow_safety_level: SafetyLevel,
+    auth_ctx: Option<&EffectiveAuthorizationContext>,
+) -> anyhow::Result<RecipeRunOutcome> {
+    if let Some(flow) = flow_name {
+        let steps = recipe.flows.get(flow).ok_or_else(|| {
+            let available: Vec<&str> = recipe.flows.keys().map(String::as_str).collect();
+            anyhow::anyhow!(
+                "flow '{flow}' not found in recipe {} (available: {:?})",
+                recipe.canonical_filename(),
+                available
+            )
+        })?;
+        if let Err(blocked) = check_safety_gate(
+            recipe,
+            Some(flow),
+            steps,
+            SafetyLevel::ReadOnly,
+            allow_safety_level,
+        ) {
+            return Ok(RecipeRunOutcome::EarlyToolResult(blocked));
+        }
+        let FlowExecutionResult {
+            steps: executed_steps,
+            artifacts,
+            error: step_err,
+        } = execute_flow_steps_with_auth(
+            ctx,
+            recipe,
+            target_window_id,
+            target_pid,
+            steps,
+            auth_ctx,
+        );
+        if let Some((idx, action, err)) = step_err {
+            return Ok(RecipeRunOutcome::EarlyToolResult(
+                ToolResult::error(format!(
+                    "flow '{flow}' failed at step {idx} ({action}): {err:#}"
+                ))
+                .with_structured(json!({
+                    "status": "failed",
+                    "app_id": recipe.app_id,
+                    "app_version": recipe.app_version,
+                    "fp8": recipe.fp8(),
+                    "flow": flow,
+                    "steps": executed_steps,
+                    "artifacts": artifacts,
+                })),
+            ));
+        }
+        let summary = format_artifacts_summary(&artifacts);
+        let msg = if summary.is_empty() {
+            format!(
+                "Completed flow '{}' of {} ({} steps, non-screenshot verified)",
+                flow,
+                recipe.canonical_filename(),
+                executed_steps.len()
+            )
+        } else {
+            format!(
+                "Completed flow '{}' of {} ({} steps, non-screenshot verified)\n\n{}",
+                flow,
+                recipe.canonical_filename(),
+                executed_steps.len(),
+                summary
+            )
+        };
+        return Ok(RecipeRunOutcome::Completed {
+            message: msg,
+            structured: json!({
+                "status": "completed",
+                "app_id": recipe.app_id,
+                "app_version": recipe.app_version,
+                "fp8": recipe.fp8(),
+                "flow": flow,
+                "steps": executed_steps,
+                "artifacts": artifacts,
+            }),
+        });
+    }
+
+    let mut executed_steps = Vec::new();
+    let mut current_state_id = recipe.state_machine.initial_state.clone();
+
+    for _ in 0..=recipe.state_machine.transitions.len() {
+        if let Some(state) = recipe
+            .state_machine
+            .states
+            .iter()
+            .find(|s| s.id == current_state_id)
+        {
+            // Check CAPTCHA / human verification boundary.
+            if let Some(ref title) = inspection.window_title {
+                for pat in &state.captcha_patterns {
+                    if title.to_ascii_lowercase().contains(&pat.to_ascii_lowercase()) {
+                        return Ok(RecipeRunOutcome::EarlyToolResult(
+                            ToolResult::error(format!(
+                                "human verification required: matched '{pat}'"
+                            ))
+                            .with_structured(json!({
+                                "status": "human_verification_required",
+                                "state": state.id,
+                                "pattern": pat,
+                            })),
+                        ));
+                    }
+                }
+            }
+
+            // Out-of-band auth_gate handling (never logs or returns plaintext).
+            if let Some(ref gate) = state.auth_gate {
+                if allow_safety_level < SafetyLevel::AuthOnly {
+                    return Ok(RecipeRunOutcome::EarlyToolResult(
+                        ToolResult::error(
+                            "safety_gate_blocked: auth_gate requires 'auth_only' or higher",
+                        )
+                        .with_structured(json!({
+                            "status": "safety_gate_blocked",
+                            "code": "safety_gate_blocked",
+                            "app_id": recipe.app_id,
+                            "state": state.id,
+                            "required_level": SafetyLevel::AuthOnly.as_str(),
+                            "allowed_level": allow_safety_level.as_str(),
+                        })),
+                    ));
+                }
+                let details = execute_auth_gate(ctx, target_window_id, gate)?;
+                executed_steps.push(json!({
+                    "state": state.id,
+                    "status": "auth_step_completed",
+                    "details": details,
+                }));
+            }
+        }
+
+        let Some(tx) = recipe
+            .state_machine
+            .transitions
+            .iter()
+            .find(|t| t.from_state == current_state_id)
+        else {
+            break;
+        };
+
+        if let Some(ms) = tx.wait_for_stable_frame_ms {
+            std::thread::sleep(std::time::Duration::from_millis(ms.min(5_000)));
+        }
+        let tx_step = RecipeStep {
+            action: tx.action.clone(),
+            args: tx.args.clone(),
+            wait_for_stable_frame_ms: tx.wait_for_stable_frame_ms,
+            description: None,
+            method: None,
+            safety_level: None,
+            latency_ms_est: None,
+            fallback_method: None,
+        };
+        if let Err(blocked) = check_safety_gate(
+            recipe,
+            None,
+            std::slice::from_ref(&tx_step),
+            SafetyLevel::ReadOnly,
+            allow_safety_level,
+        ) {
+            return Ok(RecipeRunOutcome::EarlyToolResult(blocked));
+        }
+        let details = execute_recipe_step_with_auth(
+            ctx,
+            recipe,
+            target_window_id,
+            target_pid,
+            &tx.action,
+            &tx.args,
+            auth_ctx,
+        )?;
+        executed_steps.push(json!({
+            "from": tx.from_state,
+            "to": tx.to_state,
+            "action": tx.action,
+            "ok": true,
+            "details": details,
+        }));
+        current_state_id = tx.to_state.clone();
+    }
+
+    Ok(RecipeRunOutcome::Completed {
+        message: format!(
+            "Completed recipe {} ({} steps)",
+            recipe.canonical_filename(),
+            executed_steps.len()
+        ),
+        structured: json!({
+            "status": "completed",
+            "app_id": recipe.app_id,
+            "app_version": recipe.app_version,
+            "fp8": recipe.fp8(),
+            "final_state": current_state_id,
+            "steps": executed_steps,
+        }),
+    })
 }
 
 // ── acquire_app_data ──────────────────────────────────────────────────────────
@@ -1419,17 +1599,26 @@ fn resolve_recipe_for_invocation(
     app_id: &str,
     inspection: &crate::app_inspector::AppFlowInspection,
 ) -> anyhow::Result<AppRecipe> {
+    resolve_recipe_with_path_for_invocation(recipe_path, app_id, inspection).map(|(r, _)| r)
+}
+
+fn resolve_recipe_with_path_for_invocation(
+    recipe_path: Option<&Path>,
+    app_id: &str,
+    inspection: &crate::app_inspector::AppFlowInspection,
+) -> anyhow::Result<(AppRecipe, Option<PathBuf>)> {
     if let Some(p) = recipe_path {
         let loaded = load_recipe(p).map_err(|e| anyhow::anyhow!("{e}"))?;
-        global_recipe_cache().insert_with_path(loaded.clone(), Some(p.to_path_buf()));
-        return Ok(loaded);
+        let path_buf = p.to_path_buf();
+        global_recipe_cache().insert_with_path(loaded.clone(), Some(path_buf.clone()));
+        return Ok((loaded, Some(path_buf)));
     }
     if let Some(cached) = global_recipe_cache().get(
         app_id,
         &inspection.app_version,
         &inspection.fingerprint_sha256,
     ) {
-        return Ok((*cached).clone());
+        return Ok(((*cached).clone(), None));
     }
     let dir = recipes_dir().ok_or_else(|| anyhow::anyhow!("app_recipes directory unavailable"))?;
     let (found, found_path) = find_best_recipe_with_path(
@@ -1453,8 +1642,8 @@ fn resolve_recipe_for_invocation(
             )
         }
     })?;
-    global_recipe_cache().insert_with_path(found.clone(), Some(found_path));
-    Ok(found)
+    global_recipe_cache().insert_with_path(found.clone(), Some(found_path.clone()));
+    Ok((found, Some(found_path)))
 }
 
 fn find_window_for_app(
@@ -4457,5 +4646,204 @@ mod tests {
         assert!(!sanitized.contains("ws://"));
 
         server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn run_app_recipe_auto_upgrades_version_when_existing_flow_succeeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app_bin = dir.path().join("dummy-upgraded-app");
+        std::fs::write(&app_bin, b"dummy-binary-v2").expect("write dummy app");
+
+        let inspection = inspect_app_flow(InspectAppFlowRequest {
+            app_path: Some(app_bin.display().to_string()),
+            ..Default::default()
+        })
+        .expect("inspect dummy app");
+
+        let old_version = "0.9.0";
+        let old_sha = "00000000deadbeef";
+        let recipe_path = dir.path().join("dummy_app_v0.9.0_00000000.json");
+        let recipe = json!({
+            "schema_version": 1,
+            "app_id": "dummy_upgrade_ok",
+            "app_version": old_version,
+            "version_source": "unknown",
+            "fingerprint_sha256": old_sha,
+            "flows": {
+                "ping": [{ "action": "wait_for_stable_frame", "args": { "ms": 1 } }]
+            },
+            "state_machine": {
+                "initial_state": "ready",
+                "states": [{ "id": "ready" }, { "id": "done" }],
+                "transitions": [{
+                    "from_state": "ready",
+                    "to_state": "done",
+                    "action": "wait_for_stable_frame",
+                    "args": { "ms": 1 }
+                }]
+            }
+        });
+        std::fs::write(&recipe_path, serde_json::to_string_pretty(&recipe).unwrap())
+            .expect("write recipe");
+
+        global_recipe_cache().invalidate("dummy_upgrade_ok", old_version, old_sha);
+        global_recipe_cache().invalidate(
+            "dummy_upgrade_ok",
+            &inspection.app_version,
+            &inspection.fingerprint_sha256,
+        );
+
+        let res = RunAppRecipeTool
+            .invoke(json!({
+                "app_id": "dummy_upgrade_ok",
+                "flow": "ping",
+                "recipe_path": recipe_path.display().to_string(),
+                "app_path": app_bin.display().to_string(),
+            }))
+            .await;
+        assert_ne!(res.is_error, Some(true), "expected success, got: {res:?}");
+        let structured = res.structured_content.as_ref().expect("structured");
+        assert_eq!(structured.get("version_upgraded").and_then(Value::as_bool), Some(true));
+        assert_eq!(structured.get("previous_version").and_then(Value::as_str), Some(old_version));
+        assert_eq!(
+            structured.get("app_version").and_then(Value::as_str),
+            Some(inspection.app_version.as_str())
+        );
+        assert_eq!(
+            structured.get("fp8").and_then(Value::as_str),
+            Some(inspection.fp8.as_str())
+        );
+
+        let text = serde_json::to_string(&res.content).unwrap();
+        assert!(text.contains("Auto-upgraded recipe dummy_upgrade_ok"), "text: {text}");
+
+        // Disk JSON must be atomically updated to the live version & fingerprint.
+        let disk_recipe = load_recipe(&recipe_path).expect("reload upgraded recipe");
+        assert_eq!(disk_recipe.app_version, inspection.app_version);
+        assert_eq!(disk_recipe.fingerprint_sha256, inspection.fingerprint_sha256);
+
+        // Hot cache must be refreshed: old key gone, new key present.
+        assert!(global_recipe_cache()
+            .get("dummy_upgrade_ok", old_version, old_sha)
+            .is_none());
+        assert!(global_recipe_cache()
+            .get(
+                "dummy_upgrade_ok",
+                &inspection.app_version,
+                &inspection.fingerprint_sha256
+            )
+            .is_some());
+
+        // Subsequent state_machine invocation now matches VersionGate cleanly without upgrade.
+        let res2 = RunAppRecipeTool
+            .invoke(json!({
+                "app_id": "dummy_upgrade_ok",
+                "recipe_path": recipe_path.display().to_string(),
+                "app_path": app_bin.display().to_string(),
+            }))
+            .await;
+        assert_ne!(res2.is_error, Some(true), "expected state_machine success: {res2:?}");
+        let structured2 = res2.structured_content.as_ref().expect("structured2");
+        assert!(structured2.get("version_upgraded").is_none());
+    }
+
+    #[tokio::test]
+    async fn run_app_recipe_preserves_version_and_reports_mismatch_when_flow_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app_bin = dir.path().join("dummy-failing-app");
+        std::fs::write(&app_bin, b"dummy-binary-v2-broken").expect("write dummy app");
+
+        let inspection = inspect_app_flow(InspectAppFlowRequest {
+            app_path: Some(app_bin.display().to_string()),
+            ..Default::default()
+        })
+        .expect("inspect dummy app");
+
+        let old_version = "1.2.3";
+        let old_sha = "11223344aabbccdd";
+        let recipe_path = dir.path().join("dummy_app_v1.2.3_11223344.json");
+        let recipe = json!({
+            "schema_version": 1,
+            "app_id": "dummy_upgrade_fail",
+            "app_version": old_version,
+            "version_source": "unknown",
+            "fingerprint_sha256": old_sha,
+            "flows": {
+                "broken": [{ "action": "unknown_ui_action", "args": {} }]
+            },
+            "state_machine": {
+                "initial_state": "ready",
+                "states": [{ "id": "ready" }, { "id": "done" }],
+                "transitions": [{
+                    "from_state": "ready",
+                    "to_state": "done",
+                    "action": "unknown_ui_action",
+                    "args": {}
+                }]
+            }
+        });
+        std::fs::write(&recipe_path, serde_json::to_string_pretty(&recipe).unwrap())
+            .expect("write recipe");
+
+        // Case 1: Named flow fails under version mismatch.
+        let res_flow = RunAppRecipeTool
+            .invoke(json!({
+                "app_id": "dummy_upgrade_fail",
+                "flow": "broken",
+                "recipe_path": recipe_path.display().to_string(),
+                "app_path": app_bin.display().to_string(),
+            }))
+            .await;
+        assert_eq!(res_flow.is_error, Some(true));
+        let flow_text = serde_json::to_string(&res_flow.content).unwrap();
+        assert!(flow_text.contains(old_version), "missing old version: {flow_text}");
+        assert!(
+            flow_text.contains(&inspection.app_version),
+            "missing live version: {flow_text}"
+        );
+        assert!(
+            flow_text.contains("Recipe was NOT updated"),
+            "missing non-update notice: {flow_text}"
+        );
+        assert_eq!(
+            res_flow
+                .structured_content
+                .as_ref()
+                .and_then(|v| v.get("version_upgraded"))
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+
+        let disk_after_flow = load_recipe(&recipe_path).expect("reload recipe");
+        assert_eq!(disk_after_flow.app_version, old_version);
+        assert_eq!(disk_after_flow.fingerprint_sha256, old_sha);
+
+        // Case 2: State machine fails under version mismatch.
+        let res_sm = RunAppRecipeTool
+            .invoke(json!({
+                "app_id": "dummy_upgrade_fail",
+                "recipe_path": recipe_path.display().to_string(),
+                "app_path": app_bin.display().to_string(),
+            }))
+            .await;
+        assert_eq!(res_sm.is_error, Some(true));
+        let sm_text = serde_json::to_string(&res_sm.content).unwrap();
+        assert!(sm_text.contains(old_version), "missing old version: {sm_text}");
+        assert!(
+            sm_text.contains("Recipe was NOT updated"),
+            "missing non-update notice: {sm_text}"
+        );
+        assert_eq!(
+            res_sm
+                .structured_content
+                .as_ref()
+                .and_then(|v| v.get("version_upgraded"))
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+
+        let disk_after_sm = load_recipe(&recipe_path).expect("reload recipe");
+        assert_eq!(disk_after_sm.app_version, old_version);
+        assert_eq!(disk_after_sm.fingerprint_sha256, old_sha);
     }
 }

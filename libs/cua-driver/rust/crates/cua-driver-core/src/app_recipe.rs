@@ -320,6 +320,84 @@ pub fn save_recipe_to_dir(dir: &Path, recipe: &AppRecipe) -> Result<PathBuf, Str
     Ok(path)
 }
 
+/// Atomically write `recipe` as pretty-printed JSON to `path` via a sibling
+/// temporary file + `sync_all` + `rename`.
+pub fn save_recipe_atomic(path: &Path, recipe: &AppRecipe) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+
+    let body = serde_json::to_string_pretty(recipe).map_err(|e| e.to_string())?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("recipe.json");
+    let tmp_path = parent.join(format!(
+        ".{file_name}.tmp.{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+
+    let write_res = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)?;
+        file.write_all(body.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp_path, path)?;
+        Ok(())
+    })();
+
+    if let Err(e) = write_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!("failed to atomically write {}: {e}", path.display()));
+    }
+    Ok(())
+}
+
+/// Auto-upgrade `recipe`'s `app_version` and `fingerprint_sha256` (when non-`"seeded"`)
+/// to `(actual_version, actual_sha256)`, atomically write the updated JSON back
+/// to `source_path` (preserving any curated overlay separation on disk), and
+/// refresh `cache` by invalidating the old key and inserting the upgraded recipe.
+pub fn auto_upgrade_recipe_version(
+    cache: &AppRecipeCache,
+    recipe: &mut AppRecipe,
+    source_path: Option<&Path>,
+    actual_version: &str,
+    actual_sha256: &str,
+) -> Result<(), String> {
+    let old_version = recipe.app_version.clone();
+    let old_sha256 = recipe.fingerprint_sha256.clone();
+
+    if recipe.app_version != "seeded" {
+        recipe.app_version = actual_version.to_owned();
+    }
+    if recipe.fingerprint_sha256 != "seeded" {
+        recipe.fingerprint_sha256 = actual_sha256.to_owned();
+    }
+
+    if let Some(path) = source_path {
+        let mut disk_recipe = load_recipe(path).unwrap_or_else(|_| recipe.clone());
+        if disk_recipe.app_version != "seeded" {
+            disk_recipe.app_version = recipe.app_version.clone();
+        }
+        if disk_recipe.fingerprint_sha256 != "seeded" {
+            disk_recipe.fingerprint_sha256 = recipe.fingerprint_sha256.clone();
+        }
+        save_recipe_atomic(path, &disk_recipe)?;
+    }
+
+    cache.invalidate(&recipe.app_id, &old_version, &old_sha256);
+    cache.insert_with_path(recipe.clone(), source_path.map(Path::to_path_buf));
+    Ok(())
+}
+
 /// Load and deserialize an [`AppRecipe`] from disk.
 pub fn load_recipe(path: &Path) -> Result<AppRecipe, String> {
     let text = std::fs::read_to_string(path)
@@ -1025,5 +1103,61 @@ mod tests {
         assert!(parsed.safety_policy.is_none());
         assert!(SafetyLevel::ReadOnly < SafetyLevel::AuthOnly);
         assert!(SafetyLevel::AuthOnly < SafetyLevel::Restricted);
+    }
+
+    #[test]
+    fn auto_upgrade_recipe_version_writes_atomically_preserves_overlay_and_refreshes_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = sample_recipe("10.52.1d", "abcdef1234567890");
+        let base_path = save_recipe_to_dir(dir.path(), &base).unwrap();
+
+        let mut overlay = sample_recipe("seeded", "seeded");
+        overlay.flows.insert(
+            "curated_flow".into(),
+            vec![RecipeStep {
+                action: "wait_for_stable_frame".into(),
+                args: serde_json::json!({ "ms": 5 }),
+                wait_for_stable_frame_ms: None,
+                description: None,
+                method: None,
+                safety_level: None,
+                latency_ms_est: None,
+                fallback_method: None,
+            }],
+        );
+        std::fs::write(
+            dir.path().join("tws.json"),
+            serde_json::to_string_pretty(&overlay).unwrap(),
+        )
+        .unwrap();
+
+        let cache = AppRecipeCache::new();
+        let (mut loaded, loaded_path) =
+            find_best_recipe_with_path(dir.path(), "tws", Some("10.52.1d"), Some("abcdef1234567890"))
+                .unwrap();
+        assert_eq!(loaded_path, base_path);
+        cache.insert_with_path(loaded.clone(), Some(loaded_path.clone()));
+
+        auto_upgrade_recipe_version(
+            &cache,
+            &mut loaded,
+            Some(&loaded_path),
+            "10.53.0a",
+            "9988776655443322",
+        )
+        .unwrap();
+
+        // In-memory recipe and cache are updated to new version/fp8, old key invalidated.
+        assert_eq!(loaded.app_version, "10.53.0a");
+        assert_eq!(loaded.fp8(), "99887766");
+        assert!(cache.get("tws", "10.52.1d", "abcdef1234567890").is_none());
+        let cached = cache.get("tws", "10.53.0a", "9988776655443322").unwrap();
+        assert!(cached.flows.contains_key("curated_flow"));
+
+        // On-disk base file has updated version/fp without baking overlay flows into base.
+        let disk_base = load_recipe(&base_path).unwrap();
+        assert_eq!(disk_base.app_version, "10.53.0a");
+        assert_eq!(disk_base.fingerprint_sha256, "9988776655443322");
+        assert!(!disk_base.flows.contains_key("curated_flow"));
     }
 }

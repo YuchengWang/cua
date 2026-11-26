@@ -1,7 +1,39 @@
-# Changelog — `YuchengWang/cua` (`feat/x11-virtual-desktop`)
+# Changelog — `YuchengWang/cua` (`develop` / `feat/x11-virtual-desktop`)
 
-> Self-maintained Linux X11 Virtual Screen & Dual-Version branch based on `trycua/cua` (`upstream/main` @ `2a15e141e2`, `cua-driver-rs-v0.57.0`).  
-> 自维护 Linux X11 虚拟桌面与双版本隔离分支变更日志（基于 `trycua/cua`）。
+> Self-maintained Linux X11 Virtual Screen, Browser CDP Proxy & Dual-Version branch based on `trycua/cua` (`upstream/main` @ `2a15e141e2`, `cua-driver-rs-v0.57.0`).  
+> 自维护 Linux X11 虚拟桌面、浏览器 CDP 代理与双版本隔离分支变更日志（基于 `trycua/cua`）。
+
+---
+
+## [ycwang-x11-v0.57.6] — `develop` (`2026-11-26`)
+
+### `AppRecipe` Auto-Upgrade on Compatible `VersionMismatch` (`2026-11-26`)
+- **Added / Changed**：
+  - `cua-driver-core/src/app_recipe.rs`: Added `save_recipe_atomic()` (temp file + `sync_all` + `rename`) and `auto_upgrade_recipe_version()` to update `app_version` and `fingerprint_sha256` (when non-`"seeded"`) on disk while preserving curated `<app_id>.json` overlay separation and refreshing `AppRecipeCache`.
+  - `platform-linux/src/tools/mcp_app_recipe.rs`: Updated `RunAppRecipeTool` (via `execute_run_app_recipe_body()` and `resolve_recipe_with_path_for_invocation()`) so `VersionGate::VersionMismatch` attempts compatible execution with existing `flows` / `state_machine` first — auto-upgrading and persisting the version on success, or preserving the original version and reporting `version_mismatch` on failure.
+- **Verified / 已核验**：
+  - Added `auto_upgrade_recipe_version_writes_atomically_preserves_overlay_and_refreshes_cache` (`cua-driver-core`), `run_app_recipe_auto_upgrades_version_when_existing_flow_succeeds`, and `run_app_recipe_preserves_version_and_reports_mismatch_when_flow_fails` (`platform-linux`).
+  - `cargo test -p cua-driver-core --lib -- --test-threads=1`, `cargo test -p platform-linux --lib`, and `cargo test -p cua-driver --test schema_consistency_test` all passed.
+
+### Batch Foreground Focus, `preserve_host`, OS Event Bus, Dialog Matcher & WebView Prober (`ed7b86a61c`, `2026-11-25`)
+- **Added / Changed**：
+  - `cua-driver-core/src/{batch_foreground.rs,batch_tools.rs,delivery.rs,tool_schema.rs}`: Added batch foreground focus management and `preserve_host` support across `run_steps` / `run_script`.
+  - `platform-linux/src/{os_events.rs,tools/mcp_os_events.rs}`: Added X11/AT-SPI OS event bus (`poll_os_events`, `wait_for_os_event`).
+  - `platform-linux/src/{dialog_matcher.rs,tools/mcp_dialog_matcher.rs}`: Added declarative `match_and_act_dialog` for transient modal/dialog matching and action dispatch.
+  - `platform-linux/src/{webview_probe.rs,tools/mcp_webview_probe.rs,hot_config.rs}`: Added `probe_webview_targets` supporting Electron/CEF/WebKitGTK/JxBrowser/Tauri CDP port discovery with hot-reloaded `webview_probes.json`.
+  - `platform-linux/src/{click.rs,press_key.rs,interaction/mod.rs,input/foreground.rs,input/focus_guard.rs}`: Integrated foreground focus preservation and `preserve_host` restoration.
+
+### Redacted Auth Site Discovery & Loopback CDP Proxy Reuse (`bd785b2871`, `7bca1e0a1d`, `0df86b94a2`, `a533c9a0b3`, `2026-11-25`)
+- **Added / Changed**：
+  - `resolve_auth_site`: Added redacted auth-site discovery tool with `google_voice.json` SMS 2FA metadata support (returning env-key names only; never exposing plaintext credentials).
+  - Browser CDP proxy: Added token-gated loopback CDP proxy reuse (`existing_profile` & `isolated_new` / `incognito`), aligned CDP WebSocket frame limit to 256 MiB with disconnect-reason logging, and guarded `Target.closeTarget` against closing the last remaining `"type": "page"` tab on `existing_profile` proxies.
+
+### Earlier `develop` Releases (`ycwang-x11-v0.57.1` .. `ycwang-x11-v0.57.5`, `2026-11-22` .. `2026-11-25`)
+- **`ycwang-x11-v0.57.5` (`d3992af4dd`)**: Added `approve_browser_consent` with retry/`wait_ms`, `skip_web_content` AT-SPI pruning, and WebView routing.
+- **`ycwang-x11-v0.57.4` (`a0f7f7f71c`)**: Isolated `xdg-open` stdio and prioritized transient alert/dialog nodes in AT-SPI tree walks.
+- **`ycwang-x11-v0.57.3` (`013fce7329`)**: Added transparent `sudo_in_terminal` with Zenity audit gate and default `secrets.env` lookup.
+- **`ycwang-x11-v0.57.2` (`4a1ab396b4`) & TOTP/IME/uinput hardening (`05bc694db0` .. `717b78a488`)**: Added standalone TOTP service (`type_totp_from_env`), RAII `ImeGuard` for English X11 typing, `prefer_uinput` gate, and fail-closed virtual-screen routing.
+- **`ycwang-x11-v0.57.1` (`05b61c87c5`)**: Merged `feat/x11-virtual-desktop` (X11 virtual desktop, `app_recipe`, and `acquire_app_data`).
 
 ---
 
