@@ -181,6 +181,8 @@ pub struct ResolveAuthSiteResponse {
     pub sms_config: Option<SmsAuthConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_template: Option<AuthTemplateSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linkage_hint: Option<String>,
     pub candidates: Vec<AuthSiteCandidate>,
 }
 
@@ -1455,11 +1457,62 @@ fn score_username_candidate(candidate: &AuthSiteCandidate, username: &str) -> u3
     0
 }
 
+fn build_linkage_hint(candidate: &AuthSiteCandidate) -> Option<String> {
+    if let Some(ref totp_key) = candidate.totp_env_key {
+        let env_file = candidate.env_file.as_deref().unwrap_or("env/secrets.env");
+        let press_enter = candidate.press_enter.unwrap_or(true);
+        let totp_seq = format!(
+            "chrome_devtools:click OTP field -> cua-ycwang:bring_to_front -> \
+             cua-ycwang:type_totp_from_env(env_key=\"{totp_key}\", env_file=\"{env_file}\", \
+             press_enter={press_enter})"
+        );
+        if let Some(ref recipe) = candidate.app_recipe {
+            return Some(format!(
+                "{totp_seq} (or cua-ycwang:run_app_recipe(app_id=\"{}\", flow=\"{}\", \
+                 allow_safety_level=\"auth_only\"))",
+                recipe.app_id, recipe.flow
+            ));
+        }
+        return Some(totp_seq);
+    }
+    if let Some(ref recipe) = candidate.app_recipe {
+        return Some(format!(
+            "cua-ycwang:run_app_recipe(app_id=\"{}\", flow=\"{}\", allow_safety_level=\"auth_only\")",
+            recipe.app_id, recipe.flow
+        ));
+    }
+    if is_google_voice_sms_type(candidate.second_factor_type.as_deref()) {
+        let voice_url = candidate
+            .sms_config
+            .as_ref()
+            .and_then(|s| s.voice_url.as_deref())
+            .unwrap_or("https://voice.google.com/u/0/messages");
+        return Some(format!(
+            "Record T0 baseline on {voice_url} -> trigger SMS send -> poll gv-thread-list-item \
+             (msgTimeMs >= t0FloorMin & not in baselineSet) -> fill code"
+        ));
+    }
+    if candidate.username_env_key.is_some() || candidate.password_env_key.is_some() {
+        let env_file = candidate.env_file.as_deref().unwrap_or("env/secrets.env");
+        let key_hint = candidate
+            .password_env_key
+            .as_deref()
+            .or(candidate.username_env_key.as_deref())
+            .unwrap_or("CUA_YCWANG_*");
+        return Some(format!(
+            "chrome_devtools:click input field -> cua-ycwang:bring_to_front -> \
+             cua-ycwang:type_secret_from_env(env_key=\"{key_hint}\", env_file=\"{env_file}\")"
+        ));
+    }
+    None
+}
+
 fn build_matched_response(
     query_host: Option<String>,
     candidate: AuthSiteCandidate,
     reason: &str,
 ) -> ResolveAuthSiteResponse {
+    let linkage_hint = build_linkage_hint(&candidate);
     ResolveAuthSiteResponse {
         matched: true,
         reason: reason.to_owned(),
@@ -1482,6 +1535,7 @@ fn build_matched_response(
         press_enter: candidate.press_enter,
         sms_config: candidate.sms_config.clone(),
         auth_template: candidate.auth_template.clone(),
+        linkage_hint,
         candidates: vec![candidate],
     }
 }
@@ -1513,6 +1567,7 @@ fn build_unmatched_response(
         press_enter: None,
         sms_config: None,
         auth_template: None,
+        linkage_hint: None,
         candidates,
     }
 }
@@ -1668,7 +1723,12 @@ fn format_summary_text(resp: &ResolveAuthSiteResponse) -> String {
         if let Some(ref env_file) = resp.env_file {
             details.push(format!("env_file={env_file}"));
         }
-        format!("Matched auth site '{site}' ({})", details.join(", "))
+        let base = format!("Matched auth site '{site}' ({})", details.join(", "));
+        if let Some(ref hint) = resp.linkage_hint {
+            format!("{base}\nnext_step: {hint}")
+        } else {
+            base
+        }
     } else if resp.candidates.is_empty() {
         format!(
             "No matching auth site found (reason={}{})",
@@ -2501,5 +2561,31 @@ mod tests {
         // Check Content enum import stays exercised.
         let result = ToolResult::text(text);
         assert!(matches!(result.content.first(), Some(Content::Text { .. })));
+    }
+
+    #[test]
+    fn resolve_auth_site_includes_linkage_hint_for_totp_and_app_recipe() {
+        let dir = write_fixture_dir();
+        let resp = resolve_auth_site_in_dir(
+            dir.path(),
+            &ResolveAuthSiteInput {
+                url: Some("https://github.com/sessions/two-factor".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(resp.matched);
+        let hint = resp
+            .linkage_hint
+            .as_deref()
+            .expect("totp site should include linkage_hint");
+        assert!(hint.contains("chrome_devtools:click OTP field"));
+        assert!(hint.contains("cua-ycwang:bring_to_front"));
+        assert!(hint.contains("cua-ycwang:type_totp_from_env"));
+        assert!(hint.contains("press_enter=true"));
+
+        let text = format_summary_text(&resp);
+        assert!(text.contains("next_step: chrome_devtools:click OTP field"));
+        assert_no_secrets_leaked(&text);
     }
 }

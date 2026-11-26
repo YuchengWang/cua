@@ -24,6 +24,165 @@ use x11rb::protocol::Event as X11Event;
 use x11rb::rust_connection::RustConnection;
 
 pub const DEFAULT_EVENT_RING_CAPACITY: usize = 2048;
+pub const AUTH_GATE_EVENT_KIND: &str = "auth_gate_detected";
+pub const AUTH_GATE_SUGGESTED_ACTION: &str =
+    "Call resolve_auth_site + focus OTP field + type_totp_from_env or run_app_recipe";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthGateMatch {
+    pub title: String,
+    pub url_hint: Option<String>,
+    pub suggested_action: &'static str,
+}
+
+fn contains_ascii_word(haystack_lower: &str, word: &str) -> bool {
+    let bytes = haystack_lower.as_bytes();
+    let wlen = word.len();
+    haystack_lower.match_indices(word).any(|(idx, _)| {
+        let before_ok = idx == 0 || !bytes[idx - 1].is_ascii_alphanumeric();
+        let after = idx + wlen;
+        let after_ok = after == bytes.len() || !bytes[after].is_ascii_alphanumeric();
+        before_ok && after_ok
+    })
+}
+
+fn extract_domain_token(title: &str) -> Option<String> {
+    for raw in title.split(|c: char| c.is_whitespace() || matches!(c, '|' | '·' | '/' | '(' | ')' | '[' | ']' | ',' | ';')) {
+        let token = raw.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '-');
+        if token.len() < 4 || !token.contains('.') || token.starts_with('.') || token.ends_with('.') {
+            continue;
+        }
+        let lower = token.to_ascii_lowercase();
+        let parts: Vec<&str> = lower.split('.').collect();
+        if parts.len() < 2 || parts.iter().any(|p| p.is_empty() || p.starts_with('-') || p.ends_with('-')) {
+            continue;
+        }
+        let tld = parts.last().copied().unwrap_or("");
+        if tld.len() >= 2 && tld.chars().all(|c| c.is_ascii_alphabetic()) {
+            return Some(format!("https://{lower}"));
+        }
+    }
+    None
+}
+
+fn extract_url_hint_from_title(title: &str) -> Option<String> {
+    let lower = title.to_ascii_lowercase();
+    let known = [
+        ("github", "https://github.com"),
+        ("google accounts", "https://accounts.google.com"),
+        ("accounts.google.com", "https://accounts.google.com"),
+        ("interactive brokers", "https://www.interactivebrokers.com"),
+        ("ibkr", "https://www.interactivebrokers.com"),
+        ("microsoft", "https://login.microsoftonline.com"),
+        ("office 365", "https://login.microsoftonline.com"),
+        ("amazon web services", "https://signin.aws.amazon.com"),
+        ("aws", "https://signin.aws.amazon.com"),
+        ("openai", "https://auth.openai.com"),
+        ("chatgpt", "https://auth.openai.com"),
+        ("cloudflare", "https://dash.cloudflare.com"),
+        ("stripe", "https://dashboard.stripe.com"),
+        ("gitlab", "https://gitlab.com"),
+        ("bitbucket", "https://bitbucket.org"),
+        ("okta", "https://okta.com"),
+        ("wise", "https://wise.com"),
+    ];
+    for (needle, url) in known {
+        if lower.contains(needle) {
+            return Some(url.to_owned());
+        }
+    }
+    extract_domain_token(title)
+}
+
+/// Detect whether a browser/app window title represents a 2FA or authentication gate.
+pub fn detect_auth_gate_from_title(title: &str) -> Option<AuthGateMatch> {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let phrase_matched = [
+        "two-factor authentication",
+        "two factor authentication",
+        "two-factor",
+        "two-step verification",
+        "two step verification",
+        "2-step verification",
+        "verify your identity",
+        "verify it's you",
+        "verify it\u{2019}s you",
+        "identity verification",
+        "second factor",
+        "authenticator app",
+        "verification code",
+        "security code",
+        "one-time password",
+        "one-time code",
+        "authentication required",
+        "sign in to ",
+        "sign in - ",
+        "sign in \u{2013} ",
+        "log in to ",
+    ]
+    .iter()
+    .any(|pat| lower.contains(pat));
+
+    let word_matched =
+        contains_ascii_word(&lower, "2fa") || contains_ascii_word(&lower, "otp");
+
+    if !phrase_matched && !word_matched {
+        return None;
+    }
+
+    Some(AuthGateMatch {
+        title: trimmed.to_owned(),
+        url_hint: extract_url_hint_from_title(trimmed),
+        suggested_action: AUTH_GATE_SUGGESTED_ACTION,
+    })
+}
+
+fn should_check_auth_gate(ev: &OsEvent) -> bool {
+    if ev.kind == AUTH_GATE_EVENT_KIND {
+        return false;
+    }
+    if matches!(
+        ev.kind.as_str(),
+        "window.destroy" | "x11.popup_unmap" | "object.children_changed.remove"
+    ) {
+        return false;
+    }
+    if ev.kind == "object.state_changed.showing" && ev.showing == Some(false) {
+        return false;
+    }
+    true
+}
+
+fn build_auth_gate_draft(trigger: &OsEvent, gate: AuthGateMatch) -> OsEventDraft {
+    let mut detail = json!({
+        "window_id": trigger.window_id,
+        "pid": trigger.pid,
+        "title": gate.title,
+        "suggested_action": gate.suggested_action,
+        "trigger_kind": trigger.kind,
+        "trigger_seq": trigger.seq,
+    });
+    if let Some(ref url_hint) = gate.url_hint {
+        detail["url_hint"] = json!(url_hint);
+    }
+    OsEventDraft {
+        source: trigger.source.clone(),
+        kind: AUTH_GATE_EVENT_KIND.into(),
+        pid: trigger.pid,
+        window_id: trigger.window_id,
+        role: trigger.role.clone(),
+        name: Some(gate.title),
+        bus_name: trigger.bus_name.clone(),
+        object_path: trigger.object_path.clone(),
+        showing: trigger.showing,
+        override_redirect: trigger.override_redirect,
+        detail: Some(detail),
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OsEvent {
@@ -231,6 +390,15 @@ impl OsEventBus {
             override_redirect: draft.override_redirect,
             detail: draft.detail,
         };
+        let auth_gate_draft = if should_check_auth_gate(&event) {
+            event
+                .name
+                .as_deref()
+                .and_then(detect_auth_gate_from_title)
+                .map(|gate| build_auth_gate_draft(&event, gate))
+        } else {
+            None
+        };
         {
             let mut ring = self.ring.lock().unwrap();
             while ring.len() >= self.capacity {
@@ -239,6 +407,9 @@ impl OsEventBus {
             ring.push_back(event);
         }
         self.notify.notify_waiters();
+        if let Some(auth_draft) = auth_gate_draft {
+            self.push(auth_draft);
+        }
         seq
     }
 
@@ -252,6 +423,7 @@ impl OsEventBus {
         name: Option<String>,
     ) {
         let mut changed = false;
+        let mut auth_gate_draft = None;
         {
             let mut ring = self.ring.lock().unwrap();
             if let Some(ev) = ring.iter_mut().rev().find(|e| e.seq == seq) {
@@ -266,11 +438,19 @@ impl OsEventBus {
                 if ev.name.is_none() && name.is_some() {
                     ev.name = name;
                     changed = true;
+                    if should_check_auth_gate(ev) {
+                        if let Some(gate) = ev.name.as_deref().and_then(detect_auth_gate_from_title) {
+                            auth_gate_draft = Some(build_auth_gate_draft(ev, gate));
+                        }
+                    }
                 }
             }
         }
         if changed {
             self.notify.notify_waiters();
+        }
+        if let Some(auth_draft) = auth_gate_draft {
+            self.push(auth_draft);
         }
     }
 
@@ -744,5 +924,87 @@ mod tests {
         assert_eq!(polled.events[0].window_id, Some(0x220004));
         assert_eq!(polled.events[0].override_redirect, Some(true));
         assert!(known.is_empty());
+    }
+
+    #[test]
+    fn detect_auth_gate_from_title_matches_gates_and_extracts_url_hint() {
+        let gh = detect_auth_gate_from_title("Two-factor authentication · GitHub - Google Chrome")
+            .expect("should match GitHub 2FA");
+        assert_eq!(gh.url_hint.as_deref(), Some("https://github.com"));
+        assert_eq!(gh.suggested_action, AUTH_GATE_SUGGESTED_ACTION);
+
+        let google = detect_auth_gate_from_title("2-Step Verification - Google Accounts")
+            .expect("should match Google 2-Step Verification");
+        assert_eq!(
+            google.url_hint.as_deref(),
+            Some("https://accounts.google.com")
+        );
+
+        let verify = detect_auth_gate_from_title("Verify your identity - portal.example.com")
+            .expect("should match Verify your identity with domain hint");
+        assert_eq!(
+            verify.url_hint.as_deref(),
+            Some("https://portal.example.com")
+        );
+
+        let signin = detect_auth_gate_from_title("Sign in to GitHub")
+            .expect("should match Sign in to GitHub");
+        assert_eq!(signin.url_hint.as_deref(), Some("https://github.com"));
+
+        assert!(detect_auth_gate_from_title("GitHub - Pull Requests - Google Chrome").is_none());
+        assert!(detect_auth_gate_from_title("   ").is_none());
+    }
+
+    #[test]
+    fn os_event_bus_emits_auth_gate_detected_on_push_and_metadata_patch() {
+        let bus = OsEventBus::new(16);
+
+        // 1. Direct push with matching title emits auth_gate_detected
+        bus.push(OsEventDraft {
+            source: "atspi".into(),
+            kind: "window.activate".into(),
+            pid: Some(4242),
+            window_id: Some(0x1001),
+            role: Some("frame".into()),
+            name: Some("Sign in to GitHub - Google Chrome".into()),
+            ..Default::default()
+        });
+
+        // 2. Push without title, then patch_event_metadata with matching title
+        let seq2 = bus.push(OsEventDraft {
+            source: "atspi".into(),
+            kind: "window.create".into(),
+            window_id: Some(0x1002),
+            bus_name: Some(":1.88".into()),
+            ..Default::default()
+        });
+        bus.patch_event_metadata(
+            seq2,
+            Some(5353),
+            Some("frame".into()),
+            Some("Two-Step Verification - Google Accounts".into()),
+        );
+
+        let filter = OsEventFilter::from_params(None, vec!["auth_gate_detected".into()], None, None)
+            .unwrap();
+        let res = bus.poll(None, &filter, 10);
+        assert_eq!(res.count, 2);
+
+        let first = &res.events[0];
+        assert_eq!(first.kind, "auth_gate_detected");
+        assert_eq!(first.pid, Some(4242));
+        assert_eq!(first.window_id, Some(0x1001));
+        let d1 = first.detail.as_ref().unwrap();
+        assert_eq!(d1["url_hint"], "https://github.com");
+        assert_eq!(d1["suggested_action"], AUTH_GATE_SUGGESTED_ACTION);
+        assert_eq!(d1["trigger_kind"], "window.activate");
+
+        let second = &res.events[1];
+        assert_eq!(second.kind, "auth_gate_detected");
+        assert_eq!(second.pid, Some(5353));
+        assert_eq!(second.window_id, Some(0x1002));
+        let d2 = second.detail.as_ref().unwrap();
+        assert_eq!(d2["url_hint"], "https://accounts.google.com");
+        assert_eq!(d2["trigger_kind"], "window.create");
     }
 }

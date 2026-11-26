@@ -16,7 +16,84 @@ use cua_driver_core::{
 };
 use serde_json::{json, Value};
 
-use crate::os_events::{ensure_watchers_active, global_os_event_bus, OsEventFilter};
+use crate::os_events::{
+    ensure_watchers_active, global_os_event_bus, OsEvent, OsEventFilter, PollOsEventsResult,
+    WaitForOsEventResult, AUTH_GATE_EVENT_KIND, AUTH_GATE_SUGGESTED_ACTION,
+};
+
+fn format_auth_gate_line(ev: &OsEvent) -> Option<String> {
+    if ev.kind != AUTH_GATE_EVENT_KIND {
+        return None;
+    }
+    let detail = ev.detail.as_ref();
+    let window_id = detail
+        .and_then(|d| d.get("window_id"))
+        .and_then(|v| v.as_u64())
+        .or(ev.window_id);
+    let pid = detail
+        .and_then(|d| d.get("pid"))
+        .and_then(|v| v.as_u64())
+        .map(|p| p as u32)
+        .or(ev.pid);
+    let title = detail
+        .and_then(|d| d.get("title"))
+        .and_then(|v| v.as_str())
+        .or(ev.name.as_deref())
+        .unwrap_or("");
+    let url_hint = detail
+        .and_then(|d| d.get("url_hint"))
+        .and_then(|v| v.as_str());
+    let suggested_action = detail
+        .and_then(|d| d.get("suggested_action"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(AUTH_GATE_SUGGESTED_ACTION);
+    let mut parts = Vec::new();
+    if let Some(wid) = window_id {
+        parts.push(format!("window_id={wid}"));
+    }
+    if let Some(p) = pid {
+        parts.push(format!("pid={p}"));
+    }
+    parts.push(format!("title={title:?}"));
+    if let Some(url) = url_hint {
+        parts.push(format!("url_hint={url:?}"));
+    }
+    parts.push(format!("suggested_action={suggested_action:?}"));
+    Some(format!("[AUTH_GATE_DETECTED] {}", parts.join(" ")))
+}
+
+fn format_poll_text(result: &PollOsEventsResult) -> String {
+    let mut text = format!(
+        "Polled {} OS event(s) (next_cursor={}, latest_seq={}, gaps_detected={}).",
+        result.count, result.next_cursor, result.latest_seq, result.gaps_detected
+    );
+    for ev in &result.events {
+        if let Some(line) = format_auth_gate_line(ev) {
+            text.push('\n');
+            text.push_str(&line);
+        }
+    }
+    text
+}
+
+fn format_wait_text(result: &WaitForOsEventResult) -> String {
+    if let Some(ref ev) = result.event {
+        let mut text = format!(
+            "Matched OS event seq={} kind={} pid={:?} role={:?} name={:?} in {}ms.",
+            ev.seq, ev.kind, ev.pid, ev.role, ev.name, result.elapsed_ms
+        );
+        if let Some(line) = format_auth_gate_line(ev) {
+            text.push('\n');
+            text.push_str(&line);
+        }
+        text
+    } else {
+        format!(
+            "Timed out waiting for OS event after {}ms (next_cursor={}).",
+            result.elapsed_ms, result.next_cursor
+        )
+    }
+}
 
 fn parse_filter(args: &Value) -> Result<OsEventFilter, ToolResult> {
     let pid = match args.get("pid") {
@@ -57,7 +134,7 @@ impl Tool for PollOsEventsTool {
                     "event_kinds": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Optional event kind filters (e.g. window.create, window.activate, window.destroy, document.load_complete, document.reload, object.children_changed.add, object.children_changed.remove, object.state_changed.showing, x11.popup_map, x11.popup_unmap; prefix like 'window' also matches)."
+                        "description": "Optional event kind filters (e.g. window.create, window.activate, window.destroy, document.load_complete, document.reload, object.children_changed.add, object.children_changed.remove, object.state_changed.showing, x11.popup_map, x11.popup_unmap, auth_gate_detected; prefix like 'window' also matches)."
                     },
                     "role": {
                         "type": "string",
@@ -93,10 +170,7 @@ impl Tool for PollOsEventsTool {
         let cursor = args.opt_u64("cursor");
         let limit = args.u64_or("limit", 50).clamp(1, 500) as usize;
         let result = global_os_event_bus().poll(cursor, &filter, limit);
-        let text = format!(
-            "Polled {} OS event(s) (next_cursor={}, latest_seq={}, gaps_detected={}).",
-            result.count, result.next_cursor, result.latest_seq, result.gaps_detected
-        );
+        let text = format_poll_text(&result);
         ToolResult::text(text).with_structured(json!(result))
     }
 }
@@ -128,7 +202,7 @@ impl Tool for WaitForOsEventTool {
                     "event_kinds": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Optional event kind filters (e.g. window.create, window.activate, document.load_complete, object.state_changed.showing, x11.popup_map)."
+                        "description": "Optional event kind filters (e.g. window.create, window.activate, document.load_complete, object.state_changed.showing, x11.popup_map, auth_gate_detected)."
                     },
                     "role": {
                         "type": "string",
@@ -166,17 +240,7 @@ impl Tool for WaitForOsEventTool {
         let result = global_os_event_bus()
             .wait_for(cursor, &filter, Duration::from_millis(timeout_ms))
             .await;
-        let text = if let Some(ref ev) = result.event {
-            format!(
-                "Matched OS event seq={} kind={} pid={:?} role={:?} name={:?} in {}ms.",
-                ev.seq, ev.kind, ev.pid, ev.role, ev.name, result.elapsed_ms
-            )
-        } else {
-            format!(
-                "Timed out waiting for OS event after {}ms (next_cursor={}).",
-                result.elapsed_ms, result.next_cursor
-            )
-        };
+        let text = format_wait_text(&result);
         ToolResult::text(text).with_structured(json!(result))
     }
 }
@@ -199,5 +263,46 @@ mod tests {
                 tool.name
             );
         }
+    }
+
+    #[test]
+    fn poll_and_wait_text_format_auth_gate_detected_details() {
+        use crate::os_events::{OsEventBus, OsEventDraft};
+
+        let bus = OsEventBus::new(16);
+        bus.push(OsEventDraft {
+            source: "atspi".into(),
+            kind: "window.activate".into(),
+            pid: Some(9001),
+            window_id: Some(0x3003),
+            role: Some("frame".into()),
+            name: Some("Two-factor authentication · GitHub - Google Chrome".into()),
+            ..Default::default()
+        });
+
+        let poll_res = bus.poll(None, &OsEventFilter::default(), 20);
+        let poll_text = format_poll_text(&poll_res);
+        assert!(poll_text.contains("[AUTH_GATE_DETECTED]"));
+        assert!(poll_text.contains("window_id=12291"));
+        assert!(poll_text.contains("pid=9001"));
+        assert!(poll_text.contains("url_hint=\"https://github.com\""));
+        assert!(poll_text.contains("suggested_action=\"Call resolve_auth_site + focus OTP field + type_totp_from_env or run_app_recipe\""));
+
+        let auth_ev = poll_res
+            .events
+            .into_iter()
+            .find(|e| e.kind == AUTH_GATE_EVENT_KIND)
+            .expect("auth_gate_detected event should be present");
+        let wait_res = WaitForOsEventResult {
+            matched: true,
+            timed_out: false,
+            event: Some(auth_ev),
+            next_cursor: 2,
+            elapsed_ms: 5,
+        };
+        let wait_text = format_wait_text(&wait_res);
+        assert!(wait_text.contains("Matched OS event"));
+        assert!(wait_text.contains("[AUTH_GATE_DETECTED]"));
+        assert!(wait_text.contains("url_hint=\"https://github.com\""));
     }
 }
