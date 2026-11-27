@@ -15,6 +15,7 @@
 //! Only loopback `ws://` URLs are accepted: the endpoint is a local
 //! browser the platform adapter proved we own, never a remote service.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
@@ -22,6 +23,8 @@ use std::time::{Duration, Instant};
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use serde_json::Value;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
@@ -33,6 +36,8 @@ type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(20);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const WRITER_CHANNEL_CAPACITY: usize = 1024;
+const PROXY_CLIENT_CHANNEL_CAPACITY: usize = 4096;
 /// Align CDP WebSocket frame and message limits with Puppeteer (256 MiB) so
 /// large DOM snapshots, screenshots, and traces do not hit tungstenite's
 /// default 16 MiB frame / 64 MiB message caps.
@@ -217,10 +222,129 @@ enum CallOutcome {
     Error { code: Option<i64>, message: String },
 }
 
+#[derive(Deserialize)]
+struct RawUpstreamFrame<'a> {
+    #[serde(borrow, default)]
+    id: Option<&'a RawValue>,
+    #[serde(borrow, default)]
+    method: Option<Cow<'a, str>>,
+    #[serde(borrow, default, rename = "sessionId")]
+    session_id: Option<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    params: Option<&'a RawValue>,
+    #[serde(borrow, default)]
+    result: Option<&'a RawValue>,
+    #[serde(borrow, default)]
+    error: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct RawProxyRequest<'a> {
+    #[serde(borrow, default)]
+    id: Option<&'a RawValue>,
+    #[serde(borrow, default)]
+    method: Option<Cow<'a, str>>,
+    #[serde(borrow, default, rename = "sessionId")]
+    session_id: Option<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    params: Option<&'a RawValue>,
+}
+
+#[derive(Serialize)]
+struct UpstreamProxyRequest<'a> {
+    id: u64,
+    method: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "sessionId")]
+    session_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    params: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct SessionIdOnly<'a> {
+    #[serde(borrow, default, rename = "sessionId")]
+    session_id: Option<Cow<'a, str>>,
+}
+
+#[derive(Deserialize)]
+struct TargetIdOnly<'a> {
+    #[serde(borrow, default, rename = "targetId")]
+    target_id: Option<Cow<'a, str>>,
+}
+
+#[derive(Deserialize)]
+struct TargetInfoBrief<'a> {
+    #[serde(borrow, default, rename = "targetId")]
+    target_id: Option<Cow<'a, str>>,
+    #[serde(borrow, default, rename = "type")]
+    kind: Option<Cow<'a, str>>,
+}
+
+#[derive(Deserialize)]
+struct TargetCreatedParams<'a> {
+    #[serde(borrow, default, rename = "targetInfo")]
+    target_info: Option<TargetInfoBrief<'a>>,
+}
+
+#[derive(Deserialize)]
+struct DialogTypeOnly<'a> {
+    #[serde(borrow, default, rename = "type")]
+    kind: Option<Cow<'a, str>>,
+}
+
+#[derive(Deserialize)]
+struct DiscoverFlagOnly {
+    #[serde(default)]
+    discover: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct AutoAttachFlagOnly {
+    #[serde(default, rename = "autoAttach")]
+    auto_attach: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct CdpErrorBrief {
+    #[serde(default)]
+    code: Option<i64>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+fn parse_raw_field<'a, T: Deserialize<'a>>(raw: Option<&'a RawValue>) -> Option<T> {
+    raw.and_then(|r| serde_json::from_str::<T>(r.get()).ok())
+}
+
+fn format_proxy_reply(
+    original_id_raw: &str,
+    session_id: Option<&str>,
+    result: Option<&RawValue>,
+    error: Option<&RawValue>,
+) -> String {
+    let session_part = session_id
+        .and_then(|sid| serde_json::to_string(sid).ok())
+        .map(|quoted| format!(r#","sessionId":{quoted}"#))
+        .unwrap_or_default();
+    if let Some(err_raw) = error.filter(|e| e.get() != "null") {
+        format!(
+            r#"{{"id":{original_id_raw}{session_part},"error":{}}}"#,
+            err_raw.get()
+        )
+    } else if let Some(res_raw) = result {
+        format!(
+            r#"{{"id":{original_id_raw}{session_part},"result":{}}}"#,
+            res_raw.get()
+        )
+    } else {
+        format!(r#"{{"id":{original_id_raw}{session_part}}}"#)
+    }
+}
+
 /// In-flight command submitted through an attached local CDP proxy client.
 struct ProxyPendingEntry {
     client_id: u64,
-    original_id: Value,
+    original_id_raw: String,
     method: String,
     request_session_id: Option<String>,
     enable_flag: Option<bool>,
@@ -228,7 +352,7 @@ struct ProxyPendingEntry {
 }
 
 struct ProxyClientState {
-    tx: mpsc::UnboundedSender<String>,
+    tx: Option<mpsc::Sender<String>>,
     wants_discover: bool,
     wants_auto_attach: bool,
     owned_sessions: HashSet<String>,
@@ -249,13 +373,17 @@ struct ProxyRouter {
 }
 
 impl ProxyRouter {
-    fn register_client(&mut self, tx: mpsc::UnboundedSender<String>) -> u64 {
+    fn is_discover_active(&self) -> bool {
+        self.clients.values().any(|c| c.wants_discover)
+    }
+
+    fn register_client(&mut self, tx: mpsc::Sender<String>) -> u64 {
         self.next_client_id = self.next_client_id.wrapping_add(1).max(1);
         let client_id = self.next_client_id;
         self.clients.insert(
             client_id,
             ProxyClientState {
-                tx,
+                tx: Some(tx),
                 wants_discover: false,
                 wants_auto_attach: false,
                 owned_sessions: HashSet::new(),
@@ -282,23 +410,43 @@ impl ProxyRouter {
         owners
     }
 
-    fn deliver_to_clients(&self, client_ids: impl IntoIterator<Item = u64>, raw: &str) {
+    fn deliver_to_clients(&mut self, client_ids: impl IntoIterator<Item = u64>, raw: &str) {
         for cid in client_ids {
-            if let Some(client) = self.clients.get(&cid) {
-                let _ = client.tx.send(raw.to_owned());
+            if let Some(client) = self.clients.get_mut(&cid) {
+                let Some(tx) = client.tx.as_ref() else {
+                    continue;
+                };
+                match tx.try_send(raw.to_owned()) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        tracing::warn!(
+                            client_id = cid,
+                            capacity = PROXY_CLIENT_CHANNEL_CAPACITY,
+                            "CDP proxy client outbound channel full; closing outbound sender"
+                        );
+                        // Drop only the sender so the downstream reader sees EOF after
+                        // draining and `unregister_proxy_client` runs the full cleanup plan.
+                        client.tx = None;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        client.tx = None;
+                    }
+                }
             }
         }
     }
 
-    fn route_reply(&mut self, upstream_id: u64, mut v: Value) -> bool {
+    fn route_reply(&mut self, upstream_id: u64, frame: &RawUpstreamFrame<'_>) -> bool {
         let Some(entry) = self.pending.remove(&upstream_id) else {
             return false;
         };
-        let has_error = v.get("error").is_some();
+        let has_error = frame.error.is_some_and(|e| e.get() != "null");
         if !has_error {
             if entry.method == "Target.attachToTarget" {
-                if let Some(sid) = v.pointer("/result/sessionId").and_then(Value::as_str) {
-                    self.add_session_owner(sid, entry.client_id);
+                if let Some(sid) = parse_raw_field::<SessionIdOnly>(frame.result)
+                    .and_then(|s| s.session_id)
+                {
+                    self.add_session_owner(&sid, entry.client_id);
                 }
             }
             if entry.request_session_id.is_none() && entry.enable_flag == Some(false) {
@@ -319,31 +467,38 @@ impl ProxyRouter {
                 }
             }
         }
-        v["id"] = entry.original_id;
-        if let Some(client) = self.clients.get(&entry.client_id) {
-            let _ = client.tx.send(v.to_string());
-        }
+        let reply = format_proxy_reply(
+            &entry.original_id_raw,
+            frame.session_id.as_deref(),
+            frame.result,
+            frame.error,
+        );
+        self.deliver_to_clients([entry.client_id], &reply);
         true
     }
 
-    fn route_event(&mut self, v: &Value, method: &str, raw_text: &str) {
+    fn route_event(&mut self, frame: &RawUpstreamFrame<'_>, method: &str, raw_text: &str) {
         if self.clients.is_empty() {
             return;
         }
-        if let Some(parent_sid) = v.get("sessionId").and_then(Value::as_str) {
+        if let Some(parent_sid) = frame.session_id.as_deref() {
             let Some(owners) = self.session_owners.get(parent_sid).cloned() else {
                 // Target session belongs to driver-internal calls; never leak to proxies.
                 return;
             };
             if method == "Target.attachedToTarget" {
-                if let Some(child_sid) = v.pointer("/params/sessionId").and_then(Value::as_str) {
+                if let Some(child_sid) = parse_raw_field::<SessionIdOnly>(frame.params)
+                    .and_then(|s| s.session_id)
+                {
                     for &cid in &owners {
-                        self.add_session_owner(child_sid, cid);
+                        self.add_session_owner(&child_sid, cid);
                     }
                 }
             } else if method == "Target.detachedFromTarget" {
-                if let Some(detached_sid) = v.pointer("/params/sessionId").and_then(Value::as_str) {
-                    self.remove_session_everywhere(detached_sid);
+                if let Some(detached_sid) = parse_raw_field::<SessionIdOnly>(frame.params)
+                    .and_then(|s| s.session_id)
+                {
+                    self.remove_session_everywhere(&detached_sid);
                 }
             }
             self.deliver_to_clients(owners, raw_text);
@@ -358,16 +513,20 @@ impl ProxyRouter {
                     .filter(|(_, c)| c.wants_auto_attach)
                     .map(|(&cid, _)| cid)
                     .collect();
-                if let Some(child_sid) = v.pointer("/params/sessionId").and_then(Value::as_str) {
+                if let Some(child_sid) = parse_raw_field::<SessionIdOnly>(frame.params)
+                    .and_then(|s| s.session_id)
+                {
                     for &cid in &targets {
-                        self.add_session_owner(child_sid, cid);
+                        self.add_session_owner(&child_sid, cid);
                     }
                 }
                 self.deliver_to_clients(targets, raw_text);
             }
             "Target.detachedFromTarget" => {
-                if let Some(detached_sid) = v.pointer("/params/sessionId").and_then(Value::as_str) {
-                    if let Some(owners) = self.remove_session_everywhere(detached_sid) {
+                if let Some(detached_sid) = parse_raw_field::<SessionIdOnly>(frame.params)
+                    .and_then(|s| s.session_id)
+                {
+                    if let Some(owners) = self.remove_session_everywhere(&detached_sid) {
                         self.deliver_to_clients(owners, raw_text);
                     }
                 }
@@ -443,6 +602,10 @@ struct Demux {
     /// keeps an `Emulation.*` override only while the session that set it
     /// stays attached, so clearing it must reuse that session.
     media_override_sessions: StdMutex<HashMap<String, String>>,
+    /// Cached `"type": "page"` target IDs, populated lazily by `Target.getTargets`
+    /// and maintained by `Target.targetCreated` / `Target.targetDestroyed` /
+    /// `Target.targetInfoChanged`.
+    page_target_ids: StdMutex<Option<HashSet<String>>>,
     proxy: StdMutex<ProxyRouter>,
     next_dialog_generation: AtomicU64,
     closed: AtomicBool,
@@ -459,8 +622,77 @@ impl Demux {
         self.session_targets.lock().unwrap().clear();
         self.dialogs.lock().unwrap().clear();
         self.media_override_sessions.lock().unwrap().clear();
+        self.page_target_ids.lock().unwrap().take();
         self.proxy.lock().unwrap().clear();
         let _ = self.close_tx.send(true);
+    }
+
+    fn update_page_target_cache(&self, method: &str, params: Option<&RawValue>) {
+        let mut cache = self.page_target_ids.lock().unwrap();
+        let Some(pages) = cache.as_mut() else {
+            return;
+        };
+        match method {
+            "Target.targetCreated" => {
+                if let Some(info) =
+                    parse_raw_field::<TargetCreatedParams>(params).and_then(|p| p.target_info)
+                {
+                    if info.kind.as_deref() == Some("page") {
+                        if let Some(tid) = info.target_id {
+                            pages.insert(tid.into_owned());
+                        }
+                    }
+                }
+            }
+            "Target.targetInfoChanged" => {
+                if let Some(info) =
+                    parse_raw_field::<TargetCreatedParams>(params).and_then(|p| p.target_info)
+                {
+                    if let Some(tid) = info.target_id {
+                        if info.kind.as_deref() == Some("page") {
+                            pages.insert(tid.into_owned());
+                        } else {
+                            pages.remove(tid.as_ref());
+                        }
+                    }
+                }
+            }
+            "Target.targetDestroyed" => {
+                if let Some(tid) = parse_raw_field::<TargetIdOnly>(params).and_then(|p| p.target_id)
+                {
+                    pages.remove(tid.as_ref());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Dedicated outbound writer task: drains the bounded send queue and batches
+/// contiguous frames via `feed` + `flush`, avoiding lock convoying across `.await`.
+async fn write_loop(
+    mut write: SplitSink<WsStream, Message>,
+    mut rx: mpsc::Receiver<String>,
+    demux: Arc<Demux>,
+) {
+    while let Some(text) = rx.recv().await {
+        if let Err(err) = write.feed(Message::Text(text)).await {
+            tracing::warn!(error = %err, "upstream CDP websocket feed failed");
+            demux.close();
+            return;
+        }
+        while let Ok(more) = rx.try_recv() {
+            if let Err(err) = write.feed(Message::Text(more)).await {
+                tracing::warn!(error = %err, "upstream CDP websocket feed failed");
+                demux.close();
+                return;
+            }
+        }
+        if let Err(err) = write.flush().await {
+            tracing::warn!(error = %err, "upstream CDP websocket flush failed");
+            demux.close();
+            return;
+        }
     }
 }
 
@@ -496,99 +728,133 @@ async fn read_loop(mut read: SplitStream<WsStream>, demux: Arc<Demux>) {
             }
             _ => continue,
         };
-        let v: Value = match serde_json::from_str(&text) {
+        let parsed: RawUpstreamFrame<'_> = match serde_json::from_str(&text) {
             Ok(v) => v,
             Err(_) => continue,
         };
-        if let Some(id) = v.get("id").and_then(Value::as_u64) {
+        if let Some(id) = parsed.id.and_then(|r| r.get().parse::<u64>().ok()) {
             let pending_tx = demux.pending.lock().unwrap().remove(&id);
             if let Some(tx) = pending_tx {
-                let outcome = match v.get("error") {
-                    Some(err) => CallOutcome::Error {
-                        code: err.get("code").and_then(Value::as_i64),
-                        message: err
-                            .get("message")
-                            .and_then(Value::as_str)
-                            .unwrap_or("unknown CDP error")
-                            .to_owned(),
-                    },
-                    None => CallOutcome::Result(v.get("result").cloned().unwrap_or(Value::Null)),
+                let outcome = match parsed.error.filter(|e| e.get() != "null") {
+                    Some(err_raw) => {
+                        let brief = parse_raw_field::<CdpErrorBrief>(Some(err_raw));
+                        CallOutcome::Error {
+                            code: brief.as_ref().and_then(|b| b.code),
+                            message: brief
+                                .and_then(|b| b.message)
+                                .unwrap_or_else(|| "unknown CDP error".to_owned()),
+                        }
+                    }
+                    None => {
+                        let result = parsed
+                            .result
+                            .and_then(|r| serde_json::from_str::<Value>(r.get()).ok())
+                            .unwrap_or(Value::Null);
+                        CallOutcome::Result(result)
+                    }
                 };
                 let _ = tx.send(outcome);
             } else {
-                demux.proxy.lock().unwrap().route_reply(id, v);
-            }
-        } else if let Some(method) = v.get("method").and_then(Value::as_str) {
-            demux.proxy.lock().unwrap().route_event(&v, method, &text);
-            let event = CdpEvent {
-                method: method.to_owned(),
-                session_id: v
-                    .get("sessionId")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                params: v.get("params").cloned().unwrap_or(Value::Null),
-            };
-            if let Some(session_id) = event.session_id.as_deref() {
-                let target_id = demux
-                    .session_targets
-                    .lock()
-                    .unwrap()
-                    .get(session_id)
-                    .cloned();
-                match event.method.as_str() {
-                    "Page.javascriptDialogOpening" => {
-                        let kind = match event.params.get("type").and_then(Value::as_str) {
-                            Some("alert") => "alert",
-                            Some("confirm") => "confirm",
-                            Some("prompt") => "prompt",
-                            Some("beforeunload") => "beforeunload",
-                            _ => "other",
-                        };
-                        let generation =
-                            demux.next_dialog_generation.fetch_add(1, Ordering::Relaxed);
-                        if let Some(target_id) = target_id {
-                            demux.dialogs.lock().unwrap().insert(
-                                target_id,
-                                CdpDialogState {
-                                    generation,
-                                    kind: kind.to_owned(),
-                                    session_id: session_id.to_owned(),
-                                    detached: false,
-                                },
-                            );
-                        }
-                    }
-                    "Page.javascriptDialogClosed" => {
-                        if let Some(target_id) = target_id {
-                            demux.dialogs.lock().unwrap().remove(&target_id);
-                        }
-                    }
-                    _ => {}
+                let discover_active = {
+                    let mut proxy = demux.proxy.lock().unwrap();
+                    proxy.route_reply(id, &parsed);
+                    proxy.is_discover_active()
+                };
+                if !discover_active {
+                    demux.page_target_ids.lock().unwrap().take();
                 }
-            } else if event.method == "Target.detachedFromTarget" {
+            }
+        } else if let Some(method) = parsed.method.as_deref() {
+            demux.proxy.lock().unwrap().route_event(&parsed, method, &text);
+            if matches!(
+                method,
+                "Target.targetCreated" | "Target.targetInfoChanged" | "Target.targetDestroyed"
+            ) {
+                demux.update_page_target_cache(method, parsed.params);
+            }
+            if let Some(session_id) = parsed.session_id.as_deref() {
+                if matches!(
+                    method,
+                    "Page.javascriptDialogOpening" | "Page.javascriptDialogClosed"
+                ) {
+                    let target_id = demux
+                        .session_targets
+                        .lock()
+                        .unwrap()
+                        .get(session_id)
+                        .cloned();
+                    match method {
+                        "Page.javascriptDialogOpening" => {
+                            let kind_str = parse_raw_field::<DialogTypeOnly>(parsed.params)
+                                .and_then(|d| d.kind);
+                            let kind = match kind_str.as_deref() {
+                                Some("alert") => "alert",
+                                Some("confirm") => "confirm",
+                                Some("prompt") => "prompt",
+                                Some("beforeunload") => "beforeunload",
+                                _ => "other",
+                            };
+                            let generation =
+                                demux.next_dialog_generation.fetch_add(1, Ordering::Relaxed);
+                            if let Some(target_id) = target_id {
+                                demux.dialogs.lock().unwrap().insert(
+                                    target_id,
+                                    CdpDialogState {
+                                        generation,
+                                        kind: kind.to_owned(),
+                                        session_id: session_id.to_owned(),
+                                        detached: false,
+                                    },
+                                );
+                            }
+                        }
+                        "Page.javascriptDialogClosed" => {
+                            if let Some(target_id) = target_id {
+                                demux.dialogs.lock().unwrap().remove(&target_id);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            } else if method == "Target.detachedFromTarget" {
                 // A detached session reports nothing more and cannot resolve
                 // its dialog, but the page stays blocked. Keep the record,
                 // marked unresolvable, so callers fail fast; the next attach
                 // subscribes a new session whose close event clears it.
-                if let Some(session_id) = event.params.get("sessionId").and_then(Value::as_str) {
-                    demux.session_targets.lock().unwrap().remove(session_id);
+                if let Some(session_id) = parse_raw_field::<SessionIdOnly>(parsed.params)
+                    .and_then(|s| s.session_id)
+                {
+                    demux
+                        .session_targets
+                        .lock()
+                        .unwrap()
+                        .remove(session_id.as_ref());
                     demux
                         .media_override_sessions
                         .lock()
                         .unwrap()
-                        .retain(|_, owner| owner != session_id);
+                        .retain(|_, owner| owner != session_id.as_ref());
                     for dialog in demux.dialogs.lock().unwrap().values_mut() {
-                        if dialog.session_id == session_id {
+                        if dialog.session_id == session_id.as_ref() {
                             dialog.detached = true;
                         }
                     }
                 }
             }
-            demux
-                .subscribers
-                .lock()
-                .unwrap()
-                .retain(|s| s.send(event.clone()).is_ok());
+            let mut subs = demux.subscribers.lock().unwrap();
+            subs.retain(|s| !s.is_closed());
+            if !subs.is_empty() {
+                let params = parsed
+                    .params
+                    .and_then(|r| serde_json::from_str::<Value>(r.get()).ok())
+                    .unwrap_or(Value::Null);
+                let event = CdpEvent {
+                    method: method.to_owned(),
+                    session_id: parsed.session_id.as_deref().map(str::to_owned),
+                    params,
+                };
+                subs.retain(|s| s.send(event.clone()).is_ok());
+            }
         }
     }
     demux.close();
@@ -596,18 +862,20 @@ async fn read_loop(mut read: SplitStream<WsStream>, demux: Arc<Demux>) {
 
 /// A single browser-endpoint connection.
 pub struct CdpConnection {
-    writer: Mutex<SplitSink<WsStream, Message>>,
+    writer_tx: mpsc::Sender<String>,
     proxy_control: Mutex<()>,
     close_target_guard: Mutex<()>,
     demux: Arc<Demux>,
     next_id: AtomicU64,
     existing_profile_policy: AtomicBool,
     reader: tokio::task::JoinHandle<()>,
+    writer: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for CdpConnection {
     fn drop(&mut self) {
         self.reader.abort();
+        self.writer.abort();
         self.demux.close();
     }
 }
@@ -637,20 +905,24 @@ impl CdpConnection {
             session_targets: StdMutex::new(HashMap::new()),
             dialogs: StdMutex::new(HashMap::new()),
             media_override_sessions: StdMutex::new(HashMap::new()),
+            page_target_ids: StdMutex::new(None),
             proxy: StdMutex::new(ProxyRouter::default()),
             next_dialog_generation: AtomicU64::new(1),
             closed: AtomicBool::new(false),
             close_tx,
         });
+        let (writer_tx, writer_rx) = mpsc::channel(WRITER_CHANNEL_CAPACITY);
         let reader = tokio::spawn(read_loop(read, demux.clone()));
+        let writer = tokio::spawn(write_loop(write, writer_rx, demux.clone()));
         Ok(Self {
-            writer: Mutex::new(write),
+            writer_tx,
             proxy_control: Mutex::new(()),
             close_target_guard: Mutex::new(()),
             demux,
             next_id: AtomicU64::new(1),
             existing_profile_policy: AtomicBool::new(false),
             reader,
+            writer,
         })
     }
 
@@ -680,11 +952,11 @@ impl CdpConnection {
 
     pub(crate) fn register_proxy_client(
         &self,
-    ) -> Result<(u64, mpsc::UnboundedReceiver<String>), String> {
+    ) -> Result<(u64, mpsc::Receiver<String>), String> {
         if self.is_closed() {
             return Err("CDP socket closed".to_owned());
         }
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(PROXY_CLIENT_CHANNEL_CAPACITY);
         let client_id = self.demux.proxy.lock().unwrap().register_client(tx);
         if self.is_closed() {
             self.demux.proxy.lock().unwrap().unregister_client(client_id);
@@ -696,21 +968,21 @@ impl CdpConnection {
     pub(crate) async fn forward_proxy_request(
         &self,
         client_id: u64,
-        mut obj: serde_json::Map<String, Value>,
+        raw_text: &str,
     ) -> Result<(), String> {
-        let original_id = obj
-            .get("id")
-            .cloned()
-            .filter(|v| !v.is_null())
+        let req: RawProxyRequest<'_> =
+            serde_json::from_str(raw_text).map_err(|_| "invalid CDP request JSON".to_owned())?;
+        let id_raw = req
+            .id
+            .filter(|v| v.get() != "null")
             .ok_or_else(|| "missing CDP id".to_owned())?;
-        let method = obj
-            .get("method")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
+        let method = req
+            .method
+            .as_deref()
             .ok_or_else(|| "missing CDP method".to_owned())?;
         if self.method_policy() == CdpMethodPolicy::ExistingProfile
             && matches!(
-                method.as_str(),
+                method,
                 "Browser.close" | "Browser.crash" | "Browser.crashGpuProcess"
             )
         {
@@ -727,17 +999,14 @@ impl CdpConnection {
         } else {
             None
         };
-        let request_session_id = obj
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+        let request_session_id = req.session_id.as_deref();
         let enable_flag = if request_session_id.is_none() {
-            match method.as_str() {
+            match method {
                 "Target.setDiscoverTargets" => {
-                    obj.get("params").and_then(|p| p.get("discover")).and_then(Value::as_bool)
+                    parse_raw_field::<DiscoverFlagOnly>(req.params).and_then(|p| p.discover)
                 }
                 "Target.setAutoAttach" => {
-                    obj.get("params").and_then(|p| p.get("autoAttach")).and_then(Value::as_bool)
+                    parse_raw_field::<AutoAttachFlagOnly>(req.params).and_then(|p| p.auto_attach)
                 }
                 _ => None,
             }
@@ -745,7 +1014,18 @@ impl CdpConnection {
             None
         };
 
-        let _gate = self.proxy_control.lock().await;
+        let is_control_method = matches!(
+            method,
+            "Target.setAutoAttach"
+                | "Target.setDiscoverTargets"
+                | "Target.attachToTarget"
+                | "Target.detachFromTarget"
+        );
+        let _gate = if is_control_method {
+            Some(self.proxy_control.lock().await)
+        } else {
+            None
+        };
         if self.is_closed() {
             return Err("CDP socket closed".to_owned());
         }
@@ -755,13 +1035,13 @@ impl CdpConnection {
             let Some(client) = proxy.clients.get_mut(&client_id) else {
                 return Err("proxy client unregistered".to_owned());
             };
-            let previous_flag = match method.as_str() {
+            let previous_flag = match method {
                 "Target.setDiscoverTargets" => client.wants_discover,
                 "Target.setAutoAttach" => client.wants_auto_attach,
                 _ => false,
             };
             if request_session_id.is_none() && enable_flag == Some(true) {
-                match method.as_str() {
+                match method {
                     "Target.setDiscoverTargets" => client.wants_discover = true,
                     "Target.setAutoAttach" => client.wants_auto_attach = true,
                     _ => {}
@@ -771,9 +1051,9 @@ impl CdpConnection {
                 upstream_id,
                 ProxyPendingEntry {
                     client_id,
-                    original_id,
-                    method: method.clone(),
-                    request_session_id,
+                    original_id_raw: id_raw.get().to_owned(),
+                    method: method.to_owned(),
+                    request_session_id: request_session_id.map(str::to_owned),
                     enable_flag,
                     previous_flag,
                 },
@@ -783,20 +1063,46 @@ impl CdpConnection {
             self.demux.proxy.lock().unwrap().pending.remove(&upstream_id);
             return Err("CDP socket closed".to_owned());
         }
-        obj.insert("id".to_owned(), Value::from(upstream_id));
-        let text = Value::Object(obj).to_string();
-        let sent = {
-            let mut writer = self.writer.lock().await;
-            writer.send(Message::Text(text)).await
-        };
-        if let Err(e) = sent {
+        if method == "Target.closeTarget" {
+            if let Some(tid) = parse_raw_field::<TargetIdOnly>(req.params).and_then(|p| p.target_id)
+            {
+                if let Some(pages) = self.demux.page_target_ids.lock().unwrap().as_mut() {
+                    pages.remove(tid.as_ref());
+                }
+            }
+        }
+        let text = serde_json::to_string(&UpstreamProxyRequest {
+            id: upstream_id,
+            method,
+            session_id: request_session_id,
+            params: req.params,
+        })
+        .map_err(|e| format!("CDP serialize failed during {method}: {e}"))?;
+        if self.writer_tx.send(text).await.is_err() {
             self.demux.proxy.lock().unwrap().pending.remove(&upstream_id);
-            return Err(format!("CDP send failed during {method}: {e}"));
+            return Err(format!("CDP send failed during {method}: socket closed"));
         }
         Ok(())
     }
 
     async fn guard_existing_profile_close_target(&self) -> Result<(), String> {
+        let discover_active = self.demux.proxy.lock().unwrap().is_discover_active();
+        if discover_active {
+            let cached_count = self
+                .demux
+                .page_target_ids
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(HashSet::len);
+            if let Some(count) = cached_count {
+                if count > 2 {
+                    return Ok(());
+                }
+            }
+        } else {
+            self.demux.page_target_ids.lock().unwrap().take();
+        }
         let targets = self
             .call(None, "Target.getTargets", serde_json::json!({}))
             .await
@@ -812,10 +1118,20 @@ impl CdpConnection {
                 "Refusing Target.closeTarget on existing-profile CDP proxy: Target.getTargets missing targetInfos"
                     .to_owned()
             })?;
-        let page_count = target_infos
-            .iter()
-            .filter(|info| info.get("type").and_then(Value::as_str) == Some("page"))
-            .count();
+        let mut page_ids = HashSet::new();
+        for info in target_infos {
+            if info.get("type").and_then(Value::as_str) == Some("page") {
+                if let Some(tid) = info.get("targetId").and_then(Value::as_str) {
+                    page_ids.insert(tid.to_owned());
+                }
+            }
+        }
+        let page_count = page_ids.len();
+        if self.demux.proxy.lock().unwrap().is_discover_active() {
+            *self.demux.page_target_ids.lock().unwrap() = Some(page_ids);
+        } else {
+            self.demux.page_target_ids.lock().unwrap().take();
+        }
         if page_count <= 1 {
             return Err(
                 "Refusing to close the last page tab of an existing_profile browser".to_owned(),
@@ -858,6 +1174,7 @@ impl CdpConnection {
             );
         }
         if plan.disable_discover {
+            self.demux.page_target_ids.lock().unwrap().take();
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
             cleanup_frames.push(
                 serde_json::json!({
@@ -868,12 +1185,9 @@ impl CdpConnection {
                 .to_string(),
             );
         }
-        if !cleanup_frames.is_empty() {
-            let mut writer = self.writer.lock().await;
-            for frame in cleanup_frames {
-                if writer.send(Message::Text(frame)).await.is_err() {
-                    break;
-                }
+        for frame in cleanup_frames {
+            if self.writer_tx.send(frame).await.is_err() {
+                break;
             }
         }
     }
@@ -1002,13 +1316,10 @@ impl CdpConnection {
         if let Some(sid) = session_id {
             msg["sessionId"] = Value::String(sid.to_owned());
         }
-        let sent = {
-            let mut writer = self.writer.lock().await;
-            writer.send(Message::Text(msg.to_string())).await
-        };
-        if let Err(e) = sent {
+        let sent = self.writer_tx.send(msg.to_string()).await;
+        if sent.is_err() {
             self.demux.pending.lock().unwrap().remove(&id);
-            anyhow::bail!("CDP send failed during {method}: {e}");
+            anyhow::bail!("CDP send failed during {method}: socket closed");
         }
 
         match tokio::time::timeout(timeout, rx).await {
@@ -2311,7 +2622,7 @@ mod tests {
         let close_err = conn
             .forward_proxy_request(
                 cid,
-                serde_json::from_value(json!({ "id": 99, "method": "Browser.close" })).unwrap(),
+                &json!({ "id": 99, "method": "Browser.close" }).to_string(),
             )
             .await
             .unwrap_err();
@@ -2320,12 +2631,12 @@ mod tests {
         // Proxy uses arbitrary client id (including string id) and gets exact id back.
         conn.forward_proxy_request(
             cid,
-            serde_json::from_value(json!({
+            &json!({
                 "id": "client-1",
                 "method": "Target.setDiscoverTargets",
                 "params": { "discover": true }
-            }))
-            .unwrap(),
+            })
+            .to_string(),
         )
         .await
         .unwrap();
@@ -2336,12 +2647,12 @@ mod tests {
 
         conn.forward_proxy_request(
             cid,
-            serde_json::from_value(json!({
+            &json!({
                 "id": 7,
                 "method": "Target.setAutoAttach",
                 "params": { "autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true }
-            }))
-            .unwrap(),
+            })
+            .to_string(),
         )
         .await
         .unwrap();
@@ -2423,5 +2734,209 @@ mod tests {
             .unwrap();
         let res = conn.call(None, "Runtime.evaluate", json!({})).await.unwrap();
         assert_eq!(res["blob"].as_str().unwrap().len(), 17 << 20);
+    }
+
+    #[tokio::test]
+    async fn close_target_cache_skips_get_targets_when_more_than_two_pages_remain() {
+        let get_targets_calls = Arc::new(AtomicU64::new(0));
+        let calls_for_server = get_targets_calls.clone();
+        let pages = Arc::new(StdMutex::new(vec![
+            "p1".to_owned(),
+            "p2".to_owned(),
+            "p3".to_owned(),
+        ]));
+        let pages_for_server = pages.clone();
+        let server = MockCdpServer::start(Arc::new(move |call| match call.method.as_str() {
+            "Target.getTargets" => {
+                calls_for_server.fetch_add(1, Ordering::SeqCst);
+                let infos: Vec<Value> = pages_for_server
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|id| json!({ "targetId": id, "type": "page" }))
+                    .collect();
+                MockReply::ok(json!({ "targetInfos": infos }))
+            }
+            "Target.closeTarget" => {
+                let tid = call.params.get("targetId").and_then(Value::as_str);
+                if let Some(tid) = tid {
+                    pages_for_server.lock().unwrap().retain(|id| id != tid);
+                }
+                MockReply::ok(json!({ "success": true }))
+            }
+            _ => MockReply::ok(json!({})),
+        }))
+        .await;
+
+        let conn = CdpConnection::connect(&server.ws_url()).await.unwrap();
+        conn.restrict_to_existing_profile();
+        let (cid, mut rx) = conn.register_proxy_client().unwrap();
+
+        // Enable Target.setDiscoverTargets so the local page target cache is authorized.
+        conn.forward_proxy_request(
+            cid,
+            &json!({ "id": 10, "method": "Target.setDiscoverTargets", "params": { "discover": true } })
+                .to_string(),
+        )
+        .await
+        .unwrap();
+        let _ = rx.recv().await.unwrap();
+
+        // First closeTarget initializes cache via Target.getTargets (3 pages -> allows, drops to 2).
+        conn.forward_proxy_request(
+            cid,
+            &json!({ "id": 1, "method": "Target.closeTarget", "params": { "targetId": "p1" } })
+                .to_string(),
+        )
+        .await
+        .unwrap();
+        let _ = rx.recv().await.unwrap();
+        assert_eq!(get_targets_calls.load(Ordering::SeqCst), 1);
+
+        // Simulate Target.targetCreated adding two more pages (2 -> 4 pages in cache).
+        conn.demux.update_page_target_cache(
+            "Target.targetCreated",
+            Some(
+                serde_json::value::RawValue::from_string(
+                    json!({ "targetInfo": { "targetId": "p4", "type": "page" } }).to_string(),
+                )
+                .unwrap()
+                .as_ref(),
+            ),
+        );
+        conn.demux.update_page_target_cache(
+            "Target.targetCreated",
+            Some(
+                serde_json::value::RawValue::from_string(
+                    json!({ "targetInfo": { "targetId": "p5", "type": "page" } }).to_string(),
+                )
+                .unwrap()
+                .as_ref(),
+            ),
+        );
+        pages.lock().unwrap().extend(["p4".to_owned(), "p5".to_owned()]);
+
+        // With discover active and 4 cached pages (> 2), closeTarget skips Target.getTargets!
+        conn.forward_proxy_request(
+            cid,
+            &json!({ "id": 2, "method": "Target.closeTarget", "params": { "targetId": "p4" } })
+                .to_string(),
+        )
+        .await
+        .unwrap();
+        let _ = rx.recv().await.unwrap();
+        assert_eq!(
+            get_targets_calls.load(Ordering::SeqCst),
+            1,
+            "should not query Target.getTargets when discover is active and > 2 pages are cached"
+        );
+
+        // Disabling discover must invalidate the cache so the next closeTarget queries Target.getTargets.
+        conn.forward_proxy_request(
+            cid,
+            &json!({ "id": 11, "method": "Target.setDiscoverTargets", "params": { "discover": false } })
+                .to_string(),
+        )
+        .await
+        .unwrap();
+        let _ = rx.recv().await.unwrap();
+        assert!(conn.demux.page_target_ids.lock().unwrap().is_none());
+
+        conn.forward_proxy_request(
+            cid,
+            &json!({ "id": 3, "method": "Target.closeTarget", "params": { "targetId": "p5" } })
+                .to_string(),
+        )
+        .await
+        .unwrap();
+        let _ = rx.recv().await.unwrap();
+        assert_eq!(
+            get_targets_calls.load(Ordering::SeqCst),
+            2,
+            "must query Target.getTargets once discover is disabled"
+        );
+    }
+
+    #[test]
+    fn slow_proxy_client_disconnects_when_bounded_channel_fills() {
+        let mut router = ProxyRouter::default();
+        let (tx, mut rx) = mpsc::channel(PROXY_CLIENT_CHANNEL_CAPACITY);
+        let cid = router.register_client(tx);
+        {
+            let client = router.clients.get_mut(&cid).unwrap();
+            client.wants_discover = true;
+            client.wants_auto_attach = true;
+        }
+        router.add_session_owner("s-slow", cid);
+
+        for i in 0..PROXY_CLIENT_CHANNEL_CAPACITY {
+            router.deliver_to_clients([cid], &format!("{i}"));
+        }
+        assert!(router.clients.contains_key(&cid));
+        // Overflowing the bounded channel drops only `tx` (closing the receiver)
+        // while keeping client state intact so `unregister_client` runs full cleanup.
+        router.deliver_to_clients([cid], "overflow");
+        assert!(router.clients.contains_key(&cid));
+        assert!(router.clients.get(&cid).unwrap().tx.is_none());
+
+        let mut drained = 0;
+        while rx.try_recv().is_ok() {
+            drained += 1;
+        }
+        assert_eq!(drained, PROXY_CLIENT_CHANNEL_CAPACITY);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+
+        let plan = router.unregister_client(cid);
+        assert_eq!(plan.sessions_to_detach, vec!["s-slow".to_owned()]);
+        assert!(plan.disable_auto_attach);
+        assert!(plan.disable_discover);
+    }
+
+    #[test]
+    fn proxy_route_reply_preserves_session_id_in_flatten_mode() {
+        let mut router = ProxyRouter::default();
+        let (tx, mut rx) = mpsc::channel(PROXY_CLIENT_CHANNEL_CAPACITY);
+        let cid = router.register_client(tx);
+
+        router.pending.insert(
+            100,
+            ProxyPendingEntry {
+                client_id: cid,
+                original_id_raw: "\"req-1\"".to_owned(),
+                method: "Runtime.evaluate".to_owned(),
+                request_session_id: Some("flat-session-1".to_owned()),
+                enable_flag: None,
+                previous_flag: false,
+            },
+        );
+        let ok_raw = r#"{"id":100,"sessionId":"flat-session-1","result":{"value":42}}"#;
+        let ok_frame: RawUpstreamFrame<'_> = serde_json::from_str(ok_raw).unwrap();
+        assert!(router.route_reply(100, &ok_frame));
+        let forwarded_ok: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(forwarded_ok["id"], "req-1");
+        assert_eq!(forwarded_ok["sessionId"], "flat-session-1");
+        assert_eq!(forwarded_ok["result"]["value"], 42);
+
+        router.pending.insert(
+            101,
+            ProxyPendingEntry {
+                client_id: cid,
+                original_id_raw: "42".to_owned(),
+                method: "Runtime.evaluate".to_owned(),
+                request_session_id: Some("flat-session-1".to_owned()),
+                enable_flag: None,
+                previous_flag: false,
+            },
+        );
+        let err_raw = r#"{"id":101,"sessionId":"flat-session-1","error":{"code":-32000,"message":"boom"}}"#;
+        let err_frame: RawUpstreamFrame<'_> = serde_json::from_str(err_raw).unwrap();
+        assert!(router.route_reply(101, &err_frame));
+        let forwarded_err: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(forwarded_err["id"], 42);
+        assert_eq!(forwarded_err["sessionId"], "flat-session-1");
+        assert_eq!(forwarded_err["error"]["message"], "boom");
     }
 }

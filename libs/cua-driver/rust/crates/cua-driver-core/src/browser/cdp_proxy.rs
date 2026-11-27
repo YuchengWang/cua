@@ -19,6 +19,7 @@
 //!   `ExistingProfile` sockets, and refuses `Target.closeTarget` when <= 1
 //!   `"type": "page"` target remains.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -26,7 +27,8 @@ use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{json, Value};
+use serde::Deserialize;
+use serde_json::value::RawValue;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Mutex};
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
@@ -585,6 +587,19 @@ async fn handle_proxy_client(
     touch_owners(&owner_sessions, on_activity.as_ref());
 }
 
+#[derive(Deserialize)]
+struct DownstreamCdpHeader<'a> {
+    #[serde(borrow, default)]
+    id: Option<&'a RawValue>,
+    #[serde(borrow, default)]
+    method: Option<Cow<'a, str>>,
+}
+
+fn format_proxy_error_reply(id_raw: &str, code: i64, message: &str) -> String {
+    let msg_json = serde_json::to_string(message).unwrap_or_else(|_| "\"error\"".to_owned());
+    format!(r#"{{"id":{id_raw},"error":{{"code":{code},"message":{msg_json}}}}}"#)
+}
+
 async fn process_downstream_text<S>(
     text: &str,
     client_id: u64,
@@ -594,18 +609,18 @@ async fn process_downstream_text<S>(
 where
     S: futures_util::Sink<Message> + Unpin,
 {
-    let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(text) else {
+    let Ok(header) = serde_json::from_str::<DownstreamCdpHeader<'_>>(text) else {
         return true;
     };
-    let Some(id) = obj.get("id").cloned().filter(|v| !v.is_null()) else {
+    let Some(id_raw) = header.id.filter(|v| v.get() != "null") else {
         return true;
     };
-    let Some(method) = obj.get("method").and_then(Value::as_str) else {
-        let reply = json!({
-            "id": id,
-            "error": { "code": -32600, "message": "Invalid CDP request: missing method" }
-        })
-        .to_string();
+    let Some(method) = header.method.as_deref() else {
+        let reply = format_proxy_error_reply(
+            id_raw.get(),
+            -32600,
+            "Invalid CDP request: missing method",
+        );
         return ws_write.send(Message::Text(reply)).await.is_ok();
     };
 
@@ -615,23 +630,16 @@ where
             "Browser.close" | "Browser.crash" | "Browser.crashGpuProcess"
         )
     {
-        let reply = json!({
-            "id": id,
-            "error": {
-                "code": -32000,
-                "message": format!("{method} is blocked on existing-profile CDP proxy; disconnect instead")
-            }
-        })
-        .to_string();
+        let reply = format_proxy_error_reply(
+            id_raw.get(),
+            -32000,
+            &format!("{method} is blocked on existing-profile CDP proxy; disconnect instead"),
+        );
         return ws_write.send(Message::Text(reply)).await.is_ok();
     }
 
-    if let Err(err) = conn.forward_proxy_request(client_id, obj).await {
-        let reply = json!({
-            "id": id,
-            "error": { "code": -32000, "message": err }
-        })
-        .to_string();
+    if let Err(err) = conn.forward_proxy_request(client_id, text).await {
+        let reply = format_proxy_error_reply(id_raw.get(), -32000, &err);
         if ws_write.send(Message::Text(reply)).await.is_err() {
             return false;
         }
@@ -713,6 +721,7 @@ mod tests {
     use super::*;
     use crate::browser::cdp_ws::CdpPool;
     use crate::browser::mock_cdp::{MockCdpServer, MockEvent, MockReply};
+    use serde_json::{json, Value};
     use std::sync::Arc as StdArc;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 

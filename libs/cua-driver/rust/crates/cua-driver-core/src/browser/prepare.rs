@@ -1041,7 +1041,8 @@ async fn wait_for_spawned_endpoint(
     profile: &Path,
     security_prompt_open: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<OwnedEndpoint, BrowserRefusal> {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(20);
     let port_file = profile.join("DevToolsActivePort");
     let mut observed_clean_launcher_exit = false;
     loop {
@@ -1119,7 +1120,15 @@ async fn wait_for_spawned_endpoint(
                 },
             ));
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let elapsed = start.elapsed();
+        let backoff = if elapsed < Duration::from_millis(250) {
+            Duration::from_millis(25)
+        } else if elapsed < Duration::from_secs(1) {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_millis(100)
+        };
+        tokio::time::sleep(backoff).await;
     }
 }
 
